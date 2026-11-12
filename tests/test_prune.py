@@ -40,19 +40,26 @@ class PruneWorld(unittest.TestCase):
         with open(os.path.join(self.paths["sessions"], sid + ".json"), "w") as fh:
             json.dump(d, fh)
 
-    def file(self, fname, name, sid=None, age=10 * DAY, **extra):
+    def file(self, fname, name, sid=None, age=10 * DAY, title=None, transcript=True, **extra):
+        """A status file. With a sessionId it also gets a transcript (untitled unless `title` is given),
+        so the session classifies; pass transcript=False for a session whose transcript is gone."""
         d = dict(session=name, updated=standin.iso(-age), **extra)
         if sid:
             d["sessionId"] = sid
         with open(os.path.join(self.status, fname), "w") as fh:
             json.dump(d, fh)
+        if sid and transcript:
+            self.transcript(sid, age, title)
 
-    def transcript(self, sid, age):
-        folder = os.path.join(self.paths["projects"], "-some-project")
+    def transcript(self, sid, age, title=None, root=None):
+        folder = os.path.join(root or self.paths["projects"], "-some-project")
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, sid + ".jsonl")
         with open(path, "w") as fh:
             fh.write("{}\n")
+            if title:
+                fh.write(json.dumps({"type": "custom-title", "customTitle": title, "sessionId": sid},
+                                    separators=(",", ":")) + "\n")
         os.utime(path, (standin.NOW - age, standin.NOW - age))
 
     def records(self):
@@ -81,8 +88,8 @@ class CandidateTests(PruneWorld):
         self.assertEqual(self.plan().candidates, [])
 
     def test_live_by_name_when_the_file_has_no_session_id(self):
-        self.reg("Live Two", "l2", pid=standin.PARENT_PID)
-        self.file("live2.json", "Live Two")
+        self.reg("wt-live-two", "l2", pid=standin.PARENT_PID)
+        self.file("live2.json", "wt-live-two")
         self.assertEqual(self.plan().candidates, [])
 
     def test_questions_upcoming_and_remind_keep_a_file(self):
@@ -220,9 +227,9 @@ class RestoreTests(PruneWorld):
             self.assertEqual(json.load(fh)["working_on"], "back again")
 
     def test_a_file_without_session_id_returns_by_name(self):
-        self.file("anon.json", "Anon One")
+        self.file("anon.json", "wt-anon-one")
         prune.apply(self.plan(), standin.NOW)
-        self.reg("Anon One", "a9", pid=standin.PARENT_PID)
+        self.reg("wt-anon-one", "a9", pid=standin.PARENT_PID)
         self.assertEqual(len(prune.restore_returned(self.status, self.records())), 1)
         self.assertIn("anon.json", self.folder())
 
@@ -291,6 +298,127 @@ class CliTests(PruneWorld):
         with mock.patch.object(prune, "main", return_value=7) as m:
             self.assertEqual(entry.main(["prune", "--yes"]), 7)
         m.assert_called_once_with(["--yes"])
+
+
+class NamedTests(PruneWorld):
+    """A session the user named (a custom-title record in its transcript) is never a default candidate."""
+
+    def test_a_named_session_is_kept_by_default_and_counted(self):
+        self.file("named.json", "Pricing Page", "n1", title="Pricing Page")
+        self.file("plain.json", "Scratch Run", "p1")
+        plan = self.plan()
+        self.assertEqual(self.names(plan.candidates), ["Scratch Run"])
+        self.assertEqual(self.names(plan.kept_named), ["Pricing Page"])
+        moved, _skipped = prune.apply(plan, standin.NOW)
+        self.assertEqual(moved, ["Scratch Run"])
+        self.assertIn("named.json", self.folder())
+
+    def test_the_newest_title_in_the_transcript_decides(self):
+        self.file("n.json", "Renamed", "n2", title="Old name")
+        path = os.path.join(self.paths["projects"], "-some-project", "n2.jsonl")
+        with open(path, "a") as fh:
+            fh.write(json.dumps({"type": "custom-title", "customTitle": "New name"}, separators=(",", ":")) + "\n")
+        os.utime(path, (standin.NOW - 10 * DAY, standin.NOW - 10 * DAY))
+        self.assertEqual(self.names(self.plan().kept_named), ["Renamed"])
+
+    def test_include_named_makes_them_candidates_and_marks_them(self):
+        self.file("named.json", "Pricing Page", "n1", title="Pricing Page")
+        self.file("plain.json", "Scratch Run", "p1")
+        plan = prune.make_plan(self.paths, standin.NOW, self.records(), self.settings, include_named=True)
+        self.assertEqual(self.names(plan.candidates), ["Pricing Page", "Scratch Run"])
+        self.assertEqual(plan.kept_named, [])
+        named = {c["name"]: c["named"] for c in plan.candidates}
+        self.assertEqual(named, {"Pricing Page": True, "Scratch Run": False})
+        moved, _skipped = prune.apply(plan, standin.NOW)
+        self.assertEqual(sorted(moved), ["Pricing Page", "Scratch Run"])
+
+    def test_include_flips_a_plan_without_reading_anything_again(self):
+        self.file("named.json", "Pricing Page", "n1", title="Pricing Page")
+        plan = self.plan()
+        both = plan.include(True)
+        self.assertEqual(self.names(both.candidates), ["Pricing Page"])
+        self.assertTrue(both.include_named)
+        self.assertEqual(self.names(both.include(False).kept_named), ["Pricing Page"])
+        self.assertEqual(self.names(plan.candidates), [])          # the original is untouched
+
+    def test_a_transcript_without_a_title_is_unnamed_whatever_the_status_name(self):
+        self.file("a.json", "Looks Human", "a1")
+        self.assertEqual(self.names(self.plan().candidates), ["Looks Human"])
+
+    def test_the_archive_is_searched_for_the_transcript(self):
+        self.file("a.json", "Archived Name", "ar1", transcript=False)
+        self.paths["archive"] = os.path.join(self.tmp.name, "archive")
+        self.transcript("ar1", 10 * DAY, "Archived Name", root=self.paths["archive"])
+        self.assertEqual(self.names(self.plan().kept_named), ["Archived Name"])
+
+    def test_no_transcript_falls_back_to_the_generated_name_pattern(self):
+        self.file("g.json", "wt-fix-login", "g1", transcript=False)
+        self.file("g2.json", "a1b2c3d4e5f60718293a4b5c6d7e8f90", "g2", transcript=False)
+        self.assertEqual(self.names(self.plan().candidates),
+                         ["a1b2c3d4e5f60718293a4b5c6d7e8f90", "wt-fix-login"])
+
+    def test_no_transcript_and_a_human_name_cannot_be_told_and_is_never_pruned(self):
+        self.file("h.json", "Pricing Page", "h1", transcript=False)
+        self.file("h2.json", "Nameless Id", transcript=False)           # no sessionId at all
+        for include in (False, True):
+            plan = prune.make_plan(self.paths, standin.NOW, self.records(), self.settings, include_named=include)
+            self.assertEqual(plan.candidates, [])
+            self.assertEqual(self.names(plan.kept_unknown), ["Nameless Id", "Pricing Page"])
+        moved, _s = prune.apply(plan, standin.NOW)
+        self.assertEqual(moved, [])
+        self.assertTrue({"h.json", "h2.json"} <= set(self.folder()))
+
+    def test_an_unreadable_transcript_cannot_be_told_either(self):
+        self.file("u.json", "Scratch Run", "u1")
+        with mock.patch("fleetwatch.resume.last_title", side_effect=OSError("denied")):
+            plan = self.plan()
+        self.assertEqual(plan.candidates, [])
+        self.assertEqual(self.names(plan.kept_unknown), ["Scratch Run"])
+
+    def test_open_items_still_win_over_the_named_heading(self):
+        self.file("n.json", "Pricing Page", "n1", title="Pricing Page", questions=["Which?"])
+        plan = self.plan()
+        self.assertEqual(self.names(plan.kept_open), ["Pricing Page"])
+        self.assertEqual(plan.kept_named, [])
+
+    def test_a_session_named_after_the_listing_is_not_moved(self):
+        self.file("s.json", "Scratch Run", "x1")
+        plan = self.plan()
+        self.transcript("x1", 10 * DAY, "Now named")
+        moved, skipped = prune.apply(plan, standin.NOW)
+        self.assertEqual(moved, [])
+        self.assertEqual(skipped, [("Scratch Run", "no longer a candidate")])
+        self.assertIn("s.json", self.folder())
+
+
+class NamedCliTests(PruneWorld):
+    run_cli = CliTests.run_cli
+
+    def test_default_lists_named_under_its_own_heading_and_moves_nothing_named(self):
+        self.file("named.json", "Pricing Page", "n1", title="Pricing Page")
+        self.file("plain.json", "Scratch Run", "p1")
+        self.file("lost.json", "Lost Name", "l1", transcript=False)
+        code, out = self.run_cli("--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("Ready to prune (1)", out)
+        self.assertIn("Kept: named session (1)", out)
+        self.assertIn("Kept: could not tell if named (1)", out)
+        self.assertIn("--include-named", out)
+        self.assertTrue({"lost.json", "named.json"} <= set(self.folder()))
+        self.assertNotIn("plain.json", self.folder())
+
+    def test_include_named_prunes_the_named_and_still_not_the_unknown(self):
+        self.file("named.json", "Pricing Page", "n1", title="Pricing Page")
+        self.file("lost.json", "Lost Name", "l1", transcript=False)
+        code, out = self.run_cli("--include-named", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("Pricing Page", out)
+        self.assertNotIn("Kept: named session", out)
+        self.assertIn("lost.json", self.folder())
+        self.assertNotIn("named.json", self.folder())
+        code, out = self.run_cli("--restore", "Pricing Page")
+        self.assertEqual(code, 0)
+        self.assertIn("named.json", self.folder())
 
 
 if __name__ == "__main__":

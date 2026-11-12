@@ -4,6 +4,8 @@ from datetime import datetime
 
 from rich.text import Text
 
+from collections import Counter
+
 from .config import OTHER
 from .data import (MARKERS_UTF8, LOCAL_TZ, ago, build_view, clean, date_label, day, dedup_key,
                    due_label, has_overdue, items_of, plural, short_name, task_label, timeline_rows)
@@ -21,6 +23,12 @@ TODO_TAB = 1
 SESSIONS_TAB = 2
 RESUME_TAB = 3
 INDEXES_TAB = 4
+
+# How the To-dos tab is grouped: by when it is due (the default), by project folder, or not at all.
+TODO_GROUPS = ("time", "folder", "none")
+# Sub-groups inside a time group run in this order.
+TIME_KINDS = ("deadline", "deploy", "meeting", "milestone", "todo", "checkin")
+WEEK_DAYS = 7          # "the next 7 days": tomorrow through today + 7
 
 # Per tab: (id, label shown as "sorted by: <label>"). The first entry is the default.
 SORTS = (
@@ -77,6 +85,7 @@ class Node:
     hang: int = 0                                  # continuation lines of the head indent this much more
     resume: str = None                             # a Resume row: the sessionId it would bring back
     index: str = None                              # an Indexes row: the index name
+    head_shut: Text = None                         # shown instead of head while the row is closed
 
     @property
     def expandable(self):
@@ -240,9 +249,88 @@ def _also_noted(other, now, datew, suffix=""):
     return node
 
 
-def todo_nodes(view, now, sort="date", grouping=None):
+def time_slot(row, now):
+    """Which time group a dated row belongs to, in the local zone: overdue, today, tomorrow, d2..d7
+    (that many days ahead), month (later this calendar month) or later."""
+    today = datetime.fromtimestamp(now, LOCAL_TZ).date()
+    due = row["due"].astimezone(LOCAL_TZ).date()
+    delta = (due - today).days
+    if row["red"] or delta < 0:
+        return "overdue"
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta <= WEEK_DAYS:
+        return "d%d" % delta
+    return "month" if (due.year, due.month) == (today.year, today.month) else "later"
+
+
+def _slot_order(slot):
+    fixed = ("overdue", "today", "tomorrow")
+    if slot in fixed:
+        return fixed.index(slot)
+    if slot.startswith("d"):
+        return 3 + int(slot[1:])
+    return {"month": 20, "later": 21, "undated": 22}[slot]
+
+
+def _slot_label(slot, rows):
+    if slot in ("today", "tomorrow", "overdue") or slot.startswith("d"):
+        first = rows[0]["due"].astimezone(LOCAL_TZ)
+        day = first.strftime("%a %b %-d")
+        if slot == "overdue":
+            return "Overdue"
+        return {"today": "Today · " + day, "tomorrow": "Tomorrow · " + day}.get(slot, day)
+    return {"month": "Later this month", "later": "Later", "undated": "Undated"}[slot]
+
+
+def _kind_counts(rows):
+    """[(kind, n)] busiest first, ties in kind order."""
+    c = Counter(r["kind"] for r in rows)
+    return sorted(c.items(), key=lambda kv: (-kv[1], TIME_KINDS.index(kv[0]) if kv[0] in TIME_KINDS else 99))
+
+
+def _time_group(slot, rows, now, datew, sort_key):
+    label = _slot_label(slot, rows)
+    key = "grp:%d:t:%s" % (TODO_TAB, slot)
+    head = _row_text([(label, "bold"), (" · %d" % len(rows), DIM)])
+    shut = _row_text([(label, "bold"), (" · %d" % len(rows), DIM)] + [
+        (" · %d %s" % (n, kind), DIM) for kind, n in _kind_counts(rows)])
+    node = Node(key, head, start_open=True, section=True)
+    node.head_shut = shut
+    if slot == "undated":
+        node.children = [_item_node("todo", r, now, datew) for r in rows]
+        return node
+    for kind in sorted({r["kind"] for r in rows}, key=lambda k: TIME_KINDS.index(k) if k in TIME_KINDS else 99):
+        mine = sorted((r for r in rows if r["kind"] == kind), key=sort_key)
+        kid = _row_text([(kind, "bold"), (" · %d" % len(mine), DIM)])
+        node.children.append(Node("%s:%s" % (key, kind), kid, start_open=True, section=True,
+                                  children=[_item_node("up", r, now, datew) for r in mine]))
+    return node
+
+
+def _time_nodes(undated, dated, other, now, datew, sort):
+    slots = {}
+    for r in dated:
+        slots.setdefault(time_slot(r, now), []).append(r)
+    out = [_time_group(s, slots[s], now, datew, _item_key(sort)) for s in sorted(slots, key=_slot_order)]
+    if undated:
+        out.append(_time_group("undated", undated, now, datew, None))
+    if other:
+        out.append(_also_noted(other, now, datew))
+    return out
+
+
+def todo_nodes(view, now, sort="date", grouping=None, mode=None):
+    """The To-dos tab. `mode` "time" groups by due date, "folder" by `grouping`, "none" not at all;
+    without it, `grouping` alone decides (folder when given)."""
     undated, dated, other = todo_rows(view, sort)
     datew = _datew(undated + dated + other, now)
+    if mode == "time":
+        return _time_nodes(undated, dated, other, now, datew, sort)
+    if mode == "none":
+        grouping = None
 
     def block(und, dat, oth, suffix=""):
         out = [_item_node("todo", r, now, datew) for r in und]
@@ -482,7 +570,8 @@ def tab_counts(view, stale):
             len(view["rows"]) + len(view["orphans"]) + len(stale)]
 
 
-def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None):
+def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None,
+               todo_group=None, folders=None):
     """(node tree of each tab, Needs row order).
 
     Each tab is in its chosen sort order, optionally wrapped in group sections. `seen` is the
@@ -495,7 +584,7 @@ def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), read
     if bad is not None:
         needs_tab.append(bad)
     return [needs_tab,
-            todo_nodes(view, now, s[1], grouping),
+            todo_nodes(view, now, s[1], folders if todo_group == "folder" else grouping, todo_group),
             sessions_nodes(view, stale, now, s[2], grouping, ready)], [n.key for n in needs]
 
 

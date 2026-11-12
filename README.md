@@ -109,7 +109,7 @@ The board loads the memory layers only for the `search` and `index` commands, so
     fleetwatch resume [name] [--here]
     fleetwatch park [name] --note "what it is waiting on"
     fleetwatch unpark [name]
-    fleetwatch prune [--yes] [--restore NAME] [--quiet 3d]
+    fleetwatch prune [--yes] [--include-named] [--restore NAME] [--quiet 3d]
     fleetwatch iterm install | status | uninstall
     fleetwatch --demo [--once]
 
@@ -118,14 +118,14 @@ Live by default on a terminal: a Textual app with five tabs along the bottom, re
 Tabs (switch with `1` to `5`, Tab, Shift-Tab or the mouse; each label carries a count):
 
 1. **Needs you**: one folded row per top-level session that is stuck on a prompt, holds questions, or owns at least one of your items (`yours: true`, from `upcoming` or the old `remind` strings) that is overdue, due today (in your time zone, see Settings) or undated. Items due tomorrow or later never put a session here; they stay on Your to-dos. Items that are not yours never do. Under the session, before its numbered questions, each item gets a row: `Overdue (Nov 6): <what>` in red, `Due today: <what>` (`Due today 3:00 PM: <what>` when the item has a time), then `Needs a date: <what>` in dim text. Within a kind the oldest due comes first, then text. An item of kind `checkin` reads `Check-in overdue (Nov 6): <what>` and `Check in today: <what>`. A session stuck on a prompt sorts first, since it blocks work; next comes a session with an overdue item, then the rest, under every sort. An item whose session has no row (a status file left by a session that is gone) still shows, under that session's name. That row reads `not running` (dim) where a live row shows its state, in the app and in `--once`. Enter on it, or on one of its item rows, asks `Reopen <name> in a new window?`: Enter or `y` opens it exactly as `o` does on the Resume tab, Esc or `n` cancels, and nothing starts without the confirm, never from a refresh. When fleetwatch can't reopen it, no dialog opens and the status line says why: no custom name (prune the file with `P` if the session is finished), folder gone, still running, or no transcript. Space or right arrow opens a session to its rows, numbered questions and stuck helpers (each is a row of its own); left arrow closes it. `e` opens every row in the tab, `c` closes them all, and `z` flips between the two. Enter on an item row jumps to its session. An Indexes section at the end lists any index that failed its last refresh, failed the protection check or is stale (see The Indexes tab). The tab count is the number of sessions listed plus those index rows. The header replaces a single "need you" count with the non-zero parts, for example `2 questions · 1 overdue · 1 due today · 3 need a date`, and says "nothing needs you" when all are zero. A stuck session is counted as `N stuck`. The overdue count is your overdue items only and appears once. On a narrow terminal the words shorten (`2 q`, `1 today`, `3 undated`).
-2. **Your to-dos**: your own items in one list. Your undated items come first (`yours: true` with no date, and the old `remind` strings), by session and then text. Your dated items follow, overdue first and then by date, with no count limit. Every other item (milestones, meetings, internal work) folds into one closed "Also noted (N)" section at the end. The tab count is your undated plus your dated items, not Also noted.
+2. **Your to-dos**: your own items, grouped by when they are due. The groups run in time order: **Overdue**, **Today**, **Tomorrow**, then each remaining day of the next 7 days by name (`Mon Nov 16`), **Later this month** (after those 7 days, still in this month), **Later** (next month and beyond) and **Undated** (`yours: true` with no date, and the old `remind` strings, by session and then text). Days are local days (see Settings for the time zone), changing at local midnight. An item with a time that has already passed today is Overdue. Inside a day, items are sub-grouped by kind (`deadline`, `deploy`, `meeting`, `milestone`, `todo`, `checkin`), each with a count, in the chosen sort order. Empty groups are left out. A closed group shows its counts by kind (`Tomorrow · Fri Nov 13 · 4 · 3 todo · 1 deadline`), so `z` (fold all) leaves a seven-day view you can read at a glance. Every other item (milestones, meetings, internal work) folds into one closed "Also noted (N)" section at the end. The tab count is your undated plus your dated items, not Also noted. This is the default; press `G` on this tab to cycle to the old project-folder grouping, then to a flat list (undated first, then dated), then back to time. The choice is remembered. `G` on any other tab still turns project-folder groups on or off for that tab, and does not change this one. `--once` and `--json` do not follow the board's grouping: they keep their own timeline buckets and are unchanged.
 3. **Sessions**: working, gone quiet, idle and stale (folded), with helpers counted on their parent's row.
 4. **Resume**: custom-named sessions that are parked or stopped, parked first with their notes (see Resume and park).
 5. **Indexes**: the health of every session-memory index (see The Indexes tab).
 
 Mouse: a click selects a row (and opens or closes it), a double click jumps like Enter; clicking a tab label switches tabs.
 
-Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder, `m` moves the highlighted session to another group, `/` or Ctrl-K finds a session by name, `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `r` refreshes now, `y` copies a search command on the Indexes tab, `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
+Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder (on Your to-dos it cycles by day, by project folder and no groups), `m` moves the highlighted session to another group, `/` or Ctrl-K finds a session by name, `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `r` refreshes now, `y` copies a search command on the Indexes tab, `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
 
 A footer line above the tab bar always shows the key hints for the tab you are on. On a narrow terminal it drops the least important hints (hide, refresh, groups, move, sort, fold all) rather than wrapping, and always keeps Enter, `/ find`, Space, `?` and `q`. The `m` hint appears only when a session row is selected.
 
@@ -142,7 +142,7 @@ Each tab has its own sort order, shown under the tab strip as `sorted by: ...`; 
 | Tab | Orders (first is the default) |
 |---|---|
 | Needs you | oldest question (by each question's `since`, else the status file's `updated`), most questions, most recently updated, name. Sessions stuck on a prompt come first, then sessions with an overdue item of yours, under every sort, name included. |
-| Your to-dos | date, most overdue first, session. The sort orders the dated block; the undated block stays above it and is always by session, then text. |
+| Your to-dos | date, most overdue first, session. The sort orders the items inside each group (and inside each kind under a day); the groups themselves always run in time order, and Undated is always by session, then text. |
 | Sessions | last activity, name |
 | Resume | last active, name |
 | Indexes | name, problems first |
@@ -161,13 +161,13 @@ paths = ["~/code/work"]
 ```
 
 - A session's `cwd` joins the group whose path is the longest match (whole folders, `~` expanded). A session matching nothing is under **Other**. An `[overrides]` entry pins one session, by name, and beats the paths. An `[override_ids]` entry pins by sessionId, is matched first, and so follows the session through a rename.
-- `G` turns group headers on or off on every tab. Each header is a folding section with a count; whether it is open is remembered.
+- `G` turns group headers on or off on the Needs you, Sessions and Resume tabs. Each header is a folding section with a count; whether it is open is remembered. On Your to-dos, `G` cycles by day (the default), by project folder and no groups; the day groups' folds are remembered like any other.
 - `m` on a session opens a picker (the known groups plus "New group...") and writes the choice into `[overrides]` (and the sessionId into `[override_ids]`) with a targeted edit that keeps your comments and order. The next refresh shows the move.
 - A `groups.toml` that does not parse never stops fleetwatch: it shows a message and every session is under Other. Fix the file and the next refresh picks it up.
 - With groups on, the Sessions tab lists each group's sessions in the chosen order instead of the Working, Gone quiet and Idle sections (each row still shows its state). Unattached helpers and stale records stay below the groups.
 - `fleetwatch --json` adds a `group` to every session. `fleetwatch --once --groups` appends a BY GROUP block; without `--groups` the text output is unchanged.
 
-What fleetwatch remembers (sort per tab, `G` on or off, which group headers are closed) is in `~/.config/fleetwatch/state.json`, written atomically. A corrupt file falls back to the defaults with a message. A state file from the first layout (version 1, with separate Coming up and To-dos tabs) is re-keyed when it loads: Coming up keeps its sort, the old to-dos sort is dropped, and the Sessions and Resume sorts and group folds move down one place. `FLEETWATCH_CONFIG_DIR` points both files elsewhere.
+What fleetwatch remembers (sort per tab, `G` on or off, the To-dos grouping `todo_group` (`time`, `folder` or `none`; `time` when missing), which group headers are closed) is in `~/.config/fleetwatch/state.json`, written atomically. A corrupt file falls back to the defaults with a message. A state file from the first layout (version 1, with separate Coming up and To-dos tabs) is re-keyed when it loads: Coming up keeps its sort, the old to-dos sort is dropped, and the Sessions and Resume sorts and group folds move down one place. `FLEETWATCH_CONFIG_DIR` points both files elsewhere.
 
 Each session appears once. Child sessions (helpers, worktree and run agents) are found by process ancestry, rolled up into their top-most parent, and counted in its row; generated-name sessions with no parent are counted as unattached helpers. `--all` lists stale records.
 
@@ -261,17 +261,19 @@ A file is a candidate only when all of these hold:
 2. **Quiet.** Neither its `updated` nor the session's transcript (`~/.claude/projects/*/<sessionId>.jsonl`, `FLEETWATCH_PROJECTS_DIR`) is newer than the window (default 24h).
 3. **Nothing waiting on you.** No `questions`, `upcoming` or `remind` items. Such files are listed as "kept: has open items" and never pruned.
 4. **Not on the keep list.** Names are matched whole, ignoring case.
+5. **Unnamed.** A session you named (`/rename` or `claude -n`) is kept by default, listed as "kept: named session" with a count, and pruned only with `--include-named`. A session is named when its transcript's newest `custom-title` record holds a title, the same record the Resume tab reads; the transcript is looked up by `sessionId` in the projects folder, then in the archive. With no transcript, only a generated name (`wt-`, `run-` or `t<N>-` prefixes, or a bare ID) shows the session unnamed. Any other name could be one you chose, so a file whose session cannot be classified (no transcript and a human-looking name, no `sessionId`, or an unreadable transcript) is kept as "kept: could not tell if named" and is never pruned, with or without `--include-named`.
 
 ```
-fleetwatch prune                  # dry run: candidates, then the kept-with-open-items files
+fleetwatch prune                  # dry run: unnamed candidates, then the kept files
 fleetwatch prune --yes            # move the candidates
+fleetwatch prune --include-named  # count the sessions you named as candidates too
 fleetwatch prune --restore NAME   # move one back by hand
 fleetwatch prune --quiet 3d       # use another quiet window for this run
 ```
 
 `--yes` re-derives the candidates from fresh records, moves only files you were shown, and checks the registry and the file once more immediately before each move, so a session that came back in between is skipped.
 
-In the app, `P` opens a list of the candidates and the kept files; `y` prunes and Esc cancels. The Stale section header shows how many are ready.
+In the app, `P` opens a list of the candidates and the kept files (named and unclassified ones under their own headings); `y` prunes, `n` includes or leaves out the named sessions (the title line says which, and the list updates), and Esc cancels. The Stale section header counts the unnamed candidates.
 
 **Restore on return.** On every load, a parked file whose session is live again (matched by `sessionId`, else by name) moves back and the status line says so. A newer status file the session already wrote is never overwritten; the parked copy stays in `.pruned/`. A different session's file under the same name is never overwritten either.
 

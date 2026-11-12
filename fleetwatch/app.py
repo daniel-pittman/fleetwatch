@@ -49,9 +49,11 @@ HELP_LINES = [
     "  e / c                     open all / close all rows in this tab",
     "  y                         on the Indexes tab (5): copy a search command for the highlighted index",
     "  s                         change the sort order of this tab (remembered)",
-    "  G                         group every tab by project folder, or ungroup",
+    "  G                         group every tab by project folder, or ungroup; on To-dos, cycle",
+    "                            by day, by project folder and no groups",
     "  m                         move the highlighted session to another group",
-    "  P                         prune finished sessions' status files (y moves them, Esc cancels)",
+    "  P                         prune unnamed finished sessions' status files (y moves them,",
+    "                            n adds the named ones, Esc cancels)",
     "  p / u                     park the highlighted session with a note / unpark it",
     "  r                         refresh now",
     "  ?                         show or hide this help",
@@ -73,6 +75,11 @@ HELP_LINES = [
 ]
 
 
+TODO_GROUP_NOTE = {
+    "time": "  ·  grouped by day (G: project folder, then none)",
+    "folder": "  ·  grouped by project folder (G: no groups, then by day)",
+    "none": "",
+}
 HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("z", "fold all"), ("s", "sort"), ("G", "groups"), ("m", "move"),
          ("r", "refresh"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 CORE_HINTS = ("⏎", "␣", "?", "q")
@@ -240,7 +247,8 @@ class FoldList(ScrollView, can_focus=True):
             self._by_key[node.key] = node
             glyph = (OPEN if self.is_open(node) else SHUT) if node.expandable else " "
             first = len(lines)
-            for ln in wrap(Text(glyph + " "), node.head, depth * 2, node.hang):
+            head = node.head if self.is_open(node) or node.head_shut is None else node.head_shut
+            for ln in wrap(Text(glyph + " "), head, depth * 2, node.hang):
                 lines.append((node.key, ln))
             self._order.append(node.key)
             if self.is_open(node):
@@ -474,7 +482,8 @@ class HelpScreen(ModalScreen):
 
 
 class PruneScreen(ModalScreen):
-    """The status files a prune would move aside, and the ones it keeps because they hold open items."""
+    """The status files a prune would move aside, and the ones it keeps. Unnamed sessions only, until
+    n includes the sessions the user named."""
 
     DEFAULT_CSS = """
     PruneScreen { align: center middle; }
@@ -483,21 +492,25 @@ class PruneScreen(ModalScreen):
     """
     BINDINGS = [
         Binding("y", "confirm", show=False),
+        Binding("n", "toggle_named", show=False),
         Binding("escape", "cancel", show=False),
     ]
 
     def __init__(self, plan):
         super().__init__()
+        self.base = plan
         self.plan = plan
 
-    def compose(self):
+    def body(self):
         plan = self.plan
         t = Text(no_wrap=True, overflow="ellipsis")
-        t.append("Prune status files · %d ready\n" % len(plan.candidates), style="bold")
+        t.append("Prune status files · %d ready · %s\n" % (
+            len(plan.candidates), "named sessions included" if plan.include_named else "unnamed sessions only"),
+            style="bold")
         t.append("Moved to .pruned/, never deleted; a returning session gets its file back.\n", style="dim")
         for c in plan.candidates:
             t.append("\n  %s" % c["name"])
-            t.append("  last active %s, %s" % (data.day(c["last"]), c["reason"]), style="dim")
+            t.append("  last active %s, %s" % (data.day(c["last"]), prune.why(c)), style="dim")
         if not plan.candidates:
             t.append("\n  nothing to prune")
         if plan.kept_open:
@@ -508,15 +521,31 @@ class PruneScreen(ModalScreen):
                     x for x in (data.plural(c["questions"], "question") if c["questions"] else "",
                                 data.plural(c["upcoming"], "upcoming item") if c["upcoming"] else "") if x),
                     style="dim")
-        t.append("\n\n" + ("y prune these, Esc cancel" if plan.candidates else "Esc closes"), style="bold")
+        for entries, heading in ((plan.kept_named, "Kept: named session (%d)"),
+                                 (plan.kept_unknown, "Kept: could not tell if named (%d)")):
+            if entries:
+                t.append("\n\n" + heading % len(entries), style="bold")
+                for c in entries:
+                    t.append("\n  %s" % c["name"])
+                    t.append("  last active %s" % data.day(c["last"]), style="dim")
+        keys = ["y prune these" if plan.candidates else "", "n %s named sessions" % (
+            "leave out" if plan.include_named else "include"), "Esc cancel" if plan.candidates else "Esc closes"]
+        t.append("\n\n" + ", ".join(k for k in keys if k), style="bold")
+        return t
+
+    def compose(self):
         with VerticalScroll():
-            yield Static(t)
+            yield Static(self.body(), id="prune-body")
+
+    def action_toggle_named(self):
+        self.plan = self.plan.include(not self.plan.include_named)
+        self.query_one("#prune-body", Static).update(self.body())
 
     def action_confirm(self):
-        self.dismiss(bool(self.plan.candidates))
+        self.dismiss(self.plan if self.plan.candidates else None)
 
     def action_cancel(self):
-        self.dismiss(False)
+        self.dismiss(None)
 
 
 class FindScreen(ModalScreen):
@@ -857,6 +886,7 @@ class FleetwatchApp(App):
         self.state, self._state_warning = config.load_state(self.state_path)
         self.sorts = [views.sort_id(i, self.state["sort"].get(str(i))) for i in range(len(views.TAB_TITLES))]
         self.grouped = self.state["groups"]
+        self.todo_group = self.state["todo_group"]
         self.needs_seen = []
         self.sortline_plain = []
         self.footer_plain = ""
@@ -998,7 +1028,7 @@ class FleetwatchApp(App):
         self.index_owner_states = owners = self.index_owners()
         tabs, self.needs_seen = views.build_tabs(
             snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
-            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners)
+            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners, self.todo_group, snap.grouping)
         for lst, nodes in zip(self.lists, tabs):
             lst.set_nodes(nodes)
         index_list = self.lists[views.INDEXES_TAB]
@@ -1088,7 +1118,9 @@ class FleetwatchApp(App):
         for i in range(len(views.TAB_TITLES)):
             t = Text("sorted by: %s" % views.sort_label(i, self.sorts[i]), no_wrap=True, overflow="ellipsis")
             t.append("  (s changes)", style="dim")
-            if self.grouped and i != views.INDEXES_TAB:
+            if i == views.TODO_TAB:
+                t.append(TODO_GROUP_NOTE[self.todo_group], style="dim")
+            elif self.grouped and i != views.INDEXES_TAB:
                 t.append("  ·  grouped by project folder (G ungroups, m moves a session)", style="dim")
             self.sortline_plain.append(t.plain)
             self.query_one("#sort%d" % i, Static).update(t)
@@ -1191,6 +1223,14 @@ class FleetwatchApp(App):
         self.rebuild()
 
     def action_groups(self):
+        if self.active == views.TODO_TAB:
+            groups = views.TODO_GROUPS
+            self.todo_group = groups[(groups.index(self.todo_group) + 1) % len(groups)]
+            self.state["todo_group"] = self.todo_group
+            self._save_state()
+            self.update_sortlines()
+            self.rebuild()
+            return
         self.grouped = not self.grouped
         self.state["groups"] = self.grouped
         self._save_state()
@@ -1535,8 +1575,7 @@ class FleetwatchApp(App):
         if self.snapshot is None:
             self.say("still loading")
             return
-        plan = self.snapshot.prune_plan
-        self.push_screen(PruneScreen(plan), lambda ok: ok and self._start_prune(plan))
+        self.push_screen(PruneScreen(self.snapshot.prune_plan), lambda chosen: chosen and self._start_prune(chosen))
 
     def _start_prune(self, plan):
         self.say("pruning %d status files…" % len(plan.candidates))

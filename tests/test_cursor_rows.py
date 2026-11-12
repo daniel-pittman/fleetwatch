@@ -41,7 +41,8 @@ class CursorRows(unittest.TestCase):
                       questions=["Which branch should the fix land on?"], upcoming=[SHARED, solo] + todos + extra)
 
     def app(self):
-        return fapp.FleetwatchApp(self.w.snapshot, interval=3600)
+        return fapp.FleetwatchApp(self.w.snapshot, interval=3600,
+                                  state_path=os.path.join(self.w.tmp.name, "state.json"))
 
     def settle(self, pilot, n=1):
         async def inner():
@@ -187,7 +188,7 @@ class CursorRows(unittest.TestCase):
             async with app.run_test(size=(100, 9)) as pilot:
                 await boot(app, pilot)
                 for tab in ("2",):
-                    await pilot.press(tab)
+                    await pilot.press(tab, "G", "G")       # the flat list: time, folder, then no groups
                     lst = app.current
                     await pilot.press("down", "down")
                     key = lst.cursor

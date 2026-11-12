@@ -11,6 +11,8 @@ from .data import clean, parse_window
 OTHER = "Other"
 SORT_TABS = ("0", "1", "2", "3", "4")
 STATE_VERSION = 2
+TODO_GROUP = "time"                         # the To-dos tab groups by when it is due until told otherwise
+TODO_GROUPS = ("time", "folder", "none")
 # Tab index in a version-1 state file (five tabs) to its index now; the old to-dos tab (2) is gone.
 _OLD_TAB = {"0": "0", "1": "1", "3": "2", "4": "3"}
 
@@ -240,7 +242,7 @@ def set_override(path, name, group, natural=None, session_id=None):
 # ---------------------------------------------------------------- state.json
 
 def default_state():
-    return {"version": STATE_VERSION, "sort": {}, "groups": False, "folds": {}}
+    return {"version": STATE_VERSION, "sort": {}, "groups": False, "folds": {}, "todo_group": TODO_GROUP}
 
 
 def _migrate(sort, folds):
@@ -276,7 +278,8 @@ def load_state(path=None):
         if raw.get("version") != STATE_VERSION:
             sort, folds = _migrate(sort, folds)
         return {"version": STATE_VERSION, "sort": {k: v for k, v in sort.items() if k in SORT_TABS},
-                "groups": groups, "folds": folds}, None
+                "groups": groups, "folds": folds,
+                "todo_group": raw.get("todo_group") if raw.get("todo_group") in TODO_GROUPS else TODO_GROUP}, None
     except Exception as exc:
         return default_state(), "state.json is not valid (%s); using the defaults" % (
             clean(exc)[:60] or type(exc).__name__)

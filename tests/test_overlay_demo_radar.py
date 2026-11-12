@@ -94,9 +94,9 @@ class DemoTests(unittest.TestCase):
         view = json.loads(self.snapshot(as_json=True))
         self.assertGreaterEqual(len(json.dumps(view)), 100)
 
-    def test_two_resume_rows_and_two_groups(self):
+    def test_three_resume_rows_and_two_groups(self):
         from fleetwatch import config, resume
-        self.assertEqual({e["name"] for e in resume.load(self.paths).entries()}, {"Pricing Page", "Status Page"})
+        self.assertEqual({e["name"] for e in resume.load(self.paths).entries()}, {"Holiday Banner", "Pricing Page", "Status Page"})
         groups, warning = config.load_groups()
         self.assertIsNone(warning)
         self.assertEqual([n for n in groups.names() if n != config.OTHER], ["Storefront", "Docs and Site"])
@@ -107,9 +107,10 @@ class DemoTests(unittest.TestCase):
         entries = sorted(resume.load(self.paths).entries(), key=lambda e: e["name"])
         nodes = [views.resume_node(e, now) for e in entries]
         heads = [n.head.plain for n in nodes]
-        self.assertIn("~/code/storefront/pricing", heads[0])
-        self.assertIn("~/code/site/status", heads[1])
-        self.assertIn("waiting on the new price list from finance", heads[0])
+        self.assertIn("~/code/site/notes", heads[0])                 # Holiday Banner, a named finished session
+        self.assertIn("~/code/storefront/pricing", heads[1])
+        self.assertIn("~/code/site/status", heads[2])
+        self.assertIn("waiting on the new price list from finance", heads[1])
         shown = "\n".join(heads + [t.plain for n in nodes for _, t in n.body])
         self.assertIn("was: moving the status page to the new host", shown)
         self.assertNotIn(self.tmp.name, shown)

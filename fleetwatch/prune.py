@@ -34,6 +34,36 @@ def transcript_mtime(projects, sid):
     return best
 
 
+def transcript_paths(paths, sid):
+    """Every transcript of a session: the projects folder first, then the archive that mirrors it."""
+    if not isinstance(sid, str) or not SAFE_ID.fullmatch(sid):
+        return []
+    out = []
+    for root in (paths.get("projects"), paths.get("archive")):
+        if root:
+            out += sorted(glob.glob(os.path.join(glob.escape(root), "*", sid + ".jsonl")))
+    return out
+
+
+def named_state(paths, d):
+    """True when the user named the session, False when not, None when it cannot be told.
+
+    The transcript decides: a session is named when its newest custom-title record holds a title
+    (what /rename and `claude -n` write), exactly as the Resume tab reads it. With no transcript in
+    the projects folder or the archive, only a generated name (a helper's wt-, run- or t1- prefix,
+    or a bare ID) shows the session unnamed; any other name could be a title the user chose, so the
+    session stays unclassified, and so does one whose transcript cannot be read.
+    """
+    from . import resume
+    found = transcript_paths(paths, sid_of(d))
+    if not found:
+        return False if data.HELPER_NAME.search(d["session"]) else None
+    try:
+        return any(resume.last_title(p, 0, os.path.getsize(p)) for p in found)
+    except (OSError, ValueError):
+        return None
+
+
 def read_folder(folder):
     """[(path, parsed status dict)] for each readable status file directly in folder."""
     out = []
@@ -72,20 +102,39 @@ def last_activity(d, projects):
 
 
 class Plan:
-    """What a prune would do right now: candidates, files kept for open items, counts left alone."""
+    """What a prune would do right now: candidates, files kept for open items, counts left alone.
 
-    def __init__(self, paths, now, settings, candidates=(), kept_open=(), left=None):
+    Unnamed sessions are the candidates. Named ones wait in `kept_named` (they join the candidates when
+    `include_named` is set), and sessions that could not be classified wait in `kept_unknown`, always.
+    """
+
+    def __init__(self, paths, now, settings, candidates=(), kept_open=(), left=None, kept_named=(),
+                 kept_unknown=(), include_named=False):
         self.paths, self.now, self.settings = paths, now, settings
         self.candidates, self.kept_open = list(candidates), list(kept_open)
+        self.kept_named, self.kept_unknown = list(kept_named), list(kept_unknown)
+        self.include_named = include_named
         self.left = dict(left or {"live": 0, "recent": 0, "keep": 0})
 
+    def include(self, named):
+        """The same plan with named sessions counted as candidates, or not. Reads nothing again."""
+        if named == self.include_named:
+            return self
+        both = sorted(self.candidates + self.kept_named, key=lambda e: e["last"])
+        if named:
+            cands, kept = both, []
+        else:
+            cands, kept = [e for e in both if not e["named"]], [e for e in both if e["named"]]
+        return Plan(self.paths, self.now, self.settings, cands, self.kept_open, self.left, kept,
+                    self.kept_unknown, named)
 
-def make_plan(paths, now, records, settings):
+
+def make_plan(paths, now, records, settings, include_named=False):
     """Classify every status file. `records` come from data.build_records."""
     live_ids = {r["sessionId"] for r in records if r["live"] and r["sessionId"]}
     live_names = {r["name"] for r in records if r["live"]}
     quiet_s, keep = settings["quiet_s"], settings["keep"]
-    plan = Plan(paths, now, settings)
+    plan = Plan(paths, now, settings, include_named=include_named)
     for path, d in read_folder(paths["status"]):
         name = d["session"]
         if sid_of(d) in live_ids or name in live_names:
@@ -100,10 +149,18 @@ def make_plan(paths, now, records, settings):
             continue
         q, u = open_items(d)
         entry = {"name": data.clean(name), "path": path, "sessionId": sid_of(d), "last": last,
-                 "questions": q, "upcoming": u,
+                 "questions": q, "upcoming": u, "named": False,
                  "reason": "not live, quiet for %s" % data.human(now - last)}
-        (plan.kept_open if q or u else plan.candidates).append(entry)
-    for lst in (plan.candidates, plan.kept_open):
+        if q or u:
+            plan.kept_open.append(entry)
+            continue
+        named = named_state(paths, d)
+        if named is None:
+            plan.kept_unknown.append(entry)
+            continue
+        entry["named"] = named
+        (plan.kept_named if named and not include_named else plan.candidates).append(entry)
+    for lst in (plan.candidates, plan.kept_open, plan.kept_named, plan.kept_unknown):
         lst.sort(key=lambda e: e["last"])
     return plan
 
@@ -131,7 +188,7 @@ def apply(plan, now=None):
     now = time.time() if now is None else now
     paths, settings = plan.paths, plan.settings
     warnings = []
-    fresh = make_plan(paths, now, data.build_records(paths, now, warnings), settings)
+    fresh = make_plan(paths, now, data.build_records(paths, now, warnings), settings, plan.include_named)
     fresh_paths = {c["path"] for c in fresh.candidates}
     moved, skipped = [], []
     dest = pruned_dir(paths["status"])
@@ -230,11 +287,25 @@ def restore_named(status, name):
 
 # ---------------------------------------------------------------- the command line
 
-def listing(plan, quiet_label):
-    lines = ["Ready to prune (%d), not live and quiet for over %s:" % (len(plan.candidates), quiet_label)]
-    for c in plan.candidates:
+def why(c):
+    """The reason line of a candidate, marking a named session."""
+    return ("named session, " if c.get("named") else "") + c["reason"]
+
+
+def _kept_lines(entries, heading):
+    lines = ["", heading]
+    for c in entries:
         lines.append("  %-42s last active %-7s %s" % (data.trunc(c["name"], 42, True), data.day(c["last"]),
                                                       c["reason"]))
+    return lines
+
+
+def listing(plan, quiet_label):
+    kind = "sessions" if plan.include_named else "unnamed sessions"
+    lines = ["Ready to prune (%d), %s not live and quiet for over %s:" % (len(plan.candidates), kind, quiet_label)]
+    for c in plan.candidates:
+        lines.append("  %-42s last active %-7s %s" % (data.trunc(c["name"], 42, True), data.day(c["last"]),
+                                                      why(c)))
     if not plan.candidates:
         lines.append("  none")
     if plan.kept_open:
@@ -244,6 +315,12 @@ def listing(plan, quiet_label):
                 data.trunc(c["name"], 42, True), data.day(c["last"]),
                 ", ".join(x for x in (data.plural(c["questions"], "question") if c["questions"] else "",
                                       data.plural(c["upcoming"], "upcoming item") if c["upcoming"] else "") if x)))
+    if plan.kept_named:
+        lines += _kept_lines(plan.kept_named, "Kept: named session (%d), pruned only with --include-named:"
+                             % len(plan.kept_named))
+    if plan.kept_unknown:
+        lines += _kept_lines(plan.kept_unknown, "Kept: could not tell if named (%d), never pruned:"
+                             % len(plan.kept_unknown))
     left = plan.left
     lines += ["", "Left alone: %d live, %d recent, %d on the keep list" % (
         left["live"], left["recent"], left["keep"])]
@@ -255,6 +332,8 @@ def build_parser():
                                 "to .pruned/. A dry run unless --yes is given; nothing is ever deleted.")
     p.add_argument("--yes", action="store_true", help="move the candidates")
     p.add_argument("--restore", metavar="NAME", help="move one pruned file back")
+    p.add_argument("--include-named", action="store_true",
+                   help="also prune sessions you named (/rename or claude -n); by default only unnamed ones")
     p.add_argument("--quiet", type=data.parse_window, metavar="WINDOW",
                    help="how long a session must be quiet, e.g. 24h or 3d (default from prune.toml, else 24h)")
     p.add_argument("--command")
@@ -284,7 +363,7 @@ def main(argv):
     records = data.build_records(paths, now, warnings)
     for w in warnings:
         print(w, file=sys.stderr)
-    plan = make_plan(paths, now, records, settings)
+    plan = make_plan(paths, now, records, settings, args.include_named)
     print(listing(plan, data.human(settings["quiet_s"])))
     if not args.yes:
         print("\nDry run: nothing moved. Add --yes to move the %d to %s/" % (
