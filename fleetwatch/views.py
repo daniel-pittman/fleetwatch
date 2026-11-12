@@ -87,6 +87,8 @@ class Node:
     index: str = None                              # an Indexes row: the index name
     watch: tuple = None                            # a Watches row: (owner sessionId, owner name)
     head_shut: Text = None                         # shown instead of head while the row is closed
+    todo: tuple = None                             # an item row: (hold keys, what), for snooze and done
+    held: str = None                               # a hidden item shown on request: "snoozed" or "done"
 
     @property
     def expandable(self):
@@ -131,6 +133,38 @@ def _needs_key(sort, x):
     return (stuck, over, _oldest_question(x))
 
 
+def task_bits(x):
+    """[(text, style)] for a folded row's tasks, in words: "1 overdue", "1 due today", "2 tasks" (the
+    undated rest). Color alone never says overdue."""
+    kinds = Counter(t["kind"] for t in x["tasks"])
+    out = []
+    if kinds["overdue"]:
+        out.append(("%d overdue" % kinds["overdue"], RED))
+    if kinds["today"]:
+        out.append(("%d due today" % kinds["today"], ""))
+    rest = len(x["tasks"]) - kinds["overdue"] - kinds["today"]
+    if rest:
+        out.append((plural(rest, "task"), ""))
+    return out
+
+
+PREVIEW_CHARS = 60
+
+
+def question_preview(x, now):
+    """The oldest unanswered question cut near PREVIEW_CHARS, then its age: the same text the open row
+    lists, so a folded row shows nothing new."""
+    if not x["qs"]:
+        return None
+    fallback = x["updated"] or 0
+    text, since, _tag = min(x["qs"], key=lambda q: q[1] if q[1] is not None else fallback)
+    stamp = since if since is not None else fallback
+    if len(text) > PREVIEW_CHARS:
+        cut = text[:PREVIEW_CHARS].rsplit(" ", 1)[0] if " " in text[:PREVIEW_CHARS] else text[:PREVIEW_CHARS]
+        text = cut.rstrip(" ,;:.") + "…"
+    return "%s · %s" % (text, ago(now - stamp))
+
+
 def needs_nodes(view, now, sort="oldest"):
     nodes = []
     for x in sorted(view["for_you"], key=lambda x: (_needs_key(sort, x), x["updated"] or 0)):
@@ -151,9 +185,7 @@ def needs_nodes(view, now, sort="oldest"):
             bits.append(("a helper is stuck %s" % ago(x["helper_stuck"][0][1]), RED))
         if n_q:
             bits.append((plural(n_q, "question"), ""))
-        n_task = len(x["tasks"])
-        if n_task:
-            bits.append((plural(n_task, "task"), RED if has_overdue(x) else ""))
+        bits += task_bits(x)
         if x["updated"] is not None:
             bits.append(("updated %s" % ago(now - x["updated"]), DIM))
         for i, (s, style) in enumerate(bits):
@@ -170,7 +202,8 @@ def needs_nodes(view, now, sort="oldest"):
             label, red = task_label(t)
             kid = _row_text([(label + ": ", RED if red else DIM if t["kind"] == "undated" else ""),
                              (t["what"], RED if red else DIM if t["kind"] == "undated" else "")])
-            kids.append(Node("%s:t:%d:%s" % (base, i, t["what"]), kid, session=x["name"], hang=2))
+            kids.append(Node("%s:t:%d:%s" % (base, i, t["what"]), kid, session=x["name"], hang=2,
+                             todo=(tuple(t["keys"]), t["what"])))
         width = len(str(n_q))
         for i, (text, since, tag) in enumerate(x["qs"], 1):
             lead = "%*d. " % (width, i)
@@ -180,8 +213,11 @@ def needs_nodes(view, now, sort="oldest"):
             if tag:
                 t.append(" [%s]" % tag, style=DIM)
             kids.append(Node("%s:q:%d" % (base, i), t, session=x["name"], helper=tag, hang=len(lead)))
-        nodes.append(Node(base, _row_text(head), children=kids, session=x["name"],
-                          sort=_needs_key(sort, x)))
+        node = Node(base, _row_text(head), children=kids, session=x["name"], sort=_needs_key(sort, x))
+        preview = question_preview(x, now)
+        if preview:
+            node.head_shut = _row_text(head + [("\n" + preview, "")])
+        nodes.append(node)
     return nodes
 
 
@@ -207,7 +243,34 @@ def _item_node(prefix, row, now, datew):
         parts.append(("overdue ", RED))
     parts += [(row["what"], red), ("  " + names, DIM)]
     return Node("%s:%s:%s" % (prefix, row["bucket"], "|".join(map(str, _dedup(row)))), _row_text(parts),
-                session=row["sessions"][0], sessions=list(row["sessions"]), hang=len(lead))
+                session=row["sessions"][0], sessions=list(row["sessions"]), hang=len(lead),
+                todo=(tuple(row.get("keys", ())), row["what"]))
+
+
+def held_node(row, hold, now, datew):
+    """A snoozed or done item, dimmed, with when it comes back. S or x on it puts it back at once."""
+    names = "+".join(short_name(n) for n in row["sessions"])
+    kind, until = hold
+    when = "snoozed until " + datetime.fromtimestamp(until, LOCAL_TZ).strftime("%a %b %-d") if kind == "snoozed" \
+        else "done"
+    lead = _due(row, now).ljust(datew) + " " + _marker(row) + " "
+    t = _row_text([(lead + row["what"] + "  " + names + "  · " + when, DIM)])
+    return Node("held:%s" % "|".join(map(str, _dedup(row))), t, session=row["sessions"][0],
+                sessions=list(row["sessions"]), hang=len(lead), todo=(tuple(row["keys"]), row["what"]),
+                held=kind)
+
+
+def held_group(view, holds, now):
+    """The To-dos section for snoozed and done items, shown while `u` is on; None when there are none."""
+    rows = [(r, holds.row_status(r["keys"], now)) for r in view["held"]]
+    rows = [(r, h) for r, h in rows if h]
+    if not rows:
+        return None
+    datew = _datew([r for r, _h in rows], now)
+    head = _row_text([("Snoozed and done", "bold"), (" · %d" % len(rows), DIM)])
+    node = Node("todo-held", head, start_open=True, section=True)
+    node.children = [held_node(r, h, now, datew) for r, h in rows]
+    return node
 
 
 def _datew(rows, now):
@@ -461,11 +524,35 @@ def resume_node(e, now):
             t.append(": " + e["note"])
     line = left_off(e, now)
     body = [(Text("  "), Text(line, style=DIM))] if line else []
-    body += [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown"))),
-             (Text("  "), Text("session " + e["sid"], style=DIM))]
+    body += [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown")))]
     if e["persona"]:
         body.append((Text("  "), Text("%s's scheduled loop does not come back with it" % e["persona"], style=DIM)))
     return Node("res:" + e["sid"], t, body, resume=e["sid"], hang=2)
+
+
+def resume_details(e, now):
+    """The `i` view of a Resume row: the lines the row leaves out (the session ID and the transcript path)
+    beside the ones it shows."""
+    lines = [("name", clean(e["name"]) + (" (%s)" % e["persona"] if e["persona"] else "")),
+             ("last active", date_label(e["last"], now)),
+             ("folder", clean(e["cwd"]) if e["cwd"] else "folder unknown"),
+             ("session ID", e["sid"]),
+             ("transcript", clean(e["path"]) if e.get("path") else "no transcript found")]
+    if e["parked"]:
+        lines.append(("parked", date_label(e["parked_at"], now) + (": " + e["note"] if e["note"] else "")))
+    line = left_off(e, now)
+    if line:
+        lines.append(("last status", line))
+    tag = tags(e)
+    if tag:
+        lines.append(("state", ", ".join(tag)))
+    if e["persona"]:
+        lines.append(("note", "%s's scheduled loop does not come back with it" % e["persona"]))
+    t = Text()
+    for i, (label, value) in enumerate(lines):
+        t.append(("\n" if i else "") + label.ljust(13), style=DIM)
+        t.append(value)
+    return t
 
 
 def resume_nodes(entries, now, sort="recent", groups=None):
@@ -503,6 +590,11 @@ def owner_text(h, owners):
     return "owner: %s%s" % (h.owner, {"running": " (running)", "resume": " (can resume)"}.get(where, ""))
 
 
+def next_lines(h, now):
+    """The "next:" body lines of an index row: the command alone, so each fits one line at 100 columns."""
+    return [(Text("  "), Text("next: %s (y copies)" % c)) for c in h.next_commands(now)]
+
+
 def index_node(h, now, owners=None):
     """One index row: status and numbers, in words as well as color. Nothing from inside the index."""
     problems = h.problems(now)
@@ -532,9 +624,7 @@ def index_node(h, now, owners=None):
             (Text("  "), Text("group: %s" % h.group)),
             (Text("  "), Text("refresh schedule: %s" % ("installed, stale after %s" % _age_text(h.stale_after)
                                                          if h.scheduled else "not installed, stale after 2 d")))]
-    steps = h.next_steps(now)
-    body = [(Text("  "), Text(p, style=RED)) for p in problems] + [
-        (Text("  "), Text("next: " + t)) for t in steps] + body
+    body = [(Text("  "), Text(p, style=RED)) for p in problems] + next_lines(h, now) + body
     return Node("idx:" + h.name, _row_text(head), body, session=None, index=h.name, hang=2)
 
 
@@ -558,7 +648,7 @@ def index_problem_group(rows, now, owners=None):
     for h in bad:
         t = Text(h.name, style="bold")
         t.append("  " + "; ".join(h.problems(now)), style=RED)
-        body = [(Text("  "), Text("next: " + step)) for step in h.next_steps(now)]
+        body = next_lines(h, now)
         body.append((Text("  "), Text(owner_text(h, owners))))
         kids.append(Node("needs-idx:" + h.name, t, body, index=h.name, hang=2, start_open=True))
     head = _row_text([("Indexes", "bold"), (" · %d" % len(kids), DIM)])
@@ -600,7 +690,7 @@ def tab_counts(view, stale):
 
 
 def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None,
-               watches=(), held=(), todo_group=None, folders=None):
+               watches=(), held=(), todo_group=None, folders=None, holds=None, show_held=False):
     """(node tree of each tab, Needs row order).
 
     Each tab is in its chosen sort order, optionally wrapped in group sections. `seen` is the
@@ -615,9 +705,11 @@ def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), read
     flagged = watch_group(watches, now, held)
     if flagged is not None:
         needs_tab.append(flagged)
-    return [needs_tab,
-            todo_nodes(view, now, s[1], folders if todo_group == "folder" else grouping, todo_group),
-            sessions_nodes(view, stale, now, s[2], grouping, ready)], [n.key for n in needs]
+    todos = todo_nodes(view, now, s[1], folders if todo_group == "folder" else grouping, todo_group)
+    hidden = held_group(view, holds, now) if show_held and holds else None
+    if hidden is not None:
+        todos.append(hidden)
+    return [needs_tab, todos, sessions_nodes(view, stale, now, s[2], grouping, ready)], [n.key for n in needs]
 
 
 def needs_parts(view, short=False):
@@ -643,12 +735,25 @@ def needs_parts(view, short=False):
     return out
 
 
-def header_text(view, counts, now, warnings, short=False):
+def state_counts(view):
+    """{state: n} over the same rows the Sessions tab groups: working, quiet and idle, plus the Needs rows
+    for sessions that are not running."""
+    out = Counter("quiet" if x["quiet"] else "working" if x["working"] else "idle" for x in view["rows"])
+    out["not running"] = sum(1 for x in view["for_you"] if x.get("gone"))
+    return out
+
+
+def header_text(view, counts, now, warnings, short=False, index_problems=0, watch_flags=0, stamp=True):
+    """One line: what needs you, then how many sessions are in each state, with the rows' own words and
+    counts, so the header always matches the tabs below it."""
     when = datetime.fromtimestamp(now, LOCAL_TZ).strftime("%a %b %-d %-I:%M %p %Z")
-    rows = view["rows"]
-    n_work = sum(1 for x in rows if x["working"])
+    states = state_counts(view)
     parts = needs_parts(view, short)
-    bits = ["fleetwatch"] if short else ["fleetwatch", when]
+    if index_problems:
+        parts.append(("%d idx" % index_problems if short else plural(index_problems, "index problem"), RED))
+    if watch_flags:
+        parts.append(("%d watch" % watch_flags if short else plural(watch_flags, "watch flag"), ""))
+    bits = ["fleetwatch", when] if stamp and not short else ["fleetwatch"]
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(" · ".join(bits), style="")
     t.stylize("bold", 0, len("fleetwatch"))
@@ -659,10 +764,12 @@ def header_text(view, counts, now, warnings, short=False):
         if i:
             t.append(" · ")
         t.append(text, style=style)
-    rest = ["%d working" % n_work]
-    if view["quiet"]:
-        rest.append("%d quiet" % len(view["quiet"]))
-    rest.append("%d idle" % len(view["idle"]))
+    rest = ["%d working" % states["working"]]
+    if states["quiet"]:
+        rest.append("%d quiet" % states["quiet"])
+    rest.append("%d idle" % states["idle"])
+    if states["not running"]:
+        rest.append("%d not running" % states["not running"])
     t.append(" · " + " · ".join(rest))
     uniq = len({clean(w) for w in warnings})
     if uniq:

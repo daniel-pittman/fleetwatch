@@ -289,7 +289,8 @@ class AppTests(unittest.TestCase):
             app = self.app()
             async with app.run_test(size=(100, 20)) as pilot:
                 await boot(app, pilot)
-                app.snapshot.header.append(" · " + "x" * 120)
+                for h in (app.snapshot.header, app.snapshot.header_mid, app.snapshot.header_short):
+                    h.append(" · " + "x" * 120)
                 app.show_header()
                 await pilot.pause()
                 line = "".join(seg.text for seg in app.query_one("#top").render_line(0)).rstrip()
@@ -336,7 +337,7 @@ class AppTests(unittest.TestCase):
                 self.assertIn("1. Approve the schema change? · 3.0h", text)
                 self.assertIn("Needs a date: Email the registrar about the term dates", text)
                 await pilot.press("c")
-                self.assertNotIn("Approve the schema change", lst.visible_text())
+                self.assertNotIn("1. Approve the schema change", lst.visible_text())
         run(go())
 
     def test_todos_tab_orders_undated_then_dated_then_also_noted(self):
@@ -500,14 +501,16 @@ class AppTests(unittest.TestCase):
                 self.assertGreater(app.refreshes, n)
         run(go())
 
-    def test_help_opens_and_any_key_closes(self):
+    def test_help_opens_and_escape_closes_while_other_keys_do_not(self):
         async def go():
             app = self.app()
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("question_mark")
                 self.assertEqual(type(app.screen).__name__, "HelpScreen")
-                await pilot.press("x")
+                await pilot.press("x")             # not a closing key: help scrolls, so it stays up
+                self.assertEqual(type(app.screen).__name__, "HelpScreen")
+                await pilot.press("escape")
                 self.assertEqual(type(app.screen).__name__, "Screen")
                 await pilot.press("q")
         run(go())

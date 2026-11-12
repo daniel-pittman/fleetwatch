@@ -367,7 +367,7 @@ def render(sections, stale, now, color, warnings, width=WIDTH, utf8=True, show_a
 
 
 def snapshot(window_s, show_all, horizon_days, as_json, paths, with_groups=False):
-    from .config import load_groups
+    from .config import color_enabled, load_groups
     sections, stale, now, warnings = collect(window_s, show_all, paths)
     groups, bad = load_groups(create=False)
     if bad:
@@ -375,6 +375,6 @@ def snapshot(window_s, show_all, horizon_days, as_json, paths, with_groups=False
     if as_json:
         return json.dumps(to_json(sections, stale, now, window_s, warnings, horizon_days, groups), indent=2)
     cols = shutil.get_terminal_size((WIDTH, 24)).columns
-    return render(sections, stale, now, sys.stdout.isatty(), warnings, width=cols,
+    return render(sections, stale, now, sys.stdout.isatty() and color_enabled(), warnings, width=cols,
                   utf8=is_utf8(sys.stdout), show_all=show_all, horizon_days=horizon_days,
                   groups=groups if with_groups else None)

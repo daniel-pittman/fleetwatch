@@ -172,21 +172,24 @@ class TabTests(BoardCase):
         self.assertNotIn("storefront-sessions", text)
         self.assertEqual(count, 4 + 3 + 2)              # four sessions need you, three indexes, two watch rows
 
-    def test_y_copies_a_search_command_for_the_highlighted_index(self):
+    def test_y_copies_the_next_command_for_a_problem_and_a_search_for_a_healthy_index(self):
         async def script(app, pilot):
             copied = []
             app.copy_to_clipboard = copied.append
             await pilot.press("5")
             lst = app.lists[views.INDEXES_TAB]
             await pilot.press("y")                      # on a group header: says what y does, copies nothing
+            lst.move_to("idx:storefront-sessions")
+            await pilot.press("y")
             lst.move_to("idx:release-history")
             await pilot.press("y")
             await pilot.pause(0.2)
             return copied, app.status_text, app.footer_plain
         copied, status, footer = self.board((140, 40), script)
-        self.assertEqual(copied, ['fleetwatch search --index release-history "'])
+        self.assertEqual(copied, ['fleetwatch search --index storefront-sessions "',
+                                  "fleetwatch index status release-history"])
         self.assertIn("copied", status)
-        self.assertIn("y copy search", footer)
+        self.assertIn("y copy", footer)
         self.assertTrue(any("  y " in line and "search" in line for line in fapp.HELP_LINES))
 
     def test_missing_extra_shows_one_line(self):
