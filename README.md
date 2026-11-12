@@ -69,6 +69,14 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 
    Write it whenever your questions change, and at the end of any turn that leaves
    work running. Subagents do not write it; their session does.
+
+   Recommended, if you use session memory: at the start of a new interactive
+   session with no index of its own (`fleetwatch search "x"` answers "no index
+   is registered for the session"), ask me
+   once whether this session should have one, and in which group
+   (`fleetwatch index list` shows the groups). On yes, run
+   `fleetwatch index add --group <group>`, then `fleetwatch index refresh`.
+   Do not ask again once I have answered.
    ```
 
    A session then writes, for example:
@@ -83,7 +91,7 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
    `write-status` finds the session it runs under, stamps the name, id and time, and refuses a malformed item with a message that tells the session how to fix it, so sessions learn the format on their first try. The full format is under How sessions report.
 
 4. **Run the board.** `fleetwatch` in any terminal, or Control-Shift-F.
-5. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. A session can opt itself in, with no setup by hand: ask it to "give yourself a fleetwatch index in the work group", and it runs `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). `index add` finds the session it runs under and registers that session's own transcripts. From then on, the session searches its own memory with `fleetwatch search "what did we decide about retries"`. To make that the default, add a line to the same `CLAUDE.md` block, for example: "A long-running session may give itself a fleetwatch index with `fleetwatch index add --group <group>`; a private session does not."
+5. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. A session can opt itself in, with no setup by hand: ask it to "give yourself a fleetwatch index in the work group", and it runs `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). `index add` finds the session it runs under and registers that session's own transcripts. From then on, the session searches its own memory with `fleetwatch search "what did we decide about retries"`. The recommended paragraph in the step 3 block makes every new session ask you this once, so no session is indexed without your yes.
 6. **Keep the indexes fresh.** `fleetwatch index schedule install`, then run the `launchctl` (or `systemctl`) command it prints.
 
 ## The three layers
