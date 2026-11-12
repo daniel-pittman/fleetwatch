@@ -7,7 +7,9 @@ core set plus the rule packs settings.toml enables.
 Replacements: secrets -> [secret], emails not on the allowlist -> [email], phone numbers ->
 [phone], numbers beside an id word ("user", "login", plus each pack's words) and each pack's
 id patterns -> [id], keyed identifiers (uid, oid, tenant, sub) -> [id], person names spaCy finds
-that are not allowlisted -> [name]. Categories and counts are recorded, never values.
+that are not allowlisted -> [name]. An all-capital surname ("Jean DUPONT", "DUPONT, Jean") is a
+name when it is on the Census surname list (data/) and not a known acronym. Categories and
+counts are recorded, never values.
 
 Needs spaCy with en_core_web_sm (the `memory` extra). spaCy loads lazily, so a run that has
 nothing to scan never pays for it.
@@ -33,14 +35,16 @@ optional):
     institution_words: [lowercase words never redacted as part of a name]
     column_denylist: [spreadsheet headers whose columns document conversion drops]
 """
+import gzip
 import hashlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 import yaml
 
-SCAN_RULES_VERSION = 17
+SCAN_RULES_VERSION = 18
 
 EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 # A local part whose domain was cut off ("jdoe@" in a table cell) still carries a surname.
@@ -82,12 +86,26 @@ def name_parts(toks):
 # A name ends before anything but a word character or an apostrophe that starts one, so a
 # possessive apostrophe ("Dr. Jones' lab") ends the name instead of hiding it.
 NAME_END = r"(?!\w|['\u2019]\w)"
+# An all-capital part: two or more capitals, with an apostrophe allowed between two
+# ("O'BRIEN"). Each repetition takes exactly one capital, so a long run backtracks linearly.
+CAPS_PART = r"[{u}](?:['\u2019]?[{u}])+".format(u=NAME_UPPER)
+CAPS_PART_RE = re.compile(CAPS_PART)
 # A title followed by one or two capitalized words, with particles between them, is a person
 # even when spaCy does not tag it ("Dean Marigold Thistlewaite" quoted inside a sentence). The
-# title stays; the words that are neither institutional nor allowlisted become [name].
+# title stays; the words that are neither institutional nor allowlisted become [name]. After
+# the first token a part may be all capitals ("Dr. Smith-JONES"); the scan redacts it only when
+# surname_ok passes and leaves it, and all that follows it, otherwise ("Dr. Smith API"). The
+# first token is always mixed case, so "Dr. API" and "Dr. JONES" never match.
+_TITLE_PART = r"(?:%s|%s)" % (NAME_TOKEN, CAPS_PART)
 TITLE_NAME_RE = re.compile(
     r"\b(Dean|Provost|Chancellor|President|Professor|Prof\.|Dr\.|Dr|Mr\.|Mrs\.|Ms\.|Mx\.)"
-    r"( %s(?: %s%s)?)%s" % (NAME_WORD, NAME_GAP, NAME_WORD, NAME_END))
+    r"( {t}(?:-{g}{p})*(?: {gap}{p}(?:-{g}{p})*)?){end}".format(
+        t=NAME_TOKEN, p=_TITLE_PART, g=NAME_GLUED, gap=NAME_GAP, end=NAME_END))
+# A roster entry, "SURNAME, Given" or "SURNAME, Given Middle". The scan redacts it only when the
+# surname passes surname_ok and spaCy tagged the surname or a given name as a person, or the
+# denylist holds one of them, so "NASA, Boeing" stays.
+ROSTER_RE = re.compile(r"(?<![\w'\u2019-])(%s), (%s)(?: (%s))?%s" % (
+    CAPS_PART, NAME_WORD, NAME_WORD, NAME_END))
 # North American phone numbers with separators: 303-555-1234, (303) 555-1234, 303.555.1234,
 # +1 303 555 1234. A bare 10-digit run is left alone (run ids and counts look the same).
 PHONE_RE = re.compile(
@@ -288,6 +306,82 @@ NAMEISH_RE = re.compile(
     r"^(?=(?:.*[ -])?[{u}][{lo}'\u2019])(?!(?:[^ -]*[ -]){{6}})"
     r"(?:{t}|[{u}]\.)(?:[ -]{g}(?:{t}|[{u}]\.))*$".format(
         t=NAME_TOKEN, u=NAME_UPPER, lo=NAME_LOWER, g=NAME_GAP))
+
+# Acronyms and capitalized words that are also US Census surnames, or that an all-capital part
+# could be confused with: an all-capital part on this list is never a surname. The surname list
+# alone already rules out an acronym it does not hold (API, AWS, NASA); this list covers the
+# ones it does (AI, CI, IP, OS, REST, USA, CEO, the state codes, the month names).
+ACRONYM_STOPLIST = frozenset(w.lower() for w in """
+API AWS SSO ITS MSU NASA CS IT AI ML UI UX PR CI CD URL URI PDF SQL CSV JSON XML HTML CSS JS TS
+IDE CLI GUI OS VM GPU CPU RAM SSD USB LAN WAN VPN DNS IP TCP UDP HTTP HTTPS SSH SSL TLS FTP REST
+RPC SDK LLM NLP GPT RAG MCP IAM GCP SLA KPI ROI CEO CTO CFO COO CIO VP HR QA PO FAQ TBD ETA
+FYI ASAP OK UUID MFA SAML JWT CORS DOM NPM GIT MIT BSD ORM ETL BI DAG MVP SOC SOX NIST ISO
+MAC ARM PIN TAR SHA AES RSA SIEM APP APPS ARN AUTH BOT CAP CAT DEV DIR ENI EXE FIX HUB JAR JOB
+NAT NER NET NIC OGG POS RAW RES RUN TAG TOP VAR WEB ZEN ROC
+PHI PII SIS LMS FERPA HIPAA GDPR MOU NDA RFP RFC LLC INC LTD BA BS MA MS PHD JD MBA PI RA TA
+GE REU RET ACS BEA AMA AMI AMS APA SIAM FAU UVA
+USA US UK EU UN NYC LA SF CU NATO CIA FBI IRS NSF NIH DOE DOD EPA FDA CDC WHO IEEE ACM ADA
+AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY ME MD MI MN MO MT NE NV NH NJ NM NY NC ND
+OH OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC
+AM PM EST PST UTC GMT MST CST EDT PDT MDT JAN FEB MAR APR MAY JUN JUL AUG SEP SEPT OCT NOV DEC
+MON TUE WED THU FRI SAT SUN
+NOTE TODO FIXME XXX HACK WARNING WARN ERROR DEBUG INFO FATAL TRACE DONE FAIL PASS SKIP NEW OLD
+TRUE FALSE NULL NIL NONE YES NO AKA IMO CC BCC RE FW FWD PS NB
+ALL AND BUT BY FOR FROM ON THE THEN ELSE WHILE END ONLY JUST VERY MORE LESS NOW MUST WILL
+""".split())
+
+SURNAMES_FILE = "data/census_surnames_2010.txt.gz"
+_SURNAMES = None
+
+
+def surnames():
+    """The 2010 US Census surname list, lowercased, read on first use (see data/README.md)."""
+    global _SURNAMES
+    if _SURNAMES is None:
+        from importlib import resources
+        raw = resources.files("fleetwatch.memory").joinpath(SURNAMES_FILE).read_bytes()
+        _SURNAMES = frozenset(gzip.decompress(raw).decode("ascii").split())
+    return _SURNAMES
+
+
+def surname_ok(part):
+    """True when all-capital `part` may be a surname: two or more letters, not on
+    ACRONYM_STOPLIST, and on the Census list (compared without apostrophes or accents, the
+    list's own spelling)."""
+    letters = re.sub(r"['\u2019]", "", part)
+    if len(letters) < 2 or not letters.isalpha() or not letters.isupper():
+        return False
+    low = letters.lower()
+    base = unicodedata.normalize("NFKD", low).encode("ascii", "ignore").decode()
+    if low in ACRONYM_STOPLIST or base in ACRONYM_STOPLIST:
+        return False
+    return base in surnames()
+
+
+# An all-capital part of a spaCy span: a whole space- or hyphen-separated part.
+CAPS_IN_SPAN_RE = re.compile(r"(?<![^ -])%s(?![^ -])" % CAPS_PART)
+NAME_TOKEN_RE = re.compile(NAME_TOKEN)
+
+
+def person_shaped(x):
+    """True when spaCy PERSON span `x` is kept as a name: NAMEISH_RE matches it, or it does
+    once each all-capital part is taken as a name token, where the span also holds a
+    mixed-case name token and every all-capital part passes surname_ok. "Jean DUPONT" is a
+    name; "Claude API", "Jean USA" and the all-capital "GARCIA" are not."""
+    if NAMEISH_RE.match(x):
+        return True
+    if not CAPS_IN_SPAN_RE.search(x):
+        return False
+    if not any(NAME_TOKEN_RE.fullmatch(t) for t in re.split(r"[ -]", x)):
+        return False
+    ok = True
+
+    def swap(m):
+        nonlocal ok
+        ok = ok and surname_ok(m.group(0))
+        return "Xx"
+    y = CAPS_IN_SPAN_RE.sub(swap, x)
+    return ok and bool(NAMEISH_RE.match(y))
 
 
 # A name this scan redacts is written as NAME_MARK until the pairing check has run, so a
@@ -491,24 +585,52 @@ class Scanner:
         return bool(parts) and all(p in self.inst or p in self.names for p in parts)
 
     @staticmethod
-    def person_candidates(texts):
-        """Distinct name-shaped PERSON entities per text, from spaCy."""
+    def person_found(texts):
+        """Per text: (distinct name-shaped PERSON entities, the set of every word in any
+        PERSON entity), from spaCy. The words let the roster rule ask whether spaCy saw a
+        person in "DUPONT, Jean", where it tags only one of the two."""
         pieces, owners = [], []
         for i, t in enumerate(texts):
             for piece in split_pieces(t):
                 pieces.append(piece)
                 owners.append(i)
         found = [set() for _ in texts]
-        if not pieces:
-            return [[] for _ in texts]
-        for i, doc in zip(owners, nlp().pipe(pieces, batch_size=8)):
+        seen = [set() for _ in texts]
+        for i, doc in zip(owners, nlp().pipe(pieces, batch_size=8) if pieces else ()):
             for e in doc.ents:
                 if e.label_ != "PERSON":
                     continue
+                seen[i].update(re.findall(r"\w+", e.text))
                 x = re.sub(r"'s$|\u2019s$", "", e.text.strip().strip("'\u2019").strip())
-                if len(x) >= 3 and NAMEISH_RE.match(x):
+                if len(x) >= 3 and person_shaped(x):
                     found[i].add(x)
-        return [sorted(f) for f in found]
+        return [(sorted(f), w) for f, w in zip(found, seen)]
+
+    @staticmethod
+    def person_candidates(texts):
+        """Distinct name-shaped PERSON entities per text, from spaCy."""
+        return [f for f, _ in Scanner.person_found(texts)]
+
+    def caps_surname(self, part):
+        """True for an all-capital part that is redacted as a surname."""
+        low = part.lower()
+        return surname_ok(part) and low not in self.names and low not in self.inst
+
+    def roster_entry(self, m, seen):
+        """The replacement for ROSTER_RE match `m`, or None to leave it. `seen` holds the
+        words of the text's PERSON entities."""
+        sur, given, mid = m.group(1), m.group(2), m.group(3)
+        if not self.caps_surname(sur):
+            return None
+        plain = lambda w: all(p.lower() not in self.names and p.lower() not in self.inst
+                              for p in w.split("-"))
+        known = lambda w: any(p in seen or token_hash(p) in self.deny for p in w.split("-"))
+        if not plain(given) or not (known(sur) or known(given)):
+            return None
+        out = NAME_MARK + ", " + NAME_MARK
+        if mid:
+            out += " " + (NAME_MARK if plain(mid) and known(mid) else mid)
+        return out
 
     def scan_groups(self, groups, triage=None, chunk=100):
         """groups: list of lists of strings (the fields of one record or one document).
@@ -533,9 +655,9 @@ class Scanner:
         has_keep = bool(self.keep_lit_re or self.keep_res)
         texts = ["\n\n".join(self.mask_keep(g, {}, {}, count=False) if has_keep else g)
                  for g in groups]
-        cands = self.person_candidates(texts) if self.person_names else [[] for _ in texts]
+        found = self.person_found(texts) if self.person_names else [([], set()) for _ in texts]
         out = []
-        for fields, names in zip(groups, cands):
+        for fields, (names, seen) in zip(groups, found):
             cats, fields = {}, list(fields)
             store = {}
 
@@ -593,6 +715,14 @@ class Scanner:
                     for m in rx.finditer(joined):
                         if m.group(1) in hits:
                             pairing = True
+            if self.person_names:
+                def roster(m):
+                    rep = self.roster_entry(m, seen)
+                    if rep is None:
+                        return m.group(0)
+                    cats["person-name"] = cats.get("person-name", 0) + 1
+                    return rep
+                fields = [ROSTER_RE.sub(roster, f) for f in fields]
             # A phrase that mixes institutional words with a name ("Academic Freedom",
             # "Dean Marigold Thistlewaite") keeps its institutional words; only the rest is
             # redacted, so the surrounding governance or course text stays searchable.
@@ -617,18 +747,36 @@ class Scanner:
             if self.person_names:
                 def titled(m):
                     words = m.group(2).split()
-                    out = [w if (w.lower() in self.inst or w.lower() in self.names) else NAME_MARK
-                           for w in words]
+                    keep = lambda w: w.lower() in self.inst or w.lower() in self.names
+                    out = []
+                    for i, w in enumerate(words):
+                        parts = w.split("-")
+                        bad = next((j for j, p in enumerate(parts) if CAPS_PART_RE.fullmatch(p)
+                                    and not self.caps_surname(p)), None)
+                        if bad is None:
+                            out.append(w if keep(w) else NAME_MARK)
+                            continue
+                        # An all-capital part that is not a surname ends the name: it and
+                        # everything after it stay ("Dr. Smith-API", "Dr. Smith API").
+                        head = "-".join(parts[:bad])
+                        if head and head.lower() not in ("al", "el") and not keep(head):
+                            head = NAME_MARK
+                        out.append((head + "-" if head else "") + "-".join(parts[bad:]))
+                        out += words[i + 1:]
+                        break
                     if out == words:
                         return m.group(0)
                     cats["person-name"] = cats.get("person-name", 0) + 1
                     return m.group(1) + " " + " ".join(out)
                 fields = [TITLE_NAME_RE.sub(titled, f) for f in fields]
             # Each part of a spaced name is redacted wherever it appears; a glued "al-" part is
-            # also redacted without its prefix. A particle never is.
+            # also redacted without its prefix. A particle never is, and neither is an
+            # all-capital part: spread through the text, a surname such as WHITE or KING
+            # would take the same word written as a heading or an acronym.
             comps = {c for n in hits if " " in n for p in name_parts(n.split())
                      for c in {p, re.sub(r"^(?:al|el)-", "", p)}
-                     if len(c) >= 3 and c.lower() not in self.names and c.lower() not in self.inst}
+                     if len(c) >= 3 and c.lower() not in self.names and c.lower() not in self.inst
+                     and not CAPS_PART_RE.fullmatch(c)}
             for c in sorted(comps, key=len, reverse=True):
                 sub_all(re.compile(name_rx(c)), NAME_MARK, "person-name")
             if self.deny:
