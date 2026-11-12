@@ -44,7 +44,7 @@ from pathlib import Path
 
 import yaml
 
-SCAN_RULES_VERSION = 18
+SCAN_RULES_VERSION = 19
 
 EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 # A local part whose domain was cut off ("jdoe@" in a table cell) still carries a surname.
@@ -152,9 +152,30 @@ KEYED_ID_RE = re.compile(
     r"[\"']?\s*[:=]\s*[\"']?)(?:%s|[A-Za-z0-9]{24,36})(?![A-Za-z0-9-])" % UUID)
 
 
+# One segment of a document name between hyphens and underscores: a number or date part, a
+# word with a vowel in lower, Title or UPPER case ("Faculty", "AY"), a short code with a
+# letter and a digit ("AY2026", "v2", "Q3"), or an acronym ("CS"). A random token segment
+# fits none of these except by chance, and a token of 40 or more characters needs a long
+# segment, which only the number and word shapes admit.
+NAME_SEGMENT_RE = re.compile(
+    r"[0-9]+"
+    r"|(?=[A-Za-z]*[AEIOUYaeiouy])(?:[a-z]{2,}|[A-Z][a-z]+|[A-Z]{2,})"
+    r"|(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*[0-9])[A-Za-z0-9]{2,6}"
+    r"|[A-Z]{2,6}")
+
+
+def looks_like_document_name(s):
+    """True for a run of 3 or more word-like segments ("2026-07-01_Faculty-Handbook_AY2026-27").
+    A run of separators counts as one."""
+    segs = [p for p in re.split(r"[-_]+", s) if p]
+    return len(segs) >= 3 and all(NAME_SEGMENT_RE.fullmatch(p) for p in segs)
+
+
 def looks_secret_b64(s):
     if re.fullmatch(r"[0-9a-fA-F]+", s):
         return False                      # git sha / hex digest
+    if looks_like_document_name(s):
+        return False                      # dated document name, not a token
     if not (re.search(r"[a-z]", s) and re.search(r"[A-Z]", s) and re.search(r"\d", s)):
         return False
     digits = sum(c.isdigit() for c in s)
