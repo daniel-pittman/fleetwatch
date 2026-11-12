@@ -103,7 +103,7 @@ class BoardTests(unittest.TestCase):
     def test_z_toggles_every_row_and_group_on_every_tab(self):
         async def script(app, pilot):
             seen = {}
-            for tab in range(4):
+            for tab in range(5):
                 await pilot.press(str(tab + 1))
                 await pilot.pause(0.2)
                 lst = app.lists[tab]

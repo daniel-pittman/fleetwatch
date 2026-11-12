@@ -66,7 +66,7 @@ class OrderTests(World):
 
     def test_count_is_undated_plus_dated_without_also_noted(self):
         self.assertEqual(views.tab_counts(self.view, self.stale)[1], 5)
-        self.assertEqual(len(views.TAB_TITLES), 4)
+        self.assertEqual(len(views.TAB_TITLES), 5)
         self.assertEqual(views.RESUME_TAB, 3)
 
     def test_build_tabs_has_three_node_lists(self):

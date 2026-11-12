@@ -1122,7 +1122,7 @@ class AppTests(AppWorld):
             async with app.run_test(size=(80, 24)) as pilot:
                 await boot(app, pilot)
                 bar = app.query_one(fapp.TabBar)
-                bar.update_tabs([14, 22, 39, 20], 0)
+                bar.update_tabs([14, 22, 39, 20, 4], 0)
                 self.assertIn("3 Sessions", bar.plain)
                 self.assertLessEqual(len(bar.plain), 78)
         asyncio.run(go())
