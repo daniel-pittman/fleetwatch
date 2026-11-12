@@ -125,15 +125,27 @@ Tabs (switch with `1` to `5`, Tab, Shift-Tab or the mouse; each label carries a 
 
 Mouse: a click selects a row (and opens or closes it), a double click jumps like Enter; clicking a tab label switches tabs.
 
-Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder (on Your to-dos it cycles by day, by project folder and no groups), `m` moves the highlighted session to another group, `/` or Ctrl-K finds a session by name, `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `r` refreshes now, `y` copies a search command on the Indexes tab, `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
+Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder (on Your to-dos it cycles by day, by project folder and no groups), `m` moves the highlighted session to another group, `/` finds a row on the current tab and Ctrl-K finds a live session from any tab (see Find a row), `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `r` refreshes now, `y` copies a search command on the Indexes tab, `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
 
 A footer line above the tab bar always shows the key hints for the tab you are on. On a narrow terminal it drops the least important hints (hide, refresh, groups, move, sort, fold all) rather than wrapping, and always keeps Enter, `/ find`, Space, `?` and `q`. The `m` hint appears only when a session row is selected.
 
-### Find a session
+### Find a row
 
-`/` (or Ctrl-K) opens a small search box over any tab. As you type, the list filters every top-level live session by fuzzy match on its name and persona: `bil` or `robin` finds "Billing API (Robin)", `ds` finds "Docs Site". Several words must each match. Ranking: a prefix of the name or persona first, then a word-start or initials match, then a substring, then a subsequence; ties go to the most recently active session. With an empty query the list is the live sessions, most recently active first.
+`/` opens a small search box over the current tab's rows; Ctrl-K opens the live-session finder from any tab (see below). As you type, the list filters by fuzzy match: `bil` or `robin` finds "Billing API (Robin)", `ds` finds "Docs Site". Several words must each match. Ranking: a prefix first, then a word-start or initials match, then a substring, then a subsequence; ties go to the shallower row, or the most recently active one.
 
-Each result shows the name, persona, group and a short status (`3 questions`, `needs you`, `working`, `idle`, or `not in iTerm`). Up/down or Ctrl-N/Ctrl-P move, Enter jumps to the session's iTerm2 tab (the same jump as on a row), and Esc closes. After a successful jump the box closes and the status line says `jumped to <name>`; a session that is not in iTerm2 shows the usual message and the box stays open.
+What each tab searches, and what Enter then does (it is exactly Enter on that row, with the same confirmations and safety rules; Esc closes the box and does nothing):
+
+| Tab | `/` matches | Enter |
+|---|---|---|
+| Needs you | every row: sessions, their item rows, helpers; the row text and its session's name | jumps to the session, as on the row |
+| Your to-dos | the to-do's text, date and session names, including rows inside closed groups | jumps to the session (a picker when several share it) |
+| Sessions | the row text and session name, helpers included | jumps to the session or helper |
+| Resume | name, persona and folder | resumes here; Ctrl-O opens a new window |
+| Indexes | the index name, group and owner it shows; never what is inside the index | goes to the owner, or says which command to run |
+
+A row hidden in a closed group opens when you choose it. Each result shows the row's text and its group.
+
+**Ctrl-K, the live-session finder.** From any tab it lists every top-level live session by name and persona, most recently active first when the box is empty. Each result shows the name, persona, group and a short status (`3 questions`, `needs you`, `working`, `idle`, or `not in iTerm`). Enter jumps to the session's iTerm2 tab; after a successful jump the box closes and the status line says `jumped to <name>`; a session that is not in iTerm2 shows the usual message and the box stays open. Up/down or Ctrl-N/Ctrl-P move in either box.
 
 ### Sorting
 
@@ -223,7 +235,7 @@ Matching is loose on name and persona, best band only: an exact name, then word 
 
 A new window runs `fleetwatch resume <id> --here` through your login shell, as the hotkey profile runs fleetwatch, and closes when the session ends. Only the session ID is in that command, so a folder or session name never passes through a shell, and nothing is typed into a prompt. fleetwatch checks again in the new window. A refusal there waits for Enter, so the window does not vanish with the reason in it.
 
-**The Resume tab.** A closed row shows the name, date, folder and, for a parked session, its note. Space opens it to the left-off line, the full folder and the session ID; `z` opens or closes every row. Enter resumes in this terminal: fleetwatch exits, the terminal is restored, and it chdirs and execs `claude --resume <id>`, so nothing is left wrapping the session. `o` opens a new iTerm window instead and fleetwatch stays. `/` finds by part of a name or persona; Enter resumes and Ctrl-O opens a new window. `s` sorts and `G` groups, as on other tabs. In the fleetwatch hotkey window Enter also opens a new window, because that window is fleetwatch's and floats over everything.
+**The Resume tab.** A closed row shows the name, date, folder and, for a parked session, its note. Space opens it to the left-off line, the full folder and the session ID; `z` opens or closes every row. Enter resumes in this terminal: fleetwatch exits, the terminal is restored, and it chdirs and execs `claude --resume <id>`, so nothing is left wrapping the session. `o` opens a new iTerm window instead and fleetwatch stays. `/` finds by part of a name, persona or folder; Enter resumes and Ctrl-O opens a new window. `s` sorts and `G` groups, as on other tabs. In the fleetwatch hotkey window Enter also opens a new window, because that window is fleetwatch's and floats over everything.
 
 **Where it left off.** Every stopped session's opened row shows where it left off, taken from its last status file (found by session ID, then by name, in the status folder or `.pruned/`): `was: <working_on> · next: <date> <your earliest dated item> · N questions · status <age> ago`. Nothing has to happen when the session closes. A session with no status file shows no line. The command-line list shows the same line, and resuming prints it.
 

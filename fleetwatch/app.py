@@ -29,6 +29,7 @@ TAB_OPEN_RESCAN_SECONDS = 15.0
 # A window just opened takes a few seconds to show up as a live session. Until it can, this is what
 # stops a second press from putting two processes on one transcript.
 REOPEN_GUARD_SECONDS = 30.0
+FIND_NOUNS = ("a row on Needs you", "a to-do", "a session", "a session to resume", "an index")
 FIND_ROW_ROOM = 60                        # the find box's row width less its separators
 CURSOR = "reverse"
 OPEN, SHUT = "▾", "▸"
@@ -42,7 +43,9 @@ HELP_LINES = [
     "                            tab, else the parent's); on a section header, fold it;",
     "                            on a row tagged 'not running', offer to reopen it",
     "  click, double click       select the row; double click jumps like Enter",
-    "  /, Ctrl-K                 find a session by part of its name or persona, Enter jumps",
+    "  /                         find a row on this tab by part of its text; Enter does what",
+    "                            Enter does on that row",
+    "  Ctrl-K                    find a live session from any tab, Enter jumps",
     "  Space                     open or close the row (▸ closed, ▾ open)",
     "  right arrow, left arrow   open, close",
     "  z                         fold all: open every row and group in this tab, or close them all",
@@ -66,7 +69,7 @@ HELP_LINES = [
     "On the Resume tab (4):",
     "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
     "  o                         resume in a new iTerm window (Ctrl-O in the find box)",
-    "  /                         find by part of a name; Enter resumes",
+    "  /                         find by part of a name or folder; Enter resumes",
     "",
     "In the fleetwatch hotkey window:",
     "  ⌃⇧F hides this window; q quits fleetwatch; a resume always opens a new window",
@@ -563,6 +566,8 @@ class FindScreen(ModalScreen):
         Binding("up,ctrl+p", "step(-1)", show=False, priority=True),
     ]
 
+    PLACEHOLDER = "Jump to session: type part of a name or persona"
+
     def __init__(self, entries):
         super().__init__()
         self.entries = entries
@@ -570,7 +575,7 @@ class FindScreen(ModalScreen):
 
     def compose(self):
         with Vertical(id="finder"):
-            yield Input(placeholder="Jump to session: type part of a name or persona", id="query")
+            yield Input(placeholder=self.PLACEHOLDER, id="query")
             yield OptionList(id="results")
 
     def on_mount(self):
@@ -621,15 +626,23 @@ class FindScreen(ModalScreen):
         self.dismiss()
 
 
+class TabFindScreen(FindScreen):
+    """The find box over one tab's rows. Enter closes it and does what Enter does on the chosen row."""
+
+    def __init__(self, entries, noun):
+        super().__init__(entries)
+        self.PLACEHOLDER = "Find %s: type part of its text, name or group" % noun
+
+    def submit(self, entry):
+        self.dismiss(entry)
+
+
 class ResumeFindScreen(FindScreen):
     """The find box over the Resume tab: Enter resumes here, Ctrl-O opens a new window."""
 
     BINDINGS = FindScreen.BINDINGS + [Binding("ctrl+o", "new_window", show=False, priority=True)]
 
-    def compose(self):
-        with Vertical(id="finder"):
-            yield Input(placeholder="Resume session: type part of a name or persona", id="query")
-            yield OptionList(id="results")
+    PLACEHOLDER = "Resume session: type part of a name, persona or folder"
 
     def submit(self, entry):
         self.app.start_resume(entry["sid"], True)
@@ -841,7 +854,8 @@ class FleetwatchApp(App):
         Binding("pagedown", "page(1)", show=False),
         Binding("enter", "enter", show=False),
         Binding("g", "jump", show=False),
-        Binding("slash,ctrl+k", "find", show=False),
+        Binding("slash", "find", show=False),
+        Binding("ctrl+k", "find_sessions", show=False),
         Binding("space", "toggle", show=False),
         Binding("right,l", "open", show=False),
         Binding("left,h", "close", show=False),
@@ -1282,14 +1296,71 @@ class FleetwatchApp(App):
                         "status": status, "updated": x["updated"]})
         return out
 
+    def action_find_sessions(self):
+        """Ctrl-K: the live-session finder, from any tab."""
+        if self.snapshot is None:
+            self.say("still loading")
+            return
+        self.push_screen(FindScreen(self.find_entries()))
+
     def action_find(self):
+        """/: find a row on the current tab."""
         if self.snapshot is None:
             self.say("still loading")
             return
         if self.active == views.RESUME_TAB:
             self.push_screen(ResumeFindScreen(self.resume_find_entries()))
             return
-        self.push_screen(FindScreen(self.find_entries()))
+        entries = self.index_find_entries() if self.active == views.INDEXES_TAB else self.row_find_entries()
+        self.push_screen(TabFindScreen(entries, FIND_NOUNS[self.active]),
+                         lambda chosen: chosen and self.find_row(chosen))
+
+    def row_find_entries(self):
+        """Every row on the current tab that Enter acts on, headers left out, with the text it shows."""
+        snap, out = self.snapshot, []
+
+        def walk(nodes, depth):
+            for n in nodes:
+                if not n.section:
+                    text = " ".join(n.head.plain.split())
+                    names = [x for x in ([n.session] if n.session else []) + list(n.sessions) if x]
+                    group = snap.grouping.of(n.session) if n.session else ""
+                    # Ties go to the shallower row, so a session outranks its own question rows.
+                    out.append({"key": n.key, "name": text, "persona": "", "status": "", "updated": -depth,
+                                "group": group, "fields": [text] + names})
+                walk(n.children, depth + 1)
+        walk(self.current.nodes, 0)
+        return out
+
+    def index_find_entries(self):
+        """Indexes match on the name, group and owner the row shows, never on what is inside the index."""
+        out = []
+        for h in self.snapshot.indexes.rows:
+            out.append({"key": "idx:" + h.name, "name": h.name, "persona": "", "status": "", "updated": 0,
+                        "group": "%s%s" % (h.group, "  owner: " + h.owner if h.owner else ""),
+                        "fields": [h.name, h.group, h.owner]})
+        return out
+
+    def find_row(self, entry):
+        """Put the cursor on the chosen row (opening what hides it) and press Enter on it."""
+        lst = self.current
+
+        def path(nodes, trail):
+            for n in nodes:
+                if n.key == entry["key"]:
+                    return trail
+                found = path(n.children, trail + [n.key])
+                if found is not None:
+                    return found
+            return None
+        trail = path(lst.nodes, [])
+        if trail is None:
+            self.say("that row is gone")
+            return
+        for key in trail:
+            lst.set_open(key, True)
+        lst.move_to(entry["key"])
+        self.action_enter()
 
     def resume_find_entries(self):
         now, out = time.time(), []
@@ -1299,6 +1370,7 @@ class FleetwatchApp(App):
             # A row that wraps would hide the next result, so the folder takes only what is left.
             used = len(e["name"]) + len(date) + len(status) + (len(e["persona"]) + 3 if e["persona"] else 0)
             out.append({"sid": e["sid"], "name": e["name"], "persona": e["persona"], "updated": e["last"],
+                        "fields": [e["name"], e["persona"] or "", resume.short_folder(e["cwd"], 200)],
                         "group": "%s  %s" % (date, resume.short_folder(e["cwd"], max(FIND_ROW_ROOM - used, 8))),
                         "status": status})
         return out

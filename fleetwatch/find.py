@@ -34,10 +34,11 @@ def score(query, fields):
 
 
 def rank(query, entries):
-    """entries: dicts with name, persona, updated. Best matches first; ties by recent activity."""
+    """entries: dicts with name, persona, updated, and optionally `fields`, the texts to match instead
+    of the name and persona. Best matches first; ties by recent activity."""
     scored = []
     for e in entries:
-        s = score(query, [e["name"], e.get("persona") or ""])
+        s = score(query, e.get("fields") or [e["name"], e.get("persona") or ""])
         if s is not None:
             scored.append((s, -(e.get("updated") or 0), e["name"].lower(), e))
     scored.sort(key=lambda t: t[:3])
