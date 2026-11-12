@@ -22,6 +22,13 @@ import yaml
 # share this template.
 WF = os.environ.get("WORKFLOWS_DIR") or os.path.join(os.path.dirname(__file__), "..", ".github", "workflows")
 TEMP_DENY = "Read(//home/runner/work/_temp/**)"
+# Where this job's credentials sit on the runner: the process environment, the
+# remote URL the action writes the App token into, and the file a checkout
+# that persists credentials writes.
+CREDENTIAL_DENIES = ("Read(//proc/**)", "Read(./.git/**)", TEMP_DENY)
+# The first line of private-checkout-comment.txt, which port.py puts above the
+# two agent checkouts of a private repository.
+PRIVATE_CHECKOUT = "# The checkout keeps its credentials on this private repository"
 ACTION_PIN = "anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed"
 
 
@@ -35,6 +42,15 @@ def action_steps(name):
         for step in job.get("steps", []):
             if str(step.get("uses", "")).startswith("anthropics/claude-code-action@"):
                 yield step
+
+
+def agent_steps():
+    """(file, job id, step) for every claude-code-action step in both workflows."""
+    for name in ("claude.yml", "claude-code-review.yml"):
+        for job_id, job in load(name)["jobs"].items():
+            for step in job.get("steps", []):
+                if str(step.get("uses", "")).startswith("anthropics/claude-code-action@"):
+                    yield name, job_id, step
 
 
 def tool_list(step, flag):
@@ -89,17 +105,21 @@ class ClaudeWorkflowTests(unittest.TestCase):
             self.assertEqual(str((step.get("env") or {}).get("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB")), "1",
                              step.get("name"))
 
-    def test_every_action_step_names_its_built_in_tools(self):
+    def test_every_action_step_names_exactly_its_built_in_tools(self):
         # --tools is the bound that holds when a CLI release adds a tool that
         # runs commands; Bash and Monitor already do, and neither may be named.
-        safe = {"Read", "Grep", "Glob", "Task", "ToolSearch"}
-        for step in self.all_action_steps():
-            tools = set(tool_list(step, "--tools"))
-            self.assertTrue(tools, step.get("name"))
-            self.assertLessEqual(tools, safe, step.get("name"))
+        # Each step gets only what its job needs: Task (subagents) only in the
+        # review, and only Read in a verdict extractor.
+        expected = {("claude.yml", "claude"): ["Read", "Grep", "Glob", "ToolSearch"],
+                    ("claude-code-review.yml", "claude-review"): ["Read", "Grep", "Glob", "Task", "ToolSearch"]}
+        steps = list(agent_steps())
+        self.assertTrue(set(expected) <= {(name, job_id) for name, job_id, _ in steps})
+        for name, job_id, step in steps:
+            self.assertEqual(tool_list(step, "--tools"), expected.get((name, job_id), ["Read"]),
+                             (name, job_id, step.get("name")))
             deny = tool_list(step, "--disallowedTools")
-            for name in ("Bash", "Monitor"):
-                self.assertIn(name, deny, step.get("name"))
+            for tool in ("Bash", "Monitor"):
+                self.assertIn(tool, deny, step.get("name"))
 
     def test_every_action_step_runs_one_pinned_version(self):
         for step in self.all_action_steps():
@@ -132,9 +152,88 @@ class ClaudeWorkflowTests(unittest.TestCase):
             self.assertFalse([a for a in allow if a.startswith("Bash(gh") and "*" in a],
                              (step.get("name"), allow))
 
-    def test_every_action_step_denies_the_runner_temp_folder(self):
+    def test_every_action_step_denies_reading_the_credential_paths(self):
         for step in self.all_action_steps():
-            self.assertIn(TEMP_DENY, tool_list(step, "--disallowedTools"), step.get("name"))
+            deny = tool_list(step, "--disallowedTools")
+            for path in CREDENTIAL_DENIES:
+                self.assertIn(path, deny, step.get("name"))
+
+    def test_github_token_permissions(self):
+        # id-token: write lets the action trade the job's OIDC token for the
+        # App token; everything else is read, except the review's
+        # pull-requests: write for its inline comments. Neither job pushes.
+        bot = load("claude.yml")["jobs"]["claude"]["permissions"]
+        self.assertEqual(bot, {"contents": "read", "pull-requests": "read", "issues": "read",
+                               "id-token": "write", "actions": "read"})
+        self.assertEqual(review_job()["permissions"],
+                         {"contents": "read", "pull-requests": "write", "issues": "read",
+                          "id-token": "write", "actions": "read"})
+
+    def test_app_token_cannot_write_contents(self):
+        # The action asks for an App token with contents, pull_requests and
+        # issues all `write` unless additional_permissions overrides a key, and
+        # that token is the agent's real ceiling. No agent step pushes.
+        expected = {("claude.yml", "claude"): {"actions": "read", "contents": "read"},
+                    ("claude-code-review.yml", "claude-review"): {"contents": "read"}}
+        extractor = {"contents": "read", "pull_requests": "read", "issues": "read"}
+        for name, job_id, step in agent_steps():
+            perms = yaml.safe_load(step["with"].get("additional_permissions") or "") or {}
+            self.assertEqual(perms, expected.get((name, job_id), extractor), (name, job_id, step.get("name")))
+
+    def test_only_a_private_repos_agent_checkouts_keep_credentials(self):
+        # A checkout that persists credentials writes the token to the runner
+        # temp folder. A public repo's checkouts all drop it. On a private
+        # repo the action's tag-mode `git fetch` needs it, so the review and
+        # bot checkouts keep it (and say why), and every other checkout drops
+        # it. WORKFLOWS_VISIBILITY, when set, says which form to expect.
+        texts = {}
+        for name in ("claude.yml", "claude-code-review.yml"):
+            with open(os.path.join(WF, name)) as fh:
+                texts[name] = fh.read()
+        private = {name: text.count(PRIVATE_CHECKOUT) for name, text in texts.items()}
+        self.assertIn(private, ({"claude.yml": 0, "claude-code-review.yml": 0},
+                                {"claude.yml": 1, "claude-code-review.yml": 1}))
+        form = "private" if private["claude.yml"] else "public"
+        if os.environ.get("WORKFLOWS_VISIBILITY"):
+            self.assertEqual(form, os.environ["WORKFLOWS_VISIBILITY"])
+        checkouts = 0
+        for name in texts:
+            for job_id, job in load(name)["jobs"].items():
+                for step in job.get("steps", []):
+                    if not str(step.get("uses", "")).startswith("actions/checkout@"):
+                        continue
+                    checkouts += 1
+                    persist = (step.get("with") or {}).get("persist-credentials", "unset")
+                    keeps = form == "private" and job_id in ("claude", "claude-review")
+                    self.assertEqual(persist, "unset" if keeps else False, (name, job_id, form))
+        self.assertGreaterEqual(checkouts, 2)
+
+    def test_triggers(self):
+        # The review runs on every push to a PR (synchronize), so the gate
+        # always judges the current head; the bot answers mentions only.
+        on = triggers(load("claude-code-review.yml"))
+        self.assertEqual(list(on), ["pull_request"])
+        self.assertEqual(sorted(on["pull_request"]), ["types"])
+        self.assertEqual(sorted(on["pull_request"]["types"]),
+                         sorted(["opened", "synchronize", "ready_for_review", "reopened"]))
+        self.assertEqual(triggers(load("claude.yml")),
+                         {"issue_comment": {"types": ["created"]},
+                          "pull_request_review_comment": {"types": ["created"]},
+                          "issues": {"types": ["opened", "assigned"]},
+                          "pull_request_review": {"types": ["submitted"]}})
+
+    def test_no_label_gates_a_run(self):
+        # Access gates these workflows, never a label: a label nobody applies
+        # turns the review off silently. The review gate's ack label is read
+        # inside its script, not in a condition.
+        for name in ("claude.yml", "claude-code-review.yml"):
+            doc = load(name)
+            for event in triggers(doc).values():
+                self.assertFalse({"labeled", "unlabeled"} & set((event or {}).get("types", [])), name)
+            for job_id, job in doc["jobs"].items():
+                conds = [job.get("if", "")] + [s.get("if", "") for s in job.get("steps", [])]
+                for cond in conds:
+                    self.assertNotIn("label", str(cond).lower(), (name, job_id))
 
     def test_review_reads_only_filtered_comments(self):
         job = review_job()
@@ -277,7 +376,8 @@ FAKE_GH = textwrap.dedent("""\
     set -eu
     case "$*" in
       "pr view 7 --repo o/r --json "*)
-        printf '{"number":7,"title":"T","headRefOid":"abc","isCrossRepository":%s}\\n' "${FAKE_CROSS:-false}" ;;
+        printf '{"number":7,"title":"T","author":%s,"headRefOid":"abc","isCrossRepository":%s}\\n' \\
+          "$FAKE_AUTHOR" "${FAKE_CROSS:-false}" ;;
       "pr diff 7 --repo o/r --name-only") echo src/a.py ;;
       "pr diff 7 --repo o/r") printf 'diff --git a/src/a.py b/src/a.py\\n' ;;
       "api --paginate repos/o/r/"*)
@@ -393,7 +493,7 @@ class ReviewContextStepTests(unittest.TestCase):
         open(out, "w").close()
         env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], FIXTURES=fixtures,
                    GITHUB_WORKSPACE=workspace, RUNNER_TEMP=runner_temp, GITHUB_OUTPUT=out,
-                   REPO="o/r", PR="7", GH_TOKEN="unused", HEAD_SHA="abc")
+                   REPO="o/r", PR="7", GH_TOKEN="unused", HEAD_SHA="abc", FAKE_AUTHOR='{"login":"pal"}')
         env.update(env_extra)
         r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script],
                            env=env, capture_output=True, text=True)
@@ -441,6 +541,31 @@ class ReviewContextStepTests(unittest.TestCase):
         r, outputs, _ = self.run_step(FAKE_GH_FAIL="api")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(outputs, {})
+
+    def test_a_pr_author_without_write_access_fails_the_step(self):
+        # An organization member with read or triage access can open a PR from
+        # a branch a writer pushed; a writer's later push starts the review,
+        # and the PR's title and body reach the agent through pr.json. The
+        # step fails, so the review does not run and a gate reads INCONCLUSIVE.
+        # gone's lookup fails, and an answer with no author is refused too.
+        for author in ('{"login":"reader"}', '{"login":"triager"}', '{"login":"gone"}', "null"):
+            with self.subTest(author=author):
+                r, outputs, _ = self.run_step(FAKE_AUTHOR=author)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("does not have write access", r.stdout + r.stderr)
+                self.assertEqual(outputs, {})
+                # No comment is fetched for a PR the review will not read.
+                login = json.loads(author)["login"] if author != "null" else None
+                self.assertEqual(permission_calls(self.fixtures), [login] if login else [])
+
+    def test_a_pr_author_with_write_access_is_looked_up_once(self):
+        # maint has admin and also commented.
+        r, outputs, _ = self.run_step(FAKE_AUTHOR='{"login":"maint"}')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("maint", outputs["actors"].split(","))
+        calls = permission_calls(self.fixtures)
+        self.assertEqual(calls.count("maint"), 1)
+        self.assertEqual(calls[0], "maint")
 
     def test_a_fork_pr_fails_the_step_and_sets_no_outputs(self):
         # "null" stands for an answer without the field: only false passes.
