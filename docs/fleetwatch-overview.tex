@@ -114,7 +114,8 @@ sessions that are waiting on me, and only those. A session shows up there for on
 reasons: it is stuck on a permission prompt, it holds questions for me, or it owns one of
 my to-dos that is overdue, due today or still has no date. A stuck session sorts first,
 since it blocks work, then a session with something overdue. Space opens a row to its
-numbered questions and items, and Enter jumps to that session's terminal tab.
+numbered questions and items, \cmd{z} opens or closes them all, and Enter jumps to that
+session's terminal tab.
 
 \begin{figure}[htbp]
   \centering
@@ -167,9 +168,9 @@ bury the session that started them.
 
 \emph{Resume} is for later (Figure~\ref{fig:board-resume}). It lists the sessions I gave a
 name that are stopped or parked, and leaves out the thousands of unnamed helper transcripts.
-Each row says where the session left off, read from its last status file: what it was
+An open row shows where the session left off, read from its last status file: what it was
 working on, my next dated item and how many questions it still held. Parking a session adds
-a note on top (\cmd{fleetwatch park --note "waiting on the new price list"}). Enter resumes
+a note that shows on the closed row (\cmd{fleetwatch park --note "waiting on the new price list"}). Enter resumes
 the session in this terminal and \cmd{o} opens it in a new iTerm2 window. fleetwatch refuses
 to resume a session that is still running, since two processes on one transcript would
 corrupt it, and it refuses a launch folder that no longer exists rather than start the
@@ -246,8 +247,8 @@ needs me to decide. For that, each session writes one small status file.
 A session writes it by piping JSON to \cmd{fleetwatch write-status}
 (Figure~\ref{fig:status}). The command finds the calling session by walking up the process
 tree to the first process with a registry entry, stamps the session's name, ID and the time,
-and writes the file atomically. The file is keyed by the session ID, so a renamed session
-keeps its file. Table~\ref{tab:fields} lists the fields; only the ones a session sends are
+and writes the file atomically. The file is named for the session and carries its ID, so a
+renamed session keeps its file. Table~\ref{tab:fields} lists the fields; only the ones a session sends are
 written.
 
 \begin{figure}[htbp]
@@ -570,7 +571,11 @@ pip install 'fleetwatch[search,memory] @ git+https://github.com/daniel-pittman/f
   \item \textbf{Install the overlay.} \cmd{fleetwatch iterm install}, then Control-Shift-F. If
     the hotkey does nothing, record it once in iTerm2's settings for the \cmd{fleetwatch}
     profile; the README has the steps.
-  \item \textbf{Teach your sessions to report.} Add a paragraph like this to
+  \item \textbf{Name your sessions.} Status, group, index and Resume all follow a session's
+    name: use \cmd{claude -n "Billing API"} or \cmd{/rename}. An unnamed session shows while
+    it runs, but Resume never lists it.
+  \item \textbf{Teach your sessions to report} (required: the board learns what a session
+    needs only from its status). Add a paragraph like this to
     \cmd{\textasciitilde/.claude/CLAUDE.md}, which every session reads:
 \begin{code}
 \begin{verbatim}
@@ -609,9 +614,6 @@ owner_name = "Sam"              # how transcripts label your messages
 
 [scanner]
 rule_packs = ["education", "my-pack.yaml"]
-
-[groups]
-protected = ["ferpa"]
 \end{verbatim}
 \end{code}
 \end{enumerate}
@@ -622,32 +624,31 @@ fleetwatch is a tool I built for my own way of working, and it has edges.
 
 \begin{itemize}
   \item \textbf{It reads Claude Code's internal files.} The session registry, the transcript
-    format and \cmd{claude agents --json} are not a published interface, and a Claude Code
-    release can change them. When \cmd{claude agents} fails, fleetwatch warns once and carries
-    on with the registry, but a changed transcript format needs a fleetwatch update.
+    format and \cmd{claude agents --json} are not a published interface, and a release can
+    change them. When \cmd{claude agents} fails, fleetwatch warns once and carries on with the
+    registry; a changed transcript format needs an update.
   \item \textbf{The overlay and the jump are macOS and iTerm2 only.} The board, the status
     files and session memory run on Linux too; Enter there cannot raise a tab.
   \item \textbf{The board knows what sessions tell it.} Liveness comes from process checks
-    and the registry. Questions and dates come from status files, so a session that never
-    writes one shows as alive and nothing more.
+    and the registry; questions and dates come from status files, so a session that never
+    writes one shows as alive only.
   \item \textbf{The scrubber is good, not perfect.} Patterns and a name recognizer miss
     things: an unusual name, a key in a format no rule knows. \cmd{fleetwatch index triage
-    NAME} lists likely names the allowlist does not cover (counts only), and a protected
-    group adds rules, but an index near sensitive records still deserves a human look.
+    NAME} lists likely names the allowlist misses (counts only), but an index near sensitive
+    records still deserves a human look.
   \item \textbf{Trust groups prevent mistakes, not attacks.} Anything running as my account
     can read the files.
   \item \textbf{The models are large and the tagger is not free.} The first build downloads
-    about 1.1~GB of models; after that everything runs offline. Tagging uses model calls on
-    your Claude account, which is why it is capped per run and can be turned off.
-  \item \textbf{The library wants a full configuration.} The search engine has few defaults,
-    so a search configuration needs every key shown in Section~\ref{sec:library}.
+    about 1.1~GB of models, then everything runs offline. Tagging uses your Claude
+    account, so it is capped and can be turned off.
+  \item \textbf{The library wants a full configuration.} A search configuration needs every key
+    shown in Section~\ref{sec:library}.
   \item \textbf{One machine.} There is no sync. Each machine has its own board and its own
     indexes.
 \end{itemize}
 
-fleetwatch is MIT licensed. The README covers every command and setting; CONTRIBUTING
-explains how to run the checks, including the rule that tests and docs use fictional names
-only; and SECURITY says how to report a problem privately. I would love to hear how it works
-for you.
+fleetwatch is MIT licensed. The README covers every command and setting, CONTRIBUTING the
+checks and the fictional-names rule, and SECURITY how to report a problem privately. I would
+love to hear how it works for you.
 
 \end{document}

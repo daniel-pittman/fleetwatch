@@ -5,8 +5,18 @@ from . import data, migrate
 
 
 def build_parser():
-    p = argparse.ArgumentParser(prog="fleetwatch", description="One screen of every Claude session. "
-                                "Live by default on a terminal; --once prints one snapshot.")
+    p = argparse.ArgumentParser(
+        prog="fleetwatch", formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="One screen of every Claude session. Live by default on a terminal;\n"
+                    "--once prints one snapshot.",
+        epilog="commands (run `fleetwatch COMMAND --help` for each):\n"
+               "  resume [NAME]       resume a named session in its folder\n"
+               "  park [NAME]         mark a session finished for now, with a note\n"
+               "  unpark [NAME]       take a session off the parked list\n"
+               "  prune               move finished sessions' status files to .pruned/\n"
+               "  write-status        write this session's status file from JSON on stdin\n"
+               "  iterm               install | status | uninstall the hotkey window\n"
+               "  search, index       session memory (need the search and memory extras)")
     p.add_argument("--window", type=data.parse_window, default=data.parse_window("24h"),
                    help="activity window, e.g. 90m, 6h, 3d (default 24h)")
     p.add_argument("--horizon", type=data.parse_horizon, default=data.DEFAULT_HORIZON_DAYS,

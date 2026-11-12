@@ -71,17 +71,19 @@ It reads the private list from `FLEETWATCH_LEAK_TERMS`, or from
   Claude reviews the diff and comments with findings. It flags source changes that
   arrive without tests. Treat its findings like any reviewer's. The review is advisory
   and does not block a merge. The reviewer can read and search the checkout and
-  comment on the PR, and nothing else: it cannot edit files, push, or reach the web.
-  It cannot authenticate on a pull request from a fork, so a maintainer reviews those
-  locally. A pull request that edits `.github/workflows/claude*.yml` gets no Claude
-  review (the action skips workflows that differ from the default branch's), so
-  the change lands by administrator override.
+  comment on the PR, and nothing else: it has no shell, and it cannot edit files, push, or
+  reach the web. Comments from anyone without write access never reach it. It cannot
+  authenticate on a pull request from a fork, so a maintainer reviews those locally. It runs
+  only when a pull request is opened or updated; there is no manual trigger. A pull request
+  that edits `.github/workflows/claude*.yml` gets no Claude review (the action skips
+  workflows that differ from the default branch's), so the change lands by administrator
+  override.
 - **`@claude`**: a maintainer or collaborator can mention `@claude` in an issue or PR
   comment to ask a question about the code. It runs only when the commenter and the
-  author of the issue or PR are both the owner, a member, or a collaborator, and never
-  on a fork's pull request. It is read-only: it reads and searches the checkout and
-  replies, and it cannot edit files, run shell commands, or push. It ignores everyone
-  else, and comments from non-collaborators in the thread are not shown to it.
+  author of the issue or PR both have write access, and never on a fork's pull request. It is
+  read-only: it reads and searches the checkout and replies, and it cannot edit files, run
+  shell commands, or push. It ignores everyone else, and comments in the thread from people
+  without write access are not shown to it.
 
 A first-time outside contributor's workflow run needs a maintainer's approval before it starts.
 

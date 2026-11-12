@@ -1,6 +1,6 @@
 """`fleetwatch search`: query a session or plain index.
 
-    fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--around N] [--index NAME]
+    fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--around N] [--limit N] [--json] [--index NAME]
     fleetwatch search show ID [ID ...] [--around N] [--full]
     fleetwatch search eval | stats [--index NAME]
 
