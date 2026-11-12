@@ -170,7 +170,7 @@ class TabTests(BoardCase):
         self.assertIn("advising-notes  protection check refused (settings)", text)
         self.assertIn("site-docs  stale", text)
         self.assertNotIn("storefront-sessions", text)
-        self.assertEqual(count, 4 + 3)                  # four sessions need you, three indexes
+        self.assertEqual(count, 4 + 3 + 2)              # four sessions need you, three indexes, two watch rows
 
     def test_y_copies_a_search_command_for_the_highlighted_index(self):
         async def script(app, pilot):

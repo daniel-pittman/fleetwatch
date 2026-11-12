@@ -17,7 +17,7 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, index_health, iterm, park, prune, radar, resume, views
+from . import config, data, find, index_health, iterm, park, prune, radar, resume, views, watches
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
@@ -61,6 +61,9 @@ HELP_LINES = [
     "in it. Enter on an index row jumps to its owner's iTerm tab, or resumes the owner when it is not running;",
     "with no owner it says which command to run. Space folds the row.",
     "",
+    "A Watches section on Needs you lists what a stopped session's watches found on GitHub: counts and issue",
+    "or PR numbers only. Enter goes to the owner session, which reads them with `fleetwatch watch report`.",
+    "",
     "On the Resume tab (4):",
     "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
     "  o                         resume in a new iTerm window (Ctrl-O in the find box)",
@@ -103,8 +106,9 @@ class Snapshot:
     """One collection: the view, counts, header, groups and the data the jump needs."""
 
     def __init__(self, sections, stale, now, warnings, horizon, jump=None, groups=None, cfg_warning=None,
-                 prune_plan=None, held=None, indexes=None):
+                 prune_plan=None, held=None, indexes=None, watch_rows=None):
         self.now = now
+        self.watches = list(watch_rows or [])
         self.indexes = indexes if indexes is not None else index_health.Result()
         self.held = held or {}
         self.prune_plan = prune_plan or prune.Plan({}, now, config.default_prune())
@@ -168,7 +172,7 @@ def gather(paths, window_s, horizon):
     warnings += [prune_warning] if prune_warning else []
     plan = prune.make_plan(paths, now, records, settings)
     return Snapshot(sections, stale, now, warnings, horizon, iterm.jump_context(), groups, cfg_warning, plan,
-                    resume.held_map(records), index_health.load())
+                    resume.held_map(records), index_health.load(), watches.board_rows(now))
 
 
 class FoldList(ScrollView, can_focus=True):
@@ -998,7 +1002,7 @@ class FleetwatchApp(App):
         self.index_owner_states = owners = self.index_owners()
         tabs, self.needs_seen = views.build_tabs(
             snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
-            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners)
+            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners, snap.watches, snap.held)
         for lst, nodes in zip(self.lists, tabs):
             lst.set_nodes(nodes)
         index_list = self.lists[views.INDEXES_TAB]
@@ -1009,21 +1013,25 @@ class FleetwatchApp(App):
         counts = list(self.snapshot.counts) if self.snapshot else [0] * views.RESUME_TAB
         if self.snapshot:
             counts[0] += len(index_health.problem_rows(self.snapshot.indexes.rows, self.snapshot.now))
+            counts[0] += len(self.snapshot.watches)
         return counts + [len(self.resume_rows), len(self.snapshot.indexes.rows) if self.snapshot else 0]
 
     def index_owner(self, h):
-        """(kind, sessionId, name) for an index's owner session: kind is "running" (held by a process or the
-        daemon) or "resume" (offered on the Resume tab), else None. The registry's session id wins over its
-        name, and a name that matches several sessions matches none."""
+        return self.owner_of(h.owner_id, h.owner)
+
+    def owner_of(self, owner_id, owner):
+        """(kind, sessionId, name) for an owner session: kind is "running" (held by a process or the daemon)
+        or "resume" (offered on the Resume tab), else None. The session id wins over the name, and a name
+        that matches several sessions matches none."""
         held = self.snapshot.held if self.snapshot else {}
         pools = (("running", held), ("resume", self.resume_rows))
         for kind, rows in pools:
-            if h.owner_id and h.owner_id in rows:
-                return kind, h.owner_id, data.clean(rows[h.owner_id]["name"])
+            if owner_id and owner_id in rows:
+                return kind, owner_id, data.clean(rows[owner_id]["name"])
         for kind, rows in pools:
-            named = [sid for sid, r in rows.items() if h.owner and data.clean(r["name"]) == h.owner]
+            named = [sid for sid, r in rows.items() if owner and data.clean(r["name"]) == owner]
             if len(named) == 1:
-                return kind, named[0], h.owner
+                return kind, named[0], owner
         return None
 
     def index_owners(self):
@@ -1344,6 +1352,8 @@ class FleetwatchApp(App):
         node = self.current.current()
         if node is not None and node.index and not node.section:
             self.go_to_index_owner(node.index)
+        elif node is not None and node.watch and not node.section:
+            self.go_to_watch_owner(*node.watch)
         elif node is not None and node.section:
             self.current.toggle()
         elif node is not None and node.resume:
@@ -1364,6 +1374,19 @@ class FleetwatchApp(App):
             who = "no owner session" if not h.owner else "owner %s is not running and has nothing to resume" % h.owner
             self.say("%s for %s; from a terminal, run: %s" % (who, name, command))
             return
+        self.go_to_owner(found)
+
+    def go_to_watch_owner(self, sid, name):
+        """Enter on a Watches row: the owner session, by the path an index row's owner takes."""
+        found = self.owner_of(sid, name)
+        if found is None:
+            self.say("%s is not running and has nothing to resume; another session can take its watches over "
+                     "by declaring them" % name)
+            return
+        self.go_to_owner(found)
+
+    def go_to_owner(self, found):
+        """Jump to a running owner's tab, or resume a stopped one; in the demo, only say which."""
         kind, sid, owner = found
         if os.environ.get("FLEETWATCH_DEMO"):
             self.say("demo: Enter would %s %s" % ("jump to" if kind == "running" else "resume", owner))
