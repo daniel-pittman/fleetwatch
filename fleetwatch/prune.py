@@ -1,7 +1,8 @@
 """`fleetwatch prune`: park finished sessions' status files in .pruned/, and bring them back on return.
 
 Nothing here deletes a status file. A file is a candidate only when its session is not live, has
-been quiet past the window, holds nothing waiting on the user, and is not on the keep list.
+been quiet past the window, holds nothing waiting on the user, declares no watches, and is not on the
+keep list.
 """
 import argparse
 import glob
@@ -77,7 +78,7 @@ class Plan:
     def __init__(self, paths, now, settings, candidates=(), kept_open=(), left=None):
         self.paths, self.now, self.settings = paths, now, settings
         self.candidates, self.kept_open = list(candidates), list(kept_open)
-        self.left = dict(left or {"live": 0, "recent": 0, "keep": 0})
+        self.left = dict(left or {"live": 0, "recent": 0, "keep": 0, "watches": 0})
 
 
 def make_plan(paths, now, records, settings):
@@ -93,6 +94,10 @@ def make_plan(paths, now, records, settings):
             continue
         if kept(name, keep):
             plan.left["keep"] += 1
+            continue
+        if d.get("watches"):
+            # `fleetwatch watch run` reads a stopped session's watches from this file
+            plan.left["watches"] += 1
             continue
         last = last_activity(d, paths.get("projects"))
         if now - last <= quiet_s:
@@ -245,8 +250,9 @@ def listing(plan, quiet_label):
                 ", ".join(x for x in (data.plural(c["questions"], "question") if c["questions"] else "",
                                       data.plural(c["upcoming"], "upcoming item") if c["upcoming"] else "") if x)))
     left = plan.left
-    lines += ["", "Left alone: %d live, %d recent, %d on the keep list" % (
-        left["live"], left["recent"], left["keep"])]
+    lines += ["", "Left alone: %d live, %d recent, %d on the keep list%s" % (
+        left["live"], left["recent"], left["keep"],
+        ", %d with watches" % left["watches"] if left.get("watches") else "")]
     return "\n".join(lines)
 
 

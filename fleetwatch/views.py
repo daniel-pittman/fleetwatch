@@ -77,6 +77,7 @@ class Node:
     hang: int = 0                                  # continuation lines of the head indent this much more
     resume: str = None                             # a Resume row: the sessionId it would bring back
     index: str = None                              # an Indexes row: the index name
+    watch: tuple = None                            # a Watches row: (owner sessionId, owner name)
 
     @property
     def expandable(self):
@@ -476,13 +477,42 @@ def index_problem_group(rows, now, owners=None):
     return Node("needs-idx", head, children=kids, start_open=True, section=True)
 
 
+def watch_group(rows, now, held=()):
+    """The Needs you section for session watches; None when nothing is flagged and nothing failed. Each row
+    is counts and numbers from the watch state; Enter on it goes to the owner session."""
+    if not rows:
+        return None
+    kids = []
+    for w in rows:
+        who = "running" if w.sid in held else "stopped" if w.owner_state == "active" else w.owner_state
+        head = [(w.owner, "bold"), (" (%s)" % who, "")]
+        if w.repo:
+            head += [(" · ", DIM), (w.repo.split("/", 1)[1], "")]
+        for part in w.parts:
+            head += [(" · ", DIM), (part, "")]
+        if w.error:
+            head += [(" · ", DIM), ("watch error: " + w.error, RED)]
+        if w.kind:
+            head += [(" · ", DIM), (w.kind, DIM)]
+        body = []
+        if w.repo:
+            body.append((Text("  "), Text("repo: " + w.repo)))
+        if w.checked is not None:
+            body.append((Text("  "), Text("checked %s ago" % ago(now - w.checked))))
+        body.append((Text("  "), Text("Enter goes to %s; it reads these with fleetwatch watch report" % w.owner)))
+        kids.append(Node(w.key, _row_text(head), body, watch=(w.sid, w.owner), hang=2))
+    head = _row_text([("Watches", "bold"), (" · %d" % len(kids), DIM)])
+    return Node("needs-watch", head, children=kids, start_open=True, section=True)
+
+
 def tab_counts(view, stale):
     undated, dated, _other = todo_rows(view)
     return [len(view["for_you"]), len(undated) + len(dated),
             len(view["rows"]) + len(view["orphans"]) + len(stale)]
 
 
-def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None):
+def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None,
+               watches=(), held=()):
     """(node tree of each tab, Needs row order).
 
     Each tab is in its chosen sort order, optionally wrapped in group sections. `seen` is the
@@ -494,6 +524,9 @@ def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), read
     bad = index_problem_group(indexes, now, owners)
     if bad is not None:
         needs_tab.append(bad)
+    flagged = watch_group(watches, now, held)
+    if flagged is not None:
+        needs_tab.append(flagged)
     return [needs_tab,
             todo_nodes(view, now, s[1], grouping),
             sessions_nodes(view, stale, now, s[2], grouping, ready)], [n.key for n in needs]

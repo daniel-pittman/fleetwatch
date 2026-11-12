@@ -17,6 +17,7 @@ def build_parser():
                "  write-status        write this session's status file from JSON on stdin\n"
                "  jump NAME           raise a running session's iTerm2 tab\n"
                "  notify              desktop notifications when something new needs you\n"
+               "  watch               run | report | ack | schedule: GitHub watches for stopped sessions\n"
                "  iterm               install | status | uninstall the hotkey window\n"
                "  search, index       session memory (need the search and memory extras)")
     p.add_argument("--window", type=data.parse_window, default=data.parse_window("24h"),
@@ -64,6 +65,9 @@ def main(argv=None):
     if argv[:1] == ["write-status"]:
         from . import write_status
         return write_status.main(argv[1:])
+    if argv[:1] == ["watch"]:
+        from . import watches
+        return watches.main(argv[1:])
     if argv[:1] == ["prune"]:
         from . import prune
         return prune.main(argv[1:])

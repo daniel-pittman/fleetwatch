@@ -71,6 +71,10 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
    Write it whenever your questions change, and at the end of any turn that leaves
    work running. Subagents do not write it; their session does.
 
+   Recommended, if you look after GitHub repos: declare `watches` (see Watches
+   in the fleetwatch README) for the repos you own, and run
+   `fleetwatch watch report` when you resume.
+
    Recommended, if you use session memory: at the start of a new interactive
    session with no index of its own (`fleetwatch search "x"` answers "no index
    is registered for the session"), ask me
@@ -341,7 +345,8 @@ The board reads four inputs. Only the status folder is ever written, by `write-s
 
 ```json
 {"session": "Name", "persona": "Robin", "updated": "2026-10-18T15:12:00-06:00",
- "cadence_min": 15, "working_on": "...", "questions": ["...", {"q": "...", "since": "2026-10-18T15:12:00-06:00"}], "upcoming": [{"what": "...", "due": "2026-10-28", "kind": "deploy", "yours": false}], "remind": ["..."]}
+ "cadence_min": 15, "working_on": "...", "questions": ["...", {"q": "...", "since": "2026-10-18T15:12:00-06:00"}], "upcoming": [{"what": "...", "due": "2026-10-28", "kind": "deploy", "yours": false}], "remind": ["..."],
+ "watches": [{"kind": "pr_stale", "repo": "example-org/widget", "days": 3}]}
 ```
 
 `kind` is one of `deadline`, `deploy`, `meeting`, `milestone`, `todo` and `checkin`; anything else counts as `milestone`. `checkin` is a date to look at a task again when its real date is unknown. It behaves like `todo` everywhere (the timeline, Your to-dos) and reads `Check-in overdue` and `Check in today` on Needs you. Undated tasks need a date, so give every task of yours a `due`, or a `checkin` date when the real one is unknown.
@@ -358,11 +363,53 @@ Sessions write their file through this subcommand rather than by hand:
 echo '{"working_on": "adding retry to the invoice job", "questions": ["Should refunds over the limit need a second approver?"]}' | fleetwatch write-status
 ```
 
-- stdin takes JSON with any of `persona`, `cadence_min`, `working_on`, `questions`, `upcoming`, `remind`. Absent fields are not written (no merge with the old file). Strings go through `clean()`; a malformed payload exits 1 with a message.
+- stdin takes JSON with any of `persona`, `cadence_min`, `working_on`, `questions`, `upcoming`, `remind`, `watches` (see Watches). Absent fields are not written (no merge with the old file). Strings go through `clean()`; a malformed payload exits 1 with a message.
 - It finds the calling session by walking its process ancestry to the first pid with a `~/.claude/sessions/<pid>.json`, and stamps `session`, `sessionId` and `updated` (local offset). With no session above it, it exits 2 and writes nothing. A helper subagent that calls it resolves to its parent session, which is the right owner.
 - It writes `~/.claude/state/fleetwatch/<slug-of-current-name>.json` atomically, then deletes any other file in that folder with the same `sessionId` (the file under the old name after a rename). Files with a different or missing `sessionId` are never touched.
 - An `upcoming` item is refused, and nothing is written, when it has a key other than `what`, `due`, `kind` and `yours` (a date under `when`, `date`, `by` or `deadline` gets "did you mean due?"), a `kind` that is not one fleetwatch knows, or `"yours": true` with no `due`. Every item of yours has a date; when the real one is unknown the error suggests a `"kind": "checkin"` item with the day to look again. The error goes back to the session that wrote it, so it learns the format on the spot. Files already in the folder are read as before.
 - `--print-path` prints the target path; `--dry-run` prints the JSON it would write. `--sessions-dir` and `--status-dir` override the folders.
+
+## Watches
+
+A session can hand fleetwatch standing checks on GitHub repos, so pull request hygiene and outside contributors are not left unwatched while the session is closed. A repo with no session of its own can get a steward: any session can declare watches for any repo, so name one session the steward and have it declare them.
+
+**Declare them in the status file.** `watches` is a list of `{"kind": K, "repo": "owner/name"}` objects, plus the options a kind takes and nothing else:
+
+```
+echo '{"working_on": "triaging the widget backlog",
+       "watches": [{"kind": "external_activity", "repo": "example-org/widget"},
+                   {"kind": "pr_checks_failed", "repo": "example-org/widget"},
+                   {"kind": "pr_stale", "repo": "example-org/widget", "days": 3},
+                   {"kind": "security_advisory", "repo": "example-org/widget"}]}' \
+  | fleetwatch write-status
+```
+
+`write-status` refuses an unknown kind, an unknown key, a repo that is not `owner/name`, a bad option or the same kind twice on one repo, with a message that teaches the format, and writes nothing. Like every field, `watches` must be sent on every write: a write without it drops them, and `write-status` says so.
+
+**The menu.** Kinds are built into fleetwatch; a session never supplies a command, a script or a URL.
+
+| kind | flags | clears by itself when |
+|---|---|---|
+| `external_activity` | issues, PRs and comments opened since the last check by authors without write access (the collaborator permission lookup: admin, maintain or write is the team). Bots, such as dependabot and the workflow bots, are skipped. | the item is closed, or someone on the team replies after it |
+| `pr_checks_failed` | a failed, cancelled or timed-out check run on an open PR's head commit, or on the default branch's latest commit | the check passes, the PR closes, or a new push replaces the commit |
+| `pr_stale` | an open PR (not a draft) with no push, review or comment from a person for `days` working days (default 3, Monday to Friday), or an approval that was dismissed with no approval since | the PR gets activity or a new approval, or closes |
+| `security_advisory` | a repository security advisory in draft, or a private vulnerability report waiting in triage | the advisory is published or closed |
+
+`security_advisory` needs admin on the repo. Without it the watch reports "not available" rather than quiet.
+
+**The hand-off.** `fleetwatch watch run` checks every declared watch whose owner session is not active, then exits. A session is active while it is live in the session registry and its status file's `updated` is within 1.5 times its `cadence_min` (30 minutes when it has none). A session that is stopped, quiet past that window, or parked is covered. `external_activity` picks up where the session left off: the first check after it stops starts from its last status write, and each later check from the one before.
+
+**The schedule.** `fleetwatch watch schedule install` writes a launchd agent (macOS, `local.fleetwatch.watch-run`) or a systemd user timer (elsewhere, with the equivalent cron line printed) that runs `fleetwatch watch run` every 15 minutes, logging to fleetwatch's state folder. Like the index schedule it never starts itself: run the `launchctl` or `systemctl` command it prints. `remove` and `status` do what they say. Each run uses `gh api` with read-only GET requests and gh's own login, with a 30-second timeout per call. A listing reads at most three pages of 100, and per-PR lookups stop at the 30 newest open PRs.
+
+**On the board.** A hit becomes one row per owner session and repo in a Watches section of Needs you, summing the kinds:
+
+    Pricing Page (parked) · storefront · 2 external issues (#41, #44) · 1 failed check (#38)
+
+A failed lookup is its own row (`watch error: lookup failed (HTTP 403)`), never "nothing new", and so is a session whose watches have not been checked for an hour, which usually means the schedule is not running. Enter on any of these rows goes to the owner session: it jumps to the session's tab when it runs, and resumes it when it does not. The board only reads the watch state; it never calls GitHub.
+
+**Picking them up.** A session that resumes should run `fleetwatch watch report`, which prints its own flags, errors and last check times, then deal with them and run `fleetwatch watch ack` to clear them (`fleetwatch watch ack example-org/widget --kind pr_stale` clears one repo and kind). A cleared flag does not come back for the same item; a new failing push or a new comment is a new flag.
+
+**The safety rule.** Watch state, the report and the board hold item numbers, advisory ids, states, counts and times only. Titles, bodies, branch names, check names, logins and gh's error text are written by people outside the team, so they are never stored and never reach the board, a prompt or a session. fleetwatch never checks out or runs anything from a pull request. State lives in one file per owner session, `$XDG_STATE_HOME/fleetwatch/watches/<sessionId>.json` (default `~/.local/state/fleetwatch/watches/`). `fleetwatch prune` leaves the status file of a session that declares watches in place, since the run reads its watches from there.
 
 ## Session memory and search
 

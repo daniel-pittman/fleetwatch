@@ -19,6 +19,7 @@ RESUME_COMMAND = "echo demo, nothing resumed:"
 # The sessions' folders live under this folder of the temp root, which the board shows as ~, so the
 # Resume tab reads ~/code/storefront/pricing and never the temporary path.
 HOME = "home"
+STATE = "state"          # the demo's XDG_STATE_HOME: its watch state lives here
 GROUPS_TOML = '''[[group]]
 name = "Storefront"
 paths = ["{home}/code/storefront"]
@@ -130,9 +131,29 @@ def build(root, now=None, parent_pid=None, helper_pid=None):
         "name": "Pricing Page", "note": "waiting on the new price list from finance", "parked_at": now - 19 * 3600}}})
     with open(os.path.join(config, "groups.toml"), "w", encoding="utf-8") as fh:
         fh.write(GROUPS_TOML.format(home=home))
+    write_watches(os.path.join(root, STATE, "fleetwatch", "watches"), now)
     return {"command": "%s -c \"print('[]')\"" % sys.executable, "sessions": sessions,
             "jobs": os.path.join(root, "jobs"), "status": status, "projects": projects,
             "ps": "echo %d %d" % (helper_pid or 1, parent_pid), "archive": os.path.join(root, "archive")}
+
+
+def write_watches(folder, now):
+    """Two stopped sessions' watch state: one with flags, one whose lookup GitHub refused. The board reads
+    these files as it reads real ones; nothing calls GitHub."""
+    checked = datetime.fromtimestamp(now - 4 * 60, data.LOCAL_TZ).isoformat(timespec="seconds")
+
+    def watch(kind, repo, flags=(), error=None):
+        return {"%s:%s" % (kind, repo): {"kind": kind, "repo": repo, "last_checked": checked, "error": error,
+                                         "available": True, "seen": [f["key"] for f in flags], "flags": list(flags)}}
+    store = "example-shop/storefront"
+    pricing = dict(watch("external_activity", store, [{"what": "issue", "ref": 41, "key": "issue:41"},
+                                                       {"what": "issue", "ref": 44, "key": "issue:44"}]),
+                   **watch("pr_checks_failed", store, [{"what": "failed_check", "ref": 38, "key": "check:38@demo"}]))
+    status = watch("pr_checks_failed", "example-shop/status-site", error="lookup failed (HTTP 403)")
+    for sid, name, state, watches in ((RESUME_SIDS[0], "Pricing Page", "parked", pricing),
+                                      (RESUME_SIDS[1], "Status Page", "stopped", status)):
+        _write(os.path.join(folder, sid + ".json"), {"version": 1, "sessionId": sid, "session": name,
+                                                     "owner_state": state, "checked": checked, "watches": watches})
 
 
 def index_rows(now=None):
@@ -166,7 +187,7 @@ def environ(root, paths):
             "FLEETWATCH_JOBS_DIR": paths["jobs"], "FLEETWATCH_STATUS_DIR": paths["status"],
             "FLEETWATCH_PROJECTS_DIR": paths["projects"], "FLEETWATCH_ARCHIVE_DIR": paths["archive"],
             "FLEETWATCH_DISPLAY_HOME": os.path.join(root, HOME), "FLEETWATCH_NO_MIGRATE": "1",
-            "FLEETWATCH_DEMO": "1"}
+            "FLEETWATCH_DEMO": "1", "XDG_STATE_HOME": os.path.join(root, STATE)}
 
 
 def prepare():

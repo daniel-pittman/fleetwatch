@@ -7,10 +7,10 @@ import re
 import sys
 from datetime import datetime
 
-from . import data
+from . import data, watches
 from .config import atomic_write
 
-FIELDS = ("persona", "cadence_min", "working_on", "questions", "upcoming", "remind")
+FIELDS = ("persona", "cadence_min", "working_on", "questions", "upcoming", "remind", "watches")
 MAX_INPUT = 256 * 1024
 
 
@@ -132,7 +132,23 @@ def validate(payload):
                     clean_item["due"] = x["due"]
                 items.append(clean_item)
             out[key] = items
+        elif key == "watches":
+            try:
+                out[key] = watches.validate(val)
+            except watches.WatchError as exc:
+                raise StatusError(str(exc)) from None
     return out
+
+
+def dropped_watches(target, doc):
+    """How many watches the file at target declares that doc leaves out (each write replaces the file)."""
+    if "watches" in doc:
+        return 0
+    try:
+        old = data.load_json(target)
+    except (OSError, ValueError):
+        return 0
+    return len(old["watches"]) if isinstance(old, dict) and isinstance(old.get("watches"), list) else 0
 
 
 def build_document(fields, name, session_id, now=None):
@@ -164,7 +180,7 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="fleetwatch write-status",
         description="Write this session's status file from JSON on stdin (persona, cadence_min, "
-                    "working_on, questions, upcoming, remind). Absent fields are not written.")
+                    "working_on, questions, upcoming, remind, watches). Absent fields are not written.")
     p.add_argument("--print-path", action="store_true", help="print the file it would write and exit")
     p.add_argument("--dry-run", action="store_true", help="print the JSON it would write and exit")
     p.add_argument("--sessions-dir")
@@ -197,8 +213,12 @@ def run(argv, stdin, out, err, paths=None, ppids=None, start_pid=None, now=None)
         if args.dry_run:
             print(json.dumps(doc, indent=1, ensure_ascii=False), file=out)
             return 0
+        dropped = dropped_watches(target, doc)
         target, _ = write_document(paths["status"], doc)
         print("wrote %s" % target, file=out)
+        if dropped:
+            print("fleetwatch write-status: note: this write drops the %s the last status declared; send "
+                  "\"watches\" on every write to keep them" % data.plural(dropped, "watch", "watches"), file=err)
         return 0
     except StatusError as exc:
         print("fleetwatch write-status: %s" % exc, file=err)

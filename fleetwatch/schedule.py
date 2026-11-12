@@ -1,21 +1,42 @@
-"""`fleetwatch index schedule install|remove|status`: run `fleetwatch index refresh --all` every
-30 minutes at low priority.
+"""`fleetwatch index schedule` and `fleetwatch watch schedule`: install|remove|status for fleetwatch's two
+background jobs. The index job runs `fleetwatch index refresh --all` every 30 minutes; the watch job runs
+`fleetwatch watch run` every 15 minutes. Both run at low priority.
 
-macOS: a launchd agent, local.fleetwatch.index-refresh, in ~/Library/LaunchAgents. install
-writes the plist and prints the launchctl command; it never loads it. Elsewhere: a systemd
-user timer pair when ~/.config/systemd/user can be written, and the equivalent cron line is
-printed. Logs go to the fleetwatch state folder.
+macOS: a launchd agent in ~/Library/LaunchAgents (local.fleetwatch.index-refresh, local.fleetwatch.watch-run).
+install writes the plist and prints the launchctl command; it never loads it. Elsewhere: a systemd user timer
+pair when ~/.config/systemd/user can be written, and the equivalent cron line is printed. Logs go to the
+fleetwatch state folder.
 """
 import os
 import plistlib
 import shlex
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import settings
 
-LABEL = "local.fleetwatch.index-refresh"
-INTERVAL_S = 1800
+
+@dataclass(frozen=True)
+class Job:
+    label: str          # the launchd label
+    unit: str           # the systemd unit name and the log file name
+    args: tuple         # after `python -m fleetwatch`
+    interval_s: int
+    what: str           # how the timer describes itself
+    usage: str
+
+
+INDEX = Job("local.fleetwatch.index-refresh", "fleetwatch-index-refresh", ("index", "refresh", "--all"), 1800,
+            "fleetwatch index refresh", "fleetwatch index schedule")
+WATCH = Job("local.fleetwatch.watch-run", "fleetwatch-watch-run", ("watch", "run"), 900,
+            "fleetwatch watch run", "fleetwatch watch schedule")
+LABEL = INDEX.label
+INTERVAL_S = INDEX.interval_s
+# Carried into the job's environment when set at install time: where fleetwatch's folders are, and for
+# the watch job, which gh to run and where its login lives.
+PASSED = ("FLEETWATCH_CONFIG_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "FLEETWATCH_PROJECTS_DIR", "PYTHONPATH",
+          "FLEETWATCH_STATUS_DIR", "FLEETWATCH_SESSIONS_DIR", "FLEETWATCH_GH_CMD", "GH_CONFIG_DIR")
 
 
 def launch_agents_dir(environ=None):
@@ -30,69 +51,77 @@ def systemd_dir(environ=None):
                 or os.path.join(os.path.expanduser("~"), ".config", "systemd", "user"))
 
 
-def command():
-    """The refresh command line: this Python running the package, so no launcher is needed."""
-    return [sys.executable, "-P", "-m", "fleetwatch", "index", "refresh", "--all"]
+def command(job=INDEX):
+    """The job's command line: this Python running the package, so no launcher is needed."""
+    return [sys.executable, "-P", "-m", "fleetwatch", *job.args]
 
 
-def plist_dict(log_dir):
+def _log_name(job):
+    return job.unit[len("fleetwatch-"):]
+
+
+def plist_dict(log_dir, job=INDEX):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
-    for key in ("FLEETWATCH_CONFIG_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "FLEETWATCH_PROJECTS_DIR", "PYTHONPATH"):
+    for key in PASSED:
         if os.environ.get(key):
             env[key] = os.environ[key]
     return {
-        "Label": LABEL,
-        "ProgramArguments": command(),
-        "StartInterval": INTERVAL_S,
+        "Label": job.label,
+        "ProgramArguments": command(job),
+        "StartInterval": job.interval_s,
         "RunAtLoad": False,
         "ProcessType": "Background",
         "Nice": 10,
         "LowPriorityIO": True,
-        "StandardOutPath": str(Path(log_dir) / "index-refresh.log"),
-        "StandardErrorPath": str(Path(log_dir) / "index-refresh.err"),
+        "StandardOutPath": str(Path(log_dir) / (_log_name(job) + ".log")),
+        "StandardErrorPath": str(Path(log_dir) / (_log_name(job) + ".err")),
         "EnvironmentVariables": env,
     }
 
 
-def _plist_path():
-    return launch_agents_dir() / (LABEL + ".plist")
+def _plist_path(job=INDEX):
+    return launch_agents_dir() / (job.label + ".plist")
 
 
-def install(out=None):
+def _units(job):
+    return [systemd_dir() / (job.unit + ".service"), systemd_dir() / (job.unit + ".timer")]
+
+
+def install(out=None, job=INDEX):
     out = out or sys.stdout
     log_dir = Path(settings.state_dir())
     if sys.platform == "darwin":
         log_dir.mkdir(parents=True, exist_ok=True)
-        path = _plist_path()
+        path = _plist_path(job)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(plistlib.dumps(plist_dict(log_dir)))
+        path.write_bytes(plistlib.dumps(plist_dict(log_dir, job)))
         print("wrote %s (not loaded)" % path, file=out)
         print("to start it: launchctl bootstrap gui/$(id -u) %s" % shlex.quote(str(path)), file=out)
         return 0
-    cmd = " ".join(shlex.quote(a) for a in command())
-    d = systemd_dir()
+    cmd = " ".join(shlex.quote(a) for a in command(job))
+    minutes = job.interval_s // 60
+    service, timer = _units(job)
     try:
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "fleetwatch-index-refresh.service").write_text(
-            "[Unit]\nDescription=fleetwatch index refresh\n\n[Service]\nType=oneshot\n"
-            "Nice=10\nIOSchedulingClass=idle\nExecStart=%s\n" % cmd)
-        (d / "fleetwatch-index-refresh.timer").write_text(
-            "[Unit]\nDescription=fleetwatch index refresh every 30 minutes\n\n[Timer]\n"
-            "OnBootSec=5min\nOnUnitActiveSec=30min\n\n[Install]\nWantedBy=timers.target\n")
-        print("wrote the timer in %s (not enabled)" % d, file=out)
-        print("to start it: systemctl --user enable --now fleetwatch-index-refresh.timer", file=out)
+        service.parent.mkdir(parents=True, exist_ok=True)
+        service.write_text(
+            "[Unit]\nDescription=%s\n\n[Service]\nType=oneshot\n"
+            "Nice=10\nIOSchedulingClass=idle\nExecStart=%s\n" % (job.what, cmd))
+        timer.write_text(
+            "[Unit]\nDescription=%s every %d minutes\n\n[Timer]\n"
+            "OnBootSec=5min\nOnUnitActiveSec=%dmin\n\n[Install]\nWantedBy=timers.target\n"
+            % (job.what, minutes, minutes))
+        print("wrote the timer in %s (not enabled)" % service.parent, file=out)
+        print("to start it: systemctl --user enable --now %s" % timer.name, file=out)
     except OSError as e:
         print("could not write a systemd timer (%s)" % e, file=out)
-    print("or use cron: */30 * * * * nice %s >> %s 2>&1"
-          % (cmd, shlex.quote(str(log_dir / "index-refresh.log"))), file=out)
+    print("or use cron: */%d * * * * nice %s >> %s 2>&1"
+          % (minutes, cmd, shlex.quote(str(log_dir / (_log_name(job) + ".log")))), file=out)
     return 0
 
 
-def remove(out=None):
+def remove(out=None, job=INDEX):
     out = out or sys.stdout
-    targets = ([_plist_path()] if sys.platform == "darwin"
-               else [systemd_dir() / "fleetwatch-index-refresh.service",
-                     systemd_dir() / "fleetwatch-index-refresh.timer"])
+    targets = [_plist_path(job)] if sys.platform == "darwin" else _units(job)
     for p in targets:
         if p.exists():
             p.unlink()
@@ -100,33 +129,31 @@ def remove(out=None):
         else:
             print("not installed: %s" % p, file=out)
     if sys.platform == "darwin":
-        print("if it was loaded: launchctl bootout gui/$(id -u)/%s" % LABEL, file=out)
+        print("if it was loaded: launchctl bootout gui/$(id -u)/%s" % job.label, file=out)
     else:
-        print("if it was enabled: systemctl --user disable --now fleetwatch-index-refresh.timer",
-              file=out)
+        print("if it was enabled: systemctl --user disable --now %s.timer" % job.unit, file=out)
     return 0
 
 
-def status(out=None):
+def status(out=None, job=INDEX):
     out = out or sys.stdout
     if sys.platform == "darwin":
-        p = _plist_path()
+        p = _plist_path(job)
         print("%s: %s" % (p, "installed" if p.exists() else "not installed"), file=out)
-        print("check whether it is loaded: launchctl print gui/$(id -u)/%s" % LABEL, file=out)
+        print("check whether it is loaded: launchctl print gui/$(id -u)/%s" % job.label, file=out)
     else:
-        for n in ("fleetwatch-index-refresh.service", "fleetwatch-index-refresh.timer"):
-            p = systemd_dir() / n
+        for p in _units(job):
             print("%s: %s" % (p, "installed" if p.exists() else "not installed"), file=out)
     return 0
 
 
-def main(argv, out=None):
+def main(argv, out=None, job=INDEX):
     verb = argv[0] if argv else ""
     if verb == "install":
-        return install(out)
+        return install(out, job)
     if verb == "remove":
-        return remove(out)
+        return remove(out, job)
     if verb == "status":
-        return status(out)
-    print("usage: fleetwatch index schedule install|remove|status", file=sys.stderr)
+        return status(out, job)
+    print("usage: %s install|remove|status" % job.usage, file=sys.stderr)
     return 2
