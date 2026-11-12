@@ -69,7 +69,9 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
      with the day to look again.
 
    Write it whenever your questions change, and at the end of any turn that leaves
-   work running. Subagents do not write it; their session does.
+   work running. Only named sessions report: subagents, worktree lanes and
+   headless `claude -p` runs do not write it (their session does), and an
+   unnamed session names itself first with `/rename`.
 
    Recommended, if you look after GitHub repos: declare `watches` (see Watches
    in the fleetwatch README) for the repos you own, and run
@@ -381,6 +383,7 @@ echo '{"working_on": "adding retry to the invoice job", "questions": ["Should re
 - It finds the calling session by walking its process ancestry to the first pid with a `~/.claude/sessions/<pid>.json`, and stamps `session`, `sessionId` and `updated` (local offset). With no session above it, it exits 2 and writes nothing. A helper subagent that calls it resolves to its parent session, which is the right owner.
 - It writes `~/.claude/state/fleetwatch/<slug-of-current-name>.json` atomically, then deletes any other file in that folder with the same `sessionId` (the file under the old name after a rename). Files with a different or missing `sessionId` are never touched.
 - An `upcoming` item is refused, and nothing is written, when it has a key other than `what`, `due`, `kind` and `yours` (a date under `when`, `date`, `by` or `deadline` gets "did you mean due?"), a `kind` that is not one fleetwatch knows, or `"yours": true` with no `due`. Every item of yours has a date; when the real one is unknown the error suggests a `"kind": "checkin"` item with the day to look again. The error goes back to the session that wrote it, so it learns the format on the spot. Files already in the folder are read as before.
+- It refuses, exit 3 with nothing written, when the calling session looks like a helper: a registry name that matches a worktree or run id (`wt-`, `run-`, `t<N>-`, a bare id), a headless `-p` or SDK run (entrypoint `sdk-...`), or a session whose name Claude Code derived itself instead of someone choosing it. The message says what to do ("helper sessions don't write status; the session that started you does", or "name this session with /rename to report status"). `--force` writes anyway, for the rare legitimate case. This keeps orphan questions from helpers off the board.
 - `--print-path` prints the target path; `--dry-run` prints the JSON it would write. `--sessions-dir` and `--status-dir` override the folders.
 
 ## Watches

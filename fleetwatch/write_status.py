@@ -12,6 +12,7 @@ from .config import atomic_write
 
 FIELDS = ("persona", "cadence_min", "working_on", "questions", "upcoming", "remind", "watches")
 MAX_INPUT = 256 * 1024
+HELPER_ENTRYPOINT = "sdk-"   # Claude Code records this for -p and SDK runs (resume.HELPER_ENTRYPOINT)
 
 
 class StatusError(Exception):
@@ -26,6 +27,12 @@ def slug(name):
 
 def find_session(sessions_dir, ppids, start_pid):
     """(name, sessionId) of the first process at or above start_pid that has a registry file."""
+    rec = find_record(sessions_dir, ppids, start_pid)
+    return data.clean(rec["name"]).strip(), rec["sessionId"]
+
+
+def find_record(sessions_dir, ppids, start_pid):
+    """The registry record (a dict) of the first process at or above start_pid that names a session."""
     seen, pid = set(), start_pid
     while isinstance(pid, int) and pid > 1 and pid not in seen and len(seen) < 512:
         seen.add(pid)
@@ -37,12 +44,26 @@ def find_session(sessions_dir, ppids, start_pid):
                 d = None
             if isinstance(d, dict) and isinstance(d.get("name"), str) and d["name"].strip() \
                     and isinstance(d.get("sessionId"), str) and d["sessionId"]:
-                return data.clean(d["name"]).strip(), d["sessionId"]
+                return d
         pid = ppids.get(pid)
     if getattr(ppids, "unreadable", False):
         raise StatusError("could not read the process table (ps failed or timed out; the machine may "
                           "be busy); try again", 2)
     raise StatusError("no Claude session found above this process; run it from inside a session", 2)
+
+
+def helper_reason(rec):
+    """Why this registry record is a helper session (a message naming the fix), or None.
+
+    Helpers are worktree lanes and run ids (data.HELPER_NAME), headless `-p` and SDK runs, and a session
+    whose name Claude Code derived itself. The session that started a helper reports for it."""
+    name = data.clean(rec["name"]).strip()
+    if data.HELPER_NAME.search(name) or str(rec.get("entrypoint") or "").startswith(HELPER_ENTRYPOINT):
+        return "helper sessions don't write status; the session that started you does"
+    source = rec.get("nameSource")
+    if isinstance(source, str) and source and source != "user":
+        return "name this session with /rename to report status (only named sessions write status)"
+    return None
 
 
 def _text(value, field):
@@ -183,6 +204,8 @@ def build_parser():
                     "working_on, questions, upcoming, remind, watches). Absent fields are not written.")
     p.add_argument("--print-path", action="store_true", help="print the file it would write and exit")
     p.add_argument("--dry-run", action="store_true", help="print the JSON it would write and exit")
+    p.add_argument("--force", action="store_true",
+                   help="write even when this session looks like a helper (worktree lane, headless run, unnamed)")
     p.add_argument("--sessions-dir")
     p.add_argument("--status-dir")
     return p
@@ -197,11 +220,15 @@ def run(argv, stdin, out, err, paths=None, ppids=None, start_pid=None, now=None)
     try:
         if ppids is None:
             ppids = data.Ancestry(paths.get("ps"))
-        name, sid = find_session(paths["sessions"], ppids, os.getpid() if start_pid is None else start_pid)
+        rec = find_record(paths["sessions"], ppids, os.getpid() if start_pid is None else start_pid)
+        name, sid = data.clean(rec["name"]).strip(), rec["sessionId"]
         target = os.path.join(paths["status"], slug(name) + ".json")
         if args.print_path:
             print(target, file=out)
             return 0
+        reason = None if args.force else helper_reason(rec)
+        if reason:
+            raise StatusError("%s (--force writes anyway)" % reason, 3)
         raw = stdin.read(MAX_INPUT + 1)
         if len(raw) > MAX_INPUT:
             raise StatusError("the payload is too large")
