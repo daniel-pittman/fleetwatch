@@ -15,6 +15,8 @@ def build_parser():
                "  unpark [NAME]       take a session off the parked list\n"
                "  prune               move finished sessions' status files to .pruned/\n"
                "  write-status        write this session's status file from JSON on stdin\n"
+               "  jump NAME           raise a running session's iTerm2 tab\n"
+               "  notify              desktop notifications when something new needs you\n"
                "  iterm               install | status | uninstall the hotkey window\n"
                "  search, index       session memory (need the search and memory extras)")
     p.add_argument("--window", type=data.parse_window, default=data.parse_window("24h"),
@@ -68,6 +70,12 @@ def main(argv=None):
     if argv[:1] == ["resume"]:
         from . import resume
         return resume.main(argv[1:])
+    if argv[:1] == ["notify"]:
+        from . import notify
+        return notify.main(argv[1:])
+    if argv[:1] == ["jump"]:
+        from . import jump
+        return jump.main(argv[1:])
     if argv[:1] == ["park"]:
         from . import park
         return park.main(argv[1:])
