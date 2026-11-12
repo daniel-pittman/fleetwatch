@@ -41,6 +41,14 @@ fleetwatch has three layers. Each one reads less than the one above it needs to 
   owner session from the registry, and Enter on it jumps to that session's iTerm2 tab or resumes it
   through the same path as the Resume tab. A fresh refresh lock marks an index as refreshing, and
   an index that a running refresh has not reached yet is waiting, not stale.
+- **Watches** are standing GitHub checks a session declares in its status file, each one kind from
+  a fixed menu on one repo. `fleetwatch watch run`, on a 15-minute launchd agent or systemd timer,
+  reads every status file, skips the sessions that are active (live, with a status newer than 1.5
+  times their cadence), and checks the rest through read-only `gh api` calls. It keeps one state
+  file per owner session under fleetwatch's state folder, holding item numbers, states, counts and
+  times, never a title, body, branch, check name or login. The board reads those files for its
+  Watches section on Needs you and never calls GitHub; a session that resumes reads its own flags
+  with `fleetwatch watch report` and clears them with `fleetwatch watch ack`.
 - **A search** (`fleetwatch search`) finds the calling session's own index from process ancestry,
   checks the trust guard when you name another index, and hands the query to the engine.
 
