@@ -136,17 +136,22 @@ def build(root, now=None, parent_pid=None, helper_pid=None):
 
 
 def index_rows(now=None):
-    """Four synthetic indexes, one in each state the Indexes tab shows. Nothing here is read from disk."""
+    """Six synthetic indexes: each state the Indexes tab shows and each kind of owner. Nothing here is read
+    from disk. Owners are demo sessions: Billing API runs, Pricing Page and Status Page can be resumed."""
     from .index_health import Health
     now = time.time() if now is None else now
     two_scheduled = 2 * 1800
     return [
         Health("storefront-sessions", "team", "session", "ok", finished=now - 14 * 60, stale_after=two_scheduled,
-               exchanges=1842, files=96, scheduled=True),
+               exchanges=1842, files=96, scheduled=True, owner="Billing API"),
         Health("site-docs", "team", "plain", "ok", finished=now - 5 * 3600, stale_after=two_scheduled,
-               files=212, scheduled=True),
+               files=212, scheduled=True, owner="Docs Site"),
+        Health("nightly-notes", "team", "plain", "ok", finished=now - 3 * 3600, stale_after=two_scheduled,
+               files=58, scheduled=True, refresh_state="waiting"),
+        Health("support-faq", "team", "session", "ok", finished=now - 2 * 3600, stale_after=two_scheduled,
+               exchanges=310, files=27, scheduled=True, owner="Status Page", refresh_state="refreshing"),
         Health("release-history", "archive", "session", "failed", "build", finished=now - 40 * 60,
-               stale_after=two_scheduled, exchanges=530, files=41, scheduled=True),
+               stale_after=two_scheduled, exchanges=530, files=41, scheduled=True, owner="Pricing Page"),
         Health("advising-notes", "ferpa", "session", "ok", finished=now - 20 * 60, stale_after=two_scheduled,
                protection="refused", refusal="settings", exchanges=77, files=12, scheduled=True),
     ]

@@ -45,7 +45,7 @@ class CanaryTree:
         for i in range(3):
             (corpus / ("CANARY-CORPUS-TEXT-%d.md" % i)).write_text("CANARY-CORPUS-TEXT body")
         (self.root / name / "probes.yaml").write_text("- CANARY-PROBE-TEXT")
-        self.reg["indexes"][name] = {"group": group, "tags": "CANARY-TAG.yaml", "owner_session": "CANARY-TAG",
+        self.reg["indexes"][name] = {"group": group, "tags": "CANARY-TAG.yaml", "owner_session": "builder-" + name, "owner_session_id": "sid-" + name,
                                      "privacy": {"allowlist": "no-such-%s.yaml" % name}}
 
     def load(self, scheduled=False, cache=None):
@@ -124,7 +124,7 @@ class HealthTests(unittest.TestCase):
         self.assertIn("fleetwatch[memory]", result.note)
 
 
-class TabTests(unittest.TestCase):
+class BoardCase(unittest.TestCase):
     def setUp(self):
         self.saved = dict(os.environ)
         self.tmp, self.paths = demo.prepare()
@@ -147,6 +147,8 @@ class TabTests(unittest.TestCase):
         with mock.patch.object(index_health, "load", loader):
             return asyncio.run(go())
 
+
+class TabTests(BoardCase):
     def test_tab_five_lists_each_index_by_group_with_its_state_in_words(self):
         async def script(app, pilot):
             await pilot.press("5", "z")
@@ -157,7 +159,7 @@ class TabTests(unittest.TestCase):
                      "96 files", "refresh FAILED (build)", "STALE", "protection REFUSED (settings)",
                      "group: ferpa", "plain"):
             self.assertIn(want, text)
-        self.assertIn("5 Indexes · 4", bar)
+        self.assertIn("5 Indexes · 6", bar)
 
     def test_needs_you_lists_each_problem_index_with_the_reason(self):
         async def script(app, pilot):
@@ -227,6 +229,181 @@ class TabTests(unittest.TestCase):
         states = {(h.state, h.protection) for h in demo.index_rows()}
         self.assertEqual(states, {("ok", None), ("failed", None), ("ok", "refused")})
         self.assertTrue(any(h.is_stale(time.time()) for h in demo.index_rows()))
+        rows = demo.index_rows()
+        self.assertEqual({h.refresh_state for h in rows}, {"", "refreshing", "waiting"})
+        self.assertTrue(any(not h.owner for h in rows))
+
+
+def health(**kw):
+    base = dict(name="ix", group="team", kind="session", state="ok", finished=time.time() - 60, stale_after=3600)
+    base.update(kw)
+    return index_health.Health(**base)
+
+
+class OwnerTests(unittest.TestCase):
+    """Who owns an index, what to do about a problem, and a running refresh is not a problem."""
+
+    def test_next_step_for_each_problem_kind(self):
+        now = time.time()
+        failed = " ".join(health(name="a", state="failed", reason="build").next_steps(now))
+        self.assertIn("fleetwatch index status a", failed)
+        self.assertIn("failures.log", failed)
+        refused = " ".join(health(name="b", protection="refused", refusal="settings").next_steps(now))
+        self.assertIn("allowlist", refused)
+        self.assertIn("fleetwatch index verify b", refused)
+        old = now - 5 * 3600
+        off = " ".join(health(name="c", finished=old, scheduled=False).next_steps(now))
+        self.assertIn("scheduled refresh is not installed", off)
+        self.assertIn("fleetwatch index schedule install", off)
+        on = " ".join(health(name="d", finished=old, scheduled=True).next_steps(now))
+        self.assertIn("last successful refresh 5.0h ago", on)
+        self.assertIn("fleetwatch index schedule status", on)
+        never = " ".join(health(name="e", state="never", finished=None).next_steps(now))
+        self.assertIn("fleetwatch index refresh e", never)
+
+    def test_a_running_refresh_is_not_a_problem(self):
+        now = time.time()
+        old = now - 5 * 3600
+        stale = health(finished=old)
+        self.assertTrue(stale.problems(now))
+        running = health(finished=old, refresh_state="refreshing")
+        self.assertEqual(running.problems(now), [])
+        self.assertEqual(health(finished=old, refresh_state="waiting").problems(now), [])
+        self.assertEqual(health(state="failed", reason="build", refresh_state="refreshing").problems(now), [])
+        self.assertTrue(health(protection="refused", refresh_state="refreshing").problems(now))
+        self.assertEqual(index_health.problem_rows([running], now), [])
+
+    def test_the_lock_files_decide_refreshing_and_waiting(self):
+        tree = CanaryTree()
+        self.addCleanup(tree.close)
+        os.environ.pop("FLEETWATCH_DEMO", None)
+        rows = {h.name: h for h in tree.load(scheduled=True).rows}
+        self.assertEqual({h.refresh_state for h in rows.values()}, {""})
+        lock = tree.root / "alpha" / "state" / "refresh.lock.d"
+        lock.mkdir()
+        rows = {h.name: h for h in tree.load(scheduled=True).rows}
+        self.assertEqual(rows["alpha"].refresh_state, "refreshing")
+        self.assertEqual(rows["gamma"].refresh_state, "waiting")       # stale, not reached yet
+        self.assertEqual(rows["beta"].refresh_state, "")                # fresh enough: not waiting
+        old = time.time() - 2 * 3600
+        os.utime(lock, (old, old))                                      # a dead run's lock
+        rows = {h.name: h for h in tree.load(scheduled=True).rows}
+        self.assertEqual({h.refresh_state for h in rows.values()}, {""})
+
+    def test_a_plain_index_in_a_protected_group_is_not_refused(self):
+        tree = CanaryTree()
+        self.addCleanup(tree.close)
+        os.environ.pop("FLEETWATCH_DEMO", None)
+        tree.reg["indexes"]["delta"]["kind"] = "plain"
+        result = tree.load()
+        rows = {h.name: h for h in result.rows}
+        self.assertEqual(rows["delta"].protection, "plain")
+        self.assertEqual(rows["delta"].problems(time.time()), [])
+        self.assertNotIn("delta", [h.name for h in index_health.problem_rows(result.rows)])
+        text = " ".join(str(n.head) for n in views.index_nodes(result.rows, time.time())[0].children)
+        self.assertIn("its own scripts build the corpus", text)
+
+    def test_the_registry_owner_is_read(self):
+        tree = CanaryTree()
+        self.addCleanup(tree.close)
+        os.environ.pop("FLEETWATCH_DEMO", None)
+        tree.reg["indexes"]["delta"].pop("owner_session")
+        tree.reg["indexes"]["delta"].pop("owner_session_id")
+        rows = {h.name: h for h in tree.load().rows}
+        self.assertEqual((rows["alpha"].owner, rows["alpha"].owner_id), ("builder-alpha", "sid-alpha"))
+        self.assertEqual((rows["delta"].owner, rows["delta"].owner_id), ("", ""))
+
+
+class OwnerBoardTests(BoardCase):
+    """Owner text and Enter on the Indexes tab, in the demo."""
+
+    def test_rows_say_who_owns_them_and_the_next_step(self):
+        async def script(app, pilot):
+            await pilot.press("5", "z")
+            await pilot.pause(0.3)
+            tab = app.lists[views.INDEXES_TAB].visible_text()
+            await pilot.press("1")
+            await pilot.pause(0.3)
+            return tab, app.lists[0].visible_text()
+        tab, needs = self.board((140, 60), script)
+        for want in ("owner: Billing API", "owner: Pricing Page", "no owner session", "refreshing now",
+                     "waiting for the running refresh", "fleetwatch index status release-history",
+                     "fleetwatch index schedule status", "fleetwatch index verify advising-notes"):
+            self.assertIn(want, tab)
+        self.assertIn("owner: Pricing Page", needs)
+        self.assertIn("fleetwatch index status release-history", needs)
+        self.assertNotIn("refreshing now", needs)
+
+    def run_enter(self, key, demo_mode=False, jump=True):
+        calls = {"jump": [], "resume": []}
+
+        async def script(app, pilot):
+            if not demo_mode:
+                os.environ.pop("FLEETWATCH_DEMO", None)
+            if jump:
+                ttys = {r["pid"]: "ttyX" for r in app.snapshot.held.values()}
+                app.snapshot.jump = {"ttys": ttys, "iterm": {"ttyX"}, "err": None}
+            app._do_jump = lambda name, tty, close_find=False: calls["jump"].append((name, tty))
+            app.start_resume = lambda sid, here: calls["resume"].append(sid)
+            await pilot.press("5", "z")
+            app.lists[views.INDEXES_TAB].move_to(key)
+            await pilot.press("enter")
+            await pilot.pause(0.4)
+            return app.status_text
+        status = self.board((140, 60), script)
+        return calls, status
+
+    def test_enter_on_a_running_owner_jumps_to_its_tab(self):
+        calls, _ = self.run_enter("idx:storefront-sessions")
+        self.assertEqual(len(calls["jump"]), 1)
+        self.assertEqual((calls["jump"][0][0], calls["resume"]), ("Billing API", []))
+
+    def test_enter_on_a_stopped_owner_resumes_it(self):
+        calls, _ = self.run_enter("idx:release-history")
+        self.assertEqual(calls["resume"], [demo.RESUME_SIDS[0]])
+        self.assertEqual(calls["jump"], [])
+
+    def test_enter_with_no_owner_names_the_command(self):
+        calls, status = self.run_enter("idx:advising-notes")
+        self.assertEqual((calls["jump"], calls["resume"]), ([], []))
+        self.assertIn("no owner session", status)
+        self.assertIn("fleetwatch index verify advising-notes", status)
+
+    def test_enter_on_a_stale_ownerless_index_names_refresh(self):
+        calls, status = self.run_enter("idx:nightly-notes")
+        self.assertIn("fleetwatch index refresh nightly-notes", status)
+
+    def test_enter_in_the_demo_only_says_what_it_would_do(self):
+        calls, status = self.run_enter("idx:release-history", demo_mode=True)
+        self.assertEqual((calls["jump"], calls["resume"]), ([], []))
+        self.assertIn("demo", status)
+        self.assertIn("resume Pricing Page", status)
+        calls, status = self.run_enter("idx:storefront-sessions", demo_mode=True)
+        self.assertEqual((calls["jump"], calls["resume"]), ([], []))
+        self.assertIn("jump to Billing API", status)
+
+    def test_enter_on_a_needs_you_index_row_also_goes_to_the_owner(self):
+        calls = {"resume": []}
+
+        async def script(app, pilot):
+            os.environ.pop("FLEETWATCH_DEMO", None)
+            app.start_resume = lambda sid, here: calls["resume"].append(sid)
+            await pilot.press("1")
+            app.lists[0].move_to("needs-idx:release-history")
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+        self.board((140, 60), script)
+        self.assertEqual(calls["resume"], [demo.RESUME_SIDS[0]])
+
+    def test_a_cursor_on_the_section_header_still_folds(self):
+        async def script(app, pilot):
+            await pilot.press("1")
+            app.lists[0].move_to("needs-idx")
+            before = app.lists[0].is_open(app.lists[0].current())
+            await pilot.press("enter")
+            return before, app.lists[0].is_open(app.lists[0].current())
+        before, after = self.board((140, 60), script)
+        self.assertNotEqual(before, after)
 
 
 if __name__ == "__main__":

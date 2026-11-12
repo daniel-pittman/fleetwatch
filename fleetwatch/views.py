@@ -406,7 +406,15 @@ def _age_text(seconds):
     return ago(seconds) if seconds is not None else "never"
 
 
-def index_node(h, now):
+def owner_text(h, owners):
+    """'owner: NAME (running)' or '(can resume)' from the owners map, 'no owner session' when none is recorded."""
+    if not h.owner:
+        return "no owner session"
+    where = (owners or {}).get(h.name)
+    return "owner: %s%s" % (h.owner, {"running": " (running)", "resume": " (can resume)"}.get(where, ""))
+
+
+def index_node(h, now, owners=None):
     """One index row: status and numbers, in words as well as color. Nothing from inside the index."""
     problems = h.problems(now)
     head = [(h.name, "bold"), ("  " + h.kind, DIM)]
@@ -415,36 +423,44 @@ def index_node(h, now):
     else:
         word = "refreshed %s ago" % _age_text(h.age(now)) if h.state == "ok" else "refresh FAILED (%s) %s ago" % (
             h.reason, _age_text(h.age(now)))
-        head += [(" · ", DIM), (word, RED if h.state == "failed" else "")]
-    if h.is_stale(now):
+        head += [(" · ", DIM), (word, RED if h.state == "failed" and h.refresh_state != "refreshing" else "")]
+    if h.refresh_state == "refreshing":
+        head += [(" · ", DIM), ("refreshing now", "bold")]
+    elif h.refresh_state == "waiting":
+        head += [(" · ", DIM), ("waiting for the running refresh", DIM)]
+    elif h.is_stale(now):
         head += [(" · ", DIM), ("STALE", RED)]
-    if h.protection:
+    if h.protection == "plain":
+        head += [(" · ", DIM), ("plain index: its own scripts build the corpus", DIM)]
+    elif h.protection:
         head += [(" · ", DIM), ("protection ok" if h.protection == "ok" else "protection REFUSED (%s)" % h.refusal,
                               "" if h.protection == "ok" else RED)]
     if h.exchanges is not None:
         head += [(" · ", DIM), (plural(h.exchanges, "exchange"), DIM)]
     if h.files is not None:
         head += [(" · ", DIM), (plural(h.files, "file"), DIM)]
-    body = [(Text("  "), Text("group: %s" % h.group)),
+    body = [(Text("  "), Text(owner_text(h, owners))),
+            (Text("  "), Text("group: %s" % h.group)),
             (Text("  "), Text("refresh schedule: %s" % ("installed, stale after %s" % _age_text(h.stale_after)
                                                          if h.scheduled else "not installed, stale after 2 d")))]
-    if problems:
-        body.insert(0, (Text("  "), Text("; ".join(problems), style=RED)))
+    steps = h.next_steps(now)
+    body = [(Text("  "), Text(p, style=RED)) for p in problems] + [
+        (Text("  "), Text("next: " + t)) for t in steps] + body
     return Node("idx:" + h.name, _row_text(head), body, session=None, index=h.name, hang=2)
 
 
-def index_nodes(rows, now, sort="name"):
+def index_nodes(rows, now, sort="name", owners=None):
     """One folding section per trust group; with the problems-first sort, rows that need a look lead."""
     def key(h):
         return (not h.problems(now), h.name.casefold()) if sort == "problems" else (h.name.casefold(),)
     out = []
     for g in sorted({h.group for h in rows}, key=str.casefold):
-        kids = [index_node(h, now) for h in sorted((h for h in rows if h.group == g), key=key)]
+        kids = [index_node(h, now, owners) for h in sorted((h for h in rows if h.group == g), key=key)]
         out.append(_group_node(INDEXES_TAB, g, len(kids), kids))
     return out
 
 
-def index_problem_group(rows, now):
+def index_problem_group(rows, now, owners=None):
     """The Needs you section for indexes that failed, are refused or are stale; None when all are fine."""
     bad = problem_rows(rows, now)
     if not bad:
@@ -453,7 +469,9 @@ def index_problem_group(rows, now):
     for h in bad:
         t = Text(h.name, style="bold")
         t.append("  " + "; ".join(h.problems(now)), style=RED)
-        kids.append(Node("needs-idx:" + h.name, t, index=h.name, hang=2))
+        body = [(Text("  "), Text("next: " + step)) for step in h.next_steps(now)]
+        body.append((Text("  "), Text(owner_text(h, owners))))
+        kids.append(Node("needs-idx:" + h.name, t, body, index=h.name, hang=2, start_open=True))
     head = _row_text([("Indexes", "bold"), (" · %d" % len(kids), DIM)])
     return Node("needs-idx", head, children=kids, start_open=True, section=True)
 
@@ -464,7 +482,7 @@ def tab_counts(view, stale):
             len(view["rows"]) + len(view["orphans"]) + len(stale)]
 
 
-def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=()):
+def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=(), owners=None):
     """(node tree of each tab, Needs row order).
 
     Each tab is in its chosen sort order, optionally wrapped in group sections. `seen` is the
@@ -473,7 +491,7 @@ def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), read
     s = [sort_id(i, sorts[i]) for i in range(3)]
     needs = stabilise(needs_nodes(view, now, s[0]), seen)
     needs_tab = list(_grouped(0, needs, grouping))
-    bad = index_problem_group(indexes, now)
+    bad = index_problem_group(indexes, now, owners)
     if bad is not None:
         needs_tab.append(bad)
     return [needs_tab,

@@ -26,7 +26,7 @@ IMAGES = os.path.join(HERE, "..", "docs", "images")
 # columns; a shorter board hides it.
 VIEWS = (
     ("board", (120, 32), "e"),
-    ("board-indexes", (120, 14), "5"),
+    ("board-indexes", (120, 40), "5 e"),
 )
 
 
