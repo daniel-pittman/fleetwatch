@@ -1,0 +1,249 @@
+{
+  "generated": "2026-10-18T14:00:00-06:00",
+  "window_seconds": 86400,
+  "counts": {
+    "needs": 1,
+    "questions": 3,
+    "quiet": 1,
+    "working": 2
+  },
+  "sections": {
+    "needs": [
+      {
+        "name": "Stuck Session",
+        "kind": "interactive",
+        "state": "waiting",
+        "live": true,
+        "last_activity": "2026-10-18T19:54:00+00:00",
+        "persona": "Robin",
+        "working_on": null,
+        "parent": null,
+        "questions": [
+          "Which branch should the fix land on?"
+        ],
+        "remind": []
+      }
+    ],
+    "questions": [
+      {
+        "name": "Stuck Session",
+        "kind": "interactive",
+        "state": "waiting",
+        "live": true,
+        "last_activity": "2026-10-18T19:54:00+00:00",
+        "persona": "Robin",
+        "working_on": null,
+        "parent": null,
+        "questions": [
+          "Which branch should the fix land on?"
+        ],
+        "remind": []
+      },
+      {
+        "name": "Asker Development",
+        "kind": "interactive",
+        "state": "idle",
+        "live": false,
+        "last_activity": "2026-10-18T19:20:00+00:00",
+        "persona": "Piper",
+        "working_on": null,
+        "parent": null,
+        "questions": [
+          {
+            "q": "Approve the schema change?",
+            "since": "2026-10-18T11:00:00-06:00"
+          },
+          "Is the staging deploy allowed this week or should it wait for the freeze to lift and the release train to pass?"
+        ],
+        "remind": [
+          "Email the registrar about the term dates"
+        ]
+      },
+      {
+        "name": "wt-helper-1",
+        "kind": "interactive",
+        "state": "busy",
+        "live": true,
+        "last_activity": "2026-10-18T19:59:00+00:00",
+        "persona": null,
+        "working_on": null,
+        "parent": "Stuck Session",
+        "questions": [
+          "Helper question that rolls up"
+        ],
+        "remind": []
+      }
+    ],
+    "quiet": [
+      {
+        "name": "Quiet One",
+        "kind": "interactive",
+        "state": "idle",
+        "live": false,
+        "last_activity": "2026-10-18T18:00:00+00:00",
+        "persona": null,
+        "working_on": "waiting on CI",
+        "parent": null,
+        "questions": [],
+        "remind": []
+      }
+    ],
+    "working": [
+      {
+        "name": "Worker",
+        "kind": "interactive",
+        "state": "busy",
+        "live": true,
+        "last_activity": "2026-10-18T19:55:00+00:00",
+        "persona": "Rowan",
+        "working_on": "reviewing PR 720",
+        "parent": null,
+        "questions": [],
+        "remind": []
+      },
+      {
+        "name": "wt-helper-1",
+        "kind": "interactive",
+        "state": "busy",
+        "live": true,
+        "last_activity": "2026-10-18T19:59:00+00:00",
+        "persona": null,
+        "working_on": null,
+        "parent": "Stuck Session",
+        "questions": [
+          "Helper question that rolls up"
+        ],
+        "remind": []
+      }
+    ],
+    "idle": [
+      {
+        "name": "Sleeper",
+        "kind": "interactive",
+        "state": "idle",
+        "live": false,
+        "last_activity": "2026-10-18T15:00:00+00:00",
+        "persona": null,
+        "working_on": null,
+        "parent": null,
+        "questions": [],
+        "remind": []
+      }
+    ],
+    "stale": [
+      {
+        "name": "Ancient",
+        "kind": "interactive",
+        "state": "idle",
+        "live": false,
+        "last_activity": "2026-10-13T20:00:00+00:00",
+        "persona": null,
+        "working_on": null,
+        "parent": null,
+        "questions": [],
+        "remind": []
+      }
+    ]
+  },
+  "upcoming": [
+    {
+      "what": "Overdue thing",
+      "due": "2026-10-10T00:00:00-06:00",
+      "has_time": false,
+      "kind": "deadline",
+      "yours": true,
+      "sessions": [
+        "Stuck Session"
+      ],
+      "bucket": "overdue",
+      "overdue": true
+    },
+    {
+      "what": "Team meeting",
+      "due": "2026-10-19T10:00:00-06:00",
+      "has_time": true,
+      "kind": "meeting",
+      "yours": false,
+      "sessions": [
+        "Worker"
+      ],
+      "bucket": "this_week",
+      "overdue": false
+    },
+    {
+      "what": "Pens down for LA applications",
+      "due": "2026-10-22T00:00:00-06:00",
+      "has_time": false,
+      "kind": "deadline",
+      "yours": true,
+      "sessions": [
+        "Asker Development"
+      ],
+      "bucket": "this_week",
+      "overdue": false
+    },
+    {
+      "what": "Dev deploy",
+      "due": "2026-10-28T00:00:00-06:00",
+      "has_time": false,
+      "kind": "deploy",
+      "yours": false,
+      "sessions": [
+        "Asker Development",
+        "Worker"
+      ],
+      "bucket": "next_2_wk",
+      "overdue": false
+    },
+    {
+      "what": "Faculty interviews",
+      "due": "2026-11-05T00:00:00-07:00",
+      "has_time": false,
+      "kind": "milestone",
+      "yours": true,
+      "sessions": [
+        "Worker"
+      ],
+      "bucket": "next_2_wk",
+      "overdue": false
+    },
+    {
+      "what": "Email the registrar about the term dates",
+      "due": null,
+      "has_time": false,
+      "kind": "todo",
+      "yours": true,
+      "sessions": [
+        "Asker Development"
+      ],
+      "bucket": "no_date",
+      "overdue": false
+    },
+    {
+      "what": "Write the ITS ticket",
+      "due": null,
+      "has_time": false,
+      "kind": "milestone",
+      "yours": true,
+      "sessions": [
+        "Quiet One"
+      ],
+      "bucket": "no_date",
+      "overdue": false
+    },
+    {
+      "what": "Spring launch",
+      "due": "2027-03-01T00:00:00-07:00",
+      "has_time": false,
+      "kind": "milestone",
+      "yours": false,
+      "sessions": [
+        "Asker Development"
+      ],
+      "bucket": "later",
+      "overdue": false
+    }
+  ],
+  "stale_hidden": 0,
+  "warnings": []
+}

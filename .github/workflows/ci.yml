@@ -1,0 +1,125 @@
+# Continuous integration: lint and the full unittest suite on Python 3.11 to
+# 3.14, on Linux and macOS. Needs no secrets, so it is safe on fork PRs.
+# The tests build their indexes with the TF-IDF backend; none downloads a model.
+# The "CI gate" job is the single status check branch protection requires.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FLEETWATCH_NO_MIGRATE: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install ruff
+        run: pip install ruff==0.15.12
+
+      - name: Lint with ruff
+        run: ruff check .
+
+  test:
+    name: Test (py${{ matrix.python-version }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The pip cache holds the downloaded wheels, the spaCy model wheel among them.
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # The document converters the indexer shells out to. tests/indexer_checks/doc_formats.py
+      # skips without them on a contributor's machine; every leg here sets
+      # FLEETWATCH_REQUIRE_DOC_TOOLS, so a missing program fails the run instead.
+      - name: Install the document converters (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends pandoc tesseract-ocr poppler-utils \
+            libreoffice-writer libreoffice-calc libreoffice-impress
+
+      # Homebrew's download cache keeps the LibreOffice cask between runs.
+      - name: Cache Homebrew downloads (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-doc-tools-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: brew-doc-tools-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install the document converters (macOS)
+        if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+          HOMEBREW_NO_ANALYTICS: "1"
+        run: |
+          brew install pandoc tesseract poppler
+          brew install --cask libreoffice
+
+      - name: Check the document converters are on PATH
+        run: |
+          for tool in pandoc soffice tesseract pdftotext pdftoppm; do
+            command -v "$tool" || { echo "missing: $tool"; exit 1; }
+          done
+
+      # The `search` extra is left out on purpose: it pulls torch and
+      # sentence-transformers, which only the optional embedder subprocess uses.
+      # The memory extra pins numpy and pyyaml.
+      - name: Install the project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[memory,test]"
+
+      - name: Run the full test suite
+        env:
+          FLEETWATCH_REQUIRE_DOC_TOOLS: "1"
+        run: python -m unittest discover -s tests
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Fail unless lint and every test job passed
+        env:
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          echo "lint=$LINT test=$TEST"
+          [ "$LINT" = "success" ] && [ "$TEST" = "success" ]

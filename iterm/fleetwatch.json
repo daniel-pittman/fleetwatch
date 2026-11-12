@@ -1,0 +1,28 @@
+{
+  "Profiles": [
+    {
+      "Name": "fleetwatch",
+      "Guid": "6F1EE7A0-5B1D-4C8E-9A52-0F1E7D3C4B01",
+      "Tags": [
+        "fleetwatch"
+      ],
+      "Rewritable": true,
+      "Dynamic Profile Parent Name": "Default",
+      "Custom Command": "Yes",
+      "Command": "/bin/zsh -ilc fleetwatch",
+      "Window Type": 2,
+      "Screen": -2,
+      "Space": -1,
+      "Columns": 120,
+      "Rows": 40,
+      "Has Hotkey": true,
+      "HotKey Key Code": 3,
+      "HotKey Modifier Flags": 393216,
+      "HotKey Characters": "\u0006",
+      "HotKey Characters Ignoring Modifiers": "F",
+      "HotKey Window AutoHides": true,
+      "HotKey Window Animates": false,
+      "HotKey Window Dock Click Action": 1
+    }
+  ]
+}

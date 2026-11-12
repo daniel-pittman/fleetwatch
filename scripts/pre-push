@@ -1,0 +1,40 @@
+#!/bin/sh
+# Leak check before a push: scans the tracked files, and the messages, added lines and
+# author and committer addresses of the commits being pushed, with the maintainer's private
+# term list when one exists.
+#
+# Install:  ln -sf ../../scripts/pre-push .git/hooks/pre-push
+# Private list: one term per line in the file named by FLEETWATCH_LEAK_TERMS,
+# default ~/.config/fleetwatch-leak-terms.txt. The list stays outside the repository.
+
+root=$(git rev-parse --show-toplevel) || exit 1
+if [ -z "${FLEETWATCH_LEAK_TERMS:-}" ] && [ -f "$HOME/.config/fleetwatch-leak-terms.txt" ]; then
+    FLEETWATCH_LEAK_TERMS="$HOME/.config/fleetwatch-leak-terms.txt"
+    export FLEETWATCH_LEAK_TERMS
+fi
+
+python3 "$root/scripts/leak_check.py" || {
+    echo "pre-push: leak check failed; push aborted." >&2
+    exit 1
+}
+
+zero=0000000000000000000000000000000000000000
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    if [ "$remote_sha" = "$zero" ]; then
+        range="$local_sha"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+    python3 "$root/scripts/leak_check.py" --messages "$range" || {
+        echo "pre-push: leak check failed in commit messages; push aborted." >&2
+        exit 1
+    }
+    # Every commit being pushed, not only the tip: a line added and later deleted is still
+    # published in history, and so are the author and committer addresses.
+    python3 "$root/scripts/leak_check.py" --history "$range" || {
+        echo "pre-push: leak check failed in the history being pushed; push aborted." >&2
+        exit 1
+    }
+done
+exit 0

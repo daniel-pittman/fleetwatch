@@ -1,0 +1,1478 @@
+"""fleetwatch live view: a Textual app with tabs along the bottom and folding sections."""
+import asyncio
+import os
+import signal
+import sys
+import time
+
+from rich.text import Text
+from textual import events
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.geometry import Size
+from textual.screen import ModalScreen
+from textual.scroll_view import ScrollView
+from textual.strip import Strip
+from textual.widgets import ContentSwitcher, Input, OptionList, Static
+from textual.widgets.option_list import Option
+
+from . import config, data, find, iterm, park, prune, radar, resume, views
+
+STATUS_SECONDS = 10.0
+RESCAN_SECONDS = 60.0
+# Below this size the radar shrinks to one glyph beside the header.
+RADAR_MIN_ROWS, RADAR_MIN_COLS = 32, 70
+TAB_OPEN_RESCAN_SECONDS = 15.0
+# A window just opened takes a few seconds to show up as a live session. Until it can, this is what
+# stops a second press from putting two processes on one transcript.
+REOPEN_GUARD_SECONDS = 30.0
+FIND_ROW_ROOM = 60                        # the find box's row width less its separators
+CURSOR = "reverse"
+OPEN, SHUT = "▾", "▸"
+
+HELP_LINES = [
+    "fleetwatch keys",
+    "",
+    "  1 to 4, Tab, Shift-Tab    switch tabs (or click one)",
+    "  up/down, j/k              move the cursor; PgUp/PgDn and the wheel scroll",
+    "  Enter, g                  jump to the row's session in iTerm2 (helpers: their own",
+    "                            tab, else the parent's); on a section header, fold it;",
+    "                            on a row tagged 'not running', offer to reopen it",
+    "  click, double click       select the row; double click jumps like Enter",
+    "  /, Ctrl-K                 find a session by part of its name or persona, Enter jumps",
+    "  Space                     open or close the row (▸ closed, ▾ open)",
+    "  right arrow, left arrow   open, close",
+    "  e / c                     open all / close all rows in this tab",
+    "  s                         change the sort order of this tab (remembered)",
+    "  G                         group every tab by project folder, or ungroup",
+    "  m                         move the highlighted session to another group",
+    "  P                         prune finished sessions' status files (y moves them, Esc cancels)",
+    "  p / u                     park the highlighted session with a note / unpark it",
+    "  r                         refresh now",
+    "  ?                         show or hide this help",
+    "  q, Ctrl-C                 quit",
+    "",
+    "On the Resume tab (4):",
+    "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
+    "  o                         resume in a new iTerm window (Ctrl-O in the find box)",
+    "  /                         find by part of a name; Enter resumes",
+    "",
+    "In the fleetwatch hotkey window:",
+    "  ⌃⇧F hides this window; q quits fleetwatch; a resume always opens a new window",
+    "",
+    "Press any key to go back.",
+]
+
+
+HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("s", "sort"), ("G", "groups"), ("m", "move"),
+         ("r", "refresh"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
+CORE_HINTS = ("⏎", "␣", "?", "q")
+DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s")     # least important first
+RESUME_HINTS = [("⏎", "resume here"), ("o", "new window"), ("/", "find"), ("p", "park"), ("u", "unpark"),
+                ("␣", "details"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
+HOTKEY_RESUME_HINTS = [("⏎", "new window")] + RESUME_HINTS[2:]
+RESUME_DROP = ("⌃⇧F", "s", "␣", "u", "p")
+
+
+def footer_text(width, show_move, hints=HINTS, drop_order=DROP_ORDER):
+    """The key-hint line: whole hints only, least important dropped first, never wrapped."""
+    keep = [h for h in hints if h[0] != "m" or show_move]
+    drop = [k for k in drop_order]
+
+    def render(hints):
+        return "  ".join("%s %s" % h for h in hints)
+    while len(render(keep)) > width and drop:
+        gone = drop.pop(0)
+        keep = [h for h in keep if h[0] != gone]
+    return Text(render(keep), style="dim", no_wrap=True, overflow="ellipsis")
+
+
+class Snapshot:
+    """One collection: the view, counts, header, groups and the data the jump needs."""
+
+    def __init__(self, sections, stale, now, warnings, horizon, jump=None, groups=None, cfg_warning=None,
+                 prune_plan=None, held=None):
+        self.now = now
+        self.held = held or {}
+        self.prune_plan = prune_plan or prune.Plan({}, now, config.default_prune())
+        self.stale = stale
+        self.warnings = list(warnings)
+        self.view = data.build_view(sections, now, horizon, stale)
+        self.counts = views.tab_counts(self.view, stale)
+        self.warnings += self.view["up_warnings"]
+        self.jump = jump or {"ttys": {}, "iterm": None, "err": "not read"}
+        self.groups = groups if groups is not None else config.Groups()
+        self.cfg_warning = cfg_warning
+        self.records, self.helpers = {}, {}
+        self.gone = {x["name"]: x["r"] for x in self.view["for_you"] if x.get("gone")}
+        for x in self.view["rows"]:
+            self.records.setdefault(x["name"], x["r"])
+            for c in x["r"]["children"]:
+                self.helpers.setdefault(data.clean(c["name"]), c)
+        for r in list(self.view["orphans"]) + list(stale):
+            self.helpers.setdefault(data.clean(r["name"]), r)
+        self.grouping = views.Grouping(
+            {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
+            self.groups.names())
+        self.header = views.header_text(self.view, self.counts, now, self.warnings)
+        self.header_short = views.header_text(self.view, self.counts, now, self.warnings, short=True)
+
+    def _tty(self, rec, name):
+        """(tty, None) when the record has an iTerm2 tab, else (None, reason)."""
+        if rec is None:
+            return None, "%s is not a live session" % name
+        if not rec["pid_alive"]:
+            return None, "%s is not running" % name
+        if self.jump["iterm"] is None:
+            return None, "could not reach iTerm2: %s" % (self.jump.get("err") or "no answer")
+        tty = self.jump["ttys"].get(rec["pid"])
+        if tty not in self.jump["iterm"]:
+            return None, "%s is not in an iTerm2 tab" % name
+        return tty, None
+
+    def held_target(self, sid, name):
+        """(tty, None) for a running session on the Resume tab, by ID since names can repeat."""
+        return self._tty(self.held.get(sid), name)
+
+    def target(self, session, helper=None):
+        """(tty, None, name raised) or (None, reason, None). A helper's own tab comes first,
+        then its parent session's."""
+        if helper:
+            tty, reason = self._tty(self.helpers.get(helper), helper)
+            if tty is not None:
+                return tty, None, helper
+            if not session:
+                return None, reason, None
+        tty, reason = self._tty(self.records.get(session), session)
+        return (tty, None, session) if tty is not None else (None, reason, None)
+
+
+def gather(paths, window_s, horizon):
+    """Collect everything one refresh needs; runs in a worker thread."""
+    sections, stale, now, warnings, records = data.collect_full(window_s, True, paths)
+    groups, cfg_warning = config.load_groups()
+    settings, prune_warning = config.load_prune()
+    warnings += [prune_warning] if prune_warning else []
+    plan = prune.make_plan(paths, now, records, settings)
+    return Snapshot(sections, stale, now, warnings, horizon, iterm.jump_context(), groups, cfg_warning, plan,
+                    resume.held_map(records))
+
+
+class FoldList(ScrollView, can_focus=True):
+    """A scrolling list of folding nodes with a cursor. State is keyed by node key, not by row."""
+
+    DEFAULT_CSS = """
+    FoldList { scrollbar-gutter: stable; scrollbar-size-vertical: 1; height: 1fr; }
+    """
+
+    def __init__(self, empty, **kw):
+        super().__init__(**kw)
+        self.empty = empty
+        self.nodes = []
+        self.overrides = {}        # key -> bool, the user's own open/closed choices
+        self.cursor = None         # key of the highlighted node
+        self.loaded = False
+        self._order = []           # visible cursor keys, top to bottom
+        self._by_key = {}
+        self._spans = {}           # key -> (first line, last line)
+        self._strips = []
+        self._width = 0
+        self.on_fold = None        # called after the user opens or closes something
+        self.on_move = None        # called whenever the cursor or the rows change
+
+    # ---- model
+
+    def is_open(self, node):
+        return self.overrides.get(node.key, node.start_open) if node.expandable else False
+
+    def set_nodes(self, nodes):
+        old_order, old_cursor = list(self._order), self.cursor
+        anchor = None
+        if old_cursor in self._spans:
+            anchor = self._spans[old_cursor][0] - int(self.scroll_y)
+        self.nodes, self.loaded = nodes, True
+        self._layout()
+        if old_cursor not in self._by_key:
+            self.cursor = self._neighbour(old_order, old_cursor)
+            self._layout()
+            anchor = None
+        if anchor is not None and self.cursor in self._spans:
+            self.scroll_to(y=max(self._spans[self.cursor][0] - anchor, 0), animate=False, immediate=True)
+        self._repaint()
+
+    def _neighbour(self, old_order, old_cursor):
+        if old_cursor in old_order:
+            i = old_order.index(old_cursor)
+            for k in old_order[i + 1:] + old_order[:i][::-1]:
+                if k in self._by_key:
+                    return k
+        return self._order[0] if self._order else None
+
+    def _layout(self):
+        """Flatten the open nodes into lines at the current width."""
+        width = max(self._width, 20)
+        console = self.app.console
+        self._order, self._by_key, self._spans, lines = [], {}, {}, []
+
+        def wrap(label, text, indent, hang=0):
+            pad = Text(" " * indent) + label
+            room = max(width - pad.cell_len - hang, 8)
+            out = []
+            for i, part in enumerate(text.wrap(console, room, overflow="fold")):
+                lead = pad if i == 0 else Text(" " * (pad.cell_len + hang))
+                out.append(lead + part)
+            return out or [pad]
+
+        def walk(node, depth):
+            self._by_key[node.key] = node
+            glyph = (OPEN if self.is_open(node) else SHUT) if node.expandable else " "
+            first = len(lines)
+            for ln in wrap(Text(glyph + " "), node.head, depth * 2, node.hang):
+                lines.append((node.key, ln))
+            self._order.append(node.key)
+            if self.is_open(node):
+                for label, text in node.body:
+                    for ln in wrap(label, text, depth * 2 + 2):
+                        lines.append((None, ln))
+                for child in node.children:
+                    walk(child, depth + 1)
+            self._spans[node.key] = (first, first + sum(
+                1 for k, _ in lines[first:] if k == node.key) - 1)
+
+        for node in self.nodes:
+            walk(node, 0)
+        if not lines:
+            lines.append((None, Text(self.empty if self.loaded else "Loading…", style="dim")))
+        if self.cursor not in self._by_key:
+            self.cursor = self._order[0] if self._order else None
+        self._lines = lines
+        self.virtual_size = Size(width, len(lines))
+
+    def _repaint(self):
+        strips = []
+        width = max(self._width, 20)
+        for key, line in self._lines:
+            segs = list(line.render(self.app.console))
+            strip = Strip(segs).adjust_cell_length(width)
+            if key is not None and key == self.cursor:
+                strip = strip.apply_style(self.app.console.get_style(CURSOR))
+            strips.append(strip)
+        self._strips = strips
+        self.refresh()
+        if self.on_move:
+            self.on_move()
+
+    def render_line(self, y):
+        i = int(self.scroll_offset.y) + y
+        if 0 <= i < len(self._strips):
+            return self._strips[i].crop(int(self.scroll_offset.x), int(self.scroll_offset.x) + self.size.width)
+        return Strip.blank(self.size.width)
+
+    def on_resize(self, event):
+        width = self.scrollable_content_region.width or event.size.width
+        if width != self._width:
+            self._width = width
+            if self.nodes:
+                self._layout()
+                self._repaint()
+
+    # ---- cursor and folding
+
+    def _reveal(self):
+        if self.cursor not in self._spans:
+            return
+        a, b = self._spans[self.cursor]
+        top, height = int(self.scroll_y), max(self.size.height, 1)
+        if a < top:
+            self.scroll_to(y=a, animate=False, immediate=True)
+        elif b >= top + height:
+            self.scroll_to(y=b - height + 1, animate=False, immediate=True)
+
+    def move_to(self, key):
+        if key is None:
+            return
+        self.cursor = key
+        self._layout()
+        self._repaint()
+        self._reveal()
+
+    def move(self, delta):
+        if not self._order:
+            return
+        i = self._order.index(self.cursor) if self.cursor in self._order else 0
+        self.move_to(self._order[max(0, min(len(self._order) - 1, i + delta))])
+
+    def page(self, direction):
+        if not self._order:
+            return
+        height = max(self.size.height - 1, 1)
+        top = max(0, int(self.scroll_y) + direction * height)
+        self.scroll_to(y=top, animate=False, immediate=True)
+        keys = [k for k in self._order if self._spans[k][0] >= top] or self._order[-1:]
+        self.cursor = keys[0] if direction > 0 else (
+            [k for k in self._order if self._spans[k][0] <= top + height][-1:] or keys)[-1]
+        self._layout()
+        self._repaint()
+
+    def set_open(self, key, value):
+        node = self._by_key.get(key)
+        if node is not None and node.expandable:
+            self.overrides[key] = value
+            self._layout()
+            self._repaint()
+            self._reveal()
+            if self.on_fold:
+                self.on_fold()
+
+    def set_all(self, value):
+        def walk(nodes):
+            for n in nodes:
+                if n.expandable:
+                    self.overrides[n.key] = value
+                walk(n.children)
+        walk(self.nodes)
+        self._layout()
+        self._repaint()
+        self._reveal()
+        if self.on_fold:
+            self.on_fold()
+
+    def toggle(self):
+        node = self._by_key.get(self.cursor)
+        if node is not None and node.expandable:
+            self.set_open(self.cursor, not self.is_open(node))
+
+    def current(self):
+        return self._by_key.get(self.cursor)
+
+    # A focused ScrollView binds the arrows, PgUp/PgDn, Home and End to scrolling and, once the rows
+    # overflow the pane, handles them before the app's bindings run. Route them to the cursor so the
+    # view only scrolls to keep the cursor visible.
+    def action_scroll_up(self):
+        self.move(-1)
+
+    def action_scroll_down(self):
+        self.move(1)
+
+    def action_page_up(self):
+        self.page(-1)
+
+    def action_page_down(self):
+        self.page(1)
+
+    def action_scroll_home(self):
+        self.move_to(self._order[0] if self._order else None)
+
+    def action_scroll_end(self):
+        self.move_to(self._order[-1] if self._order else None)
+
+    def on_click(self, event: events.Click):
+        i = int(self.scroll_offset.y) + event.y
+        if 0 <= i < len(self._lines):
+            key = self._lines[i][0]
+            if key is None:
+                return
+            # A double click arrives as a second Click with chain 2, after the first click has
+            # already selected and toggled the row: jump like Enter, but never toggle a section
+            # again, or the double click would close what the first click opened.
+            if event.chain >= 2:
+                node = self._by_key.get(key)
+                if node is not None and not node.section:
+                    self.app.action_enter()
+                return
+            self.move_to(key)
+            self.toggle()
+
+    def visible_text(self):
+        """Plain text of every line, for tests and captures."""
+        return "\n".join(line.plain.rstrip() for _, line in self._lines)
+
+
+class TabBar(Static):
+    DEFAULT_CSS = "TabBar { height: 1; }"
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.counts = [0] * len(views.TAB_TITLES)
+        self.compact = False
+        self.plain = ""
+        self.active = 0
+        self._spans = []
+
+    def update_tabs(self, counts, active, width=None):
+        self.active, self.counts = active, list(counts)
+        width = (width or self.size.width or 80) - 2
+        for titles, self.compact in ((views.TAB_TITLES, False), (views.SHORT_TITLES, False),
+                                     (views.SHORT_TITLES, True), (views.TINY_TITLES, True)):
+            for gap in (4, 2):
+                if self._fits(titles, gap, width):
+                    return self._paint(titles, gap)
+        self._paint(views.TINY_TITLES, 2)
+
+    def _label(self, titles, i):
+        return ("%d %s %d" if self.compact else "%d %s · %d") % (i + 1, titles[i], self.counts[i])
+
+    def _fits(self, titles, gap, width):
+        return sum(len(self._label(titles, i)) + gap for i in range(len(titles))) + 2 <= width
+
+    def _paint(self, titles, gap):
+        text = Text(no_wrap=True, overflow="ellipsis")
+        self._spans = []
+        pad = " " * (gap // 2 - 1)
+        for i in range(len(titles)):
+            label = self._label(titles, i)
+            start = text.cell_len
+            if i == self.active:
+                text.append("[%s%s%s]" % (pad, label, pad), style="bold reverse")
+            else:
+                text.append(" %s%s%s " % (pad, label, pad), style="dim" if self.counts[i] == 0 else "")
+            self._spans.append((start, text.cell_len))
+        self.plain = text.plain
+        self.update(text)
+
+    def on_resize(self, event):
+        self.update_tabs(self.counts, self.active, event.size.width)
+
+    def on_click(self, event: events.Click):
+        for i, (a, b) in enumerate(self._spans):
+            if a <= event.x < b:
+                self.app.show_tab(i)
+                return
+
+
+class HelpScreen(ModalScreen):
+    DEFAULT_CSS = "HelpScreen { align: center middle; } HelpScreen Static { width: auto; padding: 1 2; }"
+
+    def compose(self):
+        yield Static(Text("\n".join(HELP_LINES)))
+
+    def on_key(self, event):
+        event.stop()
+        self.dismiss()
+
+    def on_click(self, event):
+        self.dismiss()
+
+
+class PruneScreen(ModalScreen):
+    """The status files a prune would move aside, and the ones it keeps because they hold open items."""
+
+    DEFAULT_CSS = """
+    PruneScreen { align: center middle; }
+    PruneScreen VerticalScroll { width: 90%; max-width: 110; height: auto; max-height: 85%;
+        border: round $accent; padding: 0 1; background: $surface; }
+    """
+    BINDINGS = [
+        Binding("y", "confirm", show=False),
+        Binding("escape", "cancel", show=False),
+    ]
+
+    def __init__(self, plan):
+        super().__init__()
+        self.plan = plan
+
+    def compose(self):
+        plan = self.plan
+        t = Text(no_wrap=True, overflow="ellipsis")
+        t.append("Prune status files · %d ready\n" % len(plan.candidates), style="bold")
+        t.append("Moved to .pruned/, never deleted; a returning session gets its file back.\n", style="dim")
+        for c in plan.candidates:
+            t.append("\n  %s" % c["name"])
+            t.append("  last active %s, %s" % (data.day(c["last"]), c["reason"]), style="dim")
+        if not plan.candidates:
+            t.append("\n  nothing to prune")
+        if plan.kept_open:
+            t.append("\n\nKept: has open items (%d)" % len(plan.kept_open), style="bold")
+            for c in plan.kept_open:
+                t.append("\n  %s" % c["name"])
+                t.append("  " + ", ".join(
+                    x for x in (data.plural(c["questions"], "question") if c["questions"] else "",
+                                data.plural(c["upcoming"], "upcoming item") if c["upcoming"] else "") if x),
+                    style="dim")
+        t.append("\n\n" + ("y prune these, Esc cancel" if plan.candidates else "Esc closes"), style="bold")
+        with VerticalScroll():
+            yield Static(t)
+
+    def action_confirm(self):
+        self.dismiss(bool(self.plan.candidates))
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class FindScreen(ModalScreen):
+    """Type-ahead jump: filter the live top-level sessions by name and persona."""
+
+    DEFAULT_CSS = """
+    FindScreen { align: center top; }
+    FindScreen #finder { width: 72; max-width: 96%; height: auto; max-height: 80%; margin-top: 2;
+                         border: round $primary; padding: 0 1; background: $surface; }
+    FindScreen OptionList { height: auto; max-height: 14; border: none; padding: 0; }
+    """
+    BINDINGS = [
+        Binding("escape", "cancel", show=False, priority=True),
+        Binding("down,ctrl+n", "step(1)", show=False, priority=True),
+        Binding("up,ctrl+p", "step(-1)", show=False, priority=True),
+    ]
+
+    def __init__(self, entries):
+        super().__init__()
+        self.entries = entries
+        self.shown = []
+
+    def compose(self):
+        with Vertical(id="finder"):
+            yield Input(placeholder="Jump to session: type part of a name or persona", id="query")
+            yield OptionList(id="results")
+
+    def on_mount(self):
+        self.query_one("#results", OptionList).can_focus = False
+        self.query_one("#query", Input).focus()
+        self.refill("")
+
+    def refill(self, query):
+        self.shown = find.rank(query, self.entries)
+        lst = self.query_one("#results", OptionList)
+        lst.clear_options()
+        for e in self.shown:
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append(e["name"], style="bold")
+            if e["persona"]:
+                t.append(" (%s)" % e["persona"])
+            t.append("  " + e["group"], style="dim")
+            t.append("  " + e["status"], style="italic")
+            lst.add_option(Option(t))
+        if self.shown:
+            lst.highlighted = 0
+        else:
+            lst.add_option(Option(Text("no matching session", style="dim"), disabled=True))
+
+    def on_input_changed(self, event):
+        event.stop()
+        self.refill(event.value)
+
+    def on_input_submitted(self, event):
+        event.stop()
+        chosen = self.highlighted_entry()
+        if chosen is not None:
+            self.submit(chosen)
+
+    def highlighted_entry(self):
+        i = self.query_one("#results", OptionList).highlighted
+        return self.shown[i] if self.shown and i is not None and i < len(self.shown) else None
+
+    def submit(self, entry):
+        self.app.find_jump(entry["name"])
+
+    def action_step(self, d):
+        lst = self.query_one("#results", OptionList)
+        if self.shown:
+            lst.highlighted = max(0, min(len(self.shown) - 1, (lst.highlighted or 0) + d))
+
+    def action_cancel(self):
+        self.dismiss()
+
+
+class ResumeFindScreen(FindScreen):
+    """The find box over the Resume tab: Enter resumes here, Ctrl-O opens a new window."""
+
+    BINDINGS = FindScreen.BINDINGS + [Binding("ctrl+o", "new_window", show=False, priority=True)]
+
+    def compose(self):
+        with Vertical(id="finder"):
+            yield Input(placeholder="Resume session: type part of a name or persona", id="query")
+            yield OptionList(id="results")
+
+    def submit(self, entry):
+        self.app.start_resume(entry["sid"], True)
+
+    def action_new_window(self):
+        chosen = self.highlighted_entry()
+        if chosen is not None:
+            self.app.start_resume(chosen["sid"], False)
+
+
+class ParkScreen(ModalScreen):
+    """Ask what a session is waiting on, then park it."""
+
+    DEFAULT_CSS = """
+    ParkScreen { align: center middle; }
+    ParkScreen #parker { width: 72; max-width: 96%; height: auto; border: round $primary;
+                         padding: 0 1; background: $surface; }
+    ParkScreen Input { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False, priority=True)]
+
+    def __init__(self, session, note):
+        super().__init__()
+        self.session_name, self.note = session, note
+
+    def compose(self):
+        with Vertical(id="parker"):
+            yield Static(Text("Park %s" % self.session_name, style="bold", no_wrap=True, overflow="ellipsis"))
+            yield Input(value=self.note, placeholder="What is it waiting on?", id="note")
+            yield Static(Text("Enter saves, Esc cancels", style="dim"))
+
+    def on_mount(self):
+        self.query_one("#note", Input).focus()
+
+    def on_input_submitted(self, event):
+        event.stop()
+        self.dismiss(event.value)
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class StillRunningScreen(ModalScreen):
+    """A running session cannot be resumed; offer the jump instead."""
+
+    DEFAULT_CSS = """
+    StillRunningScreen { align: center middle; }
+    StillRunningScreen #running { width: 72; max-width: 96%; height: auto; border: round $warning;
+                                  padding: 0 1; background: $surface; }
+    """
+    BINDINGS = [Binding("enter,y", "confirm", show=False), Binding("escape,n", "cancel", show=False)]
+
+    def __init__(self, message, can_jump):
+        super().__init__()
+        self.message, self.can_jump = message, can_jump
+
+    def compose(self):
+        with Vertical(id="running"):
+            yield Static(Text(self.message))
+            yield Static(Text("Enter jumps to its iTerm tab, Esc stays here" if self.can_jump
+                              else "It is not in an iTerm2 tab fleetwatch can jump to. Esc closes", style="bold"))
+
+    def action_confirm(self):
+        if self.can_jump:
+            self.dismiss(True)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class ReopenScreen(ModalScreen):
+    """Confirm opening an ended session in a new window. Nothing starts without it."""
+
+    DEFAULT_CSS = """
+    ReopenScreen { align: center middle; }
+    ReopenScreen #reopen { width: 72; max-width: 96%; height: auto; border: round $warning;
+                           padding: 0 1; background: $surface; }
+    """
+    BINDINGS = [Binding("enter,y", "confirm", show=False), Binding("escape,n", "cancel", show=False)]
+
+    def __init__(self, name):
+        super().__init__()
+        self.session_name = name
+
+    def compose(self):
+        with Vertical(id="reopen"):
+            yield Static(Text("Reopen %s in a new window?" % self.session_name))
+            yield Static(Text("Enter or y reopens it, Esc or n stays here", style="bold"))
+
+    def action_confirm(self):
+        self.dismiss(True)
+
+    def action_cancel(self):
+        self.dismiss(False)
+
+
+class GroupPicker(ModalScreen):
+    """Pick a group for one session, or type a new group name."""
+
+    DEFAULT_CSS = """
+    GroupPicker { align: center middle; }
+    GroupPicker #picker { width: 48; max-width: 90%; height: auto; max-height: 90%;
+                          border: round $primary; padding: 0 1; background: $surface; }
+    GroupPicker OptionList { height: auto; max-height: 14; border: none; padding: 0; }
+    GroupPicker Input { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+    NEW = "new-group"
+
+    def __init__(self, session, names, current):
+        super().__init__()
+        self.session_name, self.names, self.current = session, names, current
+
+    def compose(self):
+        with Vertical(id="picker"):
+            yield Static(Text("Move %s to" % self.session_name, style="bold", no_wrap=True,
+                              overflow="ellipsis"))
+            options = [Option(Text(n + ("  (now)" if n == self.current else "")), id="g:%d" % i)
+                       for i, n in enumerate(self.names)]
+            yield OptionList(*options, Option(Text("New group…", style="italic"), id=self.NEW), id="choices")
+            yield Input(placeholder="New group name, then Enter", id="newname")
+
+    def on_mount(self):
+        self.query_one("#newname", Input).display = False
+        lst = self.query_one("#choices", OptionList)
+        if self.current in self.names:
+            lst.highlighted = self.names.index(self.current)
+        lst.focus()
+
+    def on_option_list_option_selected(self, event):
+        event.stop()
+        if event.option.id == self.NEW:
+            box = self.query_one("#newname", Input)
+            box.display = True
+            box.focus()
+        else:
+            self.dismiss(self.names[int(event.option.id.split(":")[1])])
+
+    def on_input_submitted(self, event):
+        event.stop()
+        name = data.clean(event.value).strip()
+        if name:
+            self.dismiss(name[:60])
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class SessionPicker(ModalScreen):
+    """Pick which of several sessions holding the same item to jump to."""
+
+    DEFAULT_CSS = """
+    SessionPicker { align: center middle; }
+    SessionPicker #picker { width: 56; max-width: 90%; height: auto; max-height: 90%;
+                            border: round $primary; padding: 0 1; background: $surface; }
+    SessionPicker OptionList { height: auto; max-height: 14; border: none; padding: 0; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, names):
+        super().__init__()
+        self.names = names
+
+    def compose(self):
+        with Vertical(id="picker"):
+            yield Static(Text("Go to which session?", style="bold", no_wrap=True))
+            yield OptionList(*[Option(Text(n, no_wrap=True, overflow="ellipsis"), id="s:%d" % i)
+                               for i, n in enumerate(self.names)], id="choices")
+
+    def on_mount(self):
+        self.query_one("#choices", OptionList).focus()
+
+    def on_option_list_option_selected(self, event):
+        event.stop()
+        self.dismiss(self.names[int(event.option.id.split(":")[1])])
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
+class FleetwatchApp(App):
+    ENABLE_COMMAND_PALETTE = False
+    CSS = """
+    Screen { layout: vertical; }
+    #head { height: 2; }
+    #head.tall { height: 5; }
+    #headtext { width: 1fr; height: auto; }
+    #radar { width: 2; height: 1; }
+    #head.tall #radar { width: 9; height: 5; margin: 0 1 0 0; }
+    #top { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #status { height: 1; padding: 0 1; }
+    ContentSwitcher { height: 1fr; }
+    .pane { height: 1fr; }
+    .sortline { height: 1; padding: 0 1; color: $text-muted; }
+    TabBar { padding: 0 1; }
+    #footer { height: 1; padding: 0 1; }
+    """
+    BINDINGS = [
+        Binding("1", "tab(0)", "Needs you", show=False),
+        Binding("2", "tab(1)", "To-dos", show=False),
+        Binding("3", "tab(2)", "Sessions", show=False),
+        Binding("4", "tab(3)", "Resume", show=False),
+        Binding("tab", "next_tab(1)", "Next tab", show=False, priority=True),
+        Binding("shift+tab", "next_tab(-1)", "Previous tab", show=False, priority=True),
+        Binding("up,k", "move(-1)", show=False),
+        Binding("down,j", "move(1)", show=False),
+        Binding("home", "edge(0)", show=False),
+        Binding("end", "edge(-1)", show=False),
+        Binding("pageup", "page(-1)", show=False),
+        Binding("pagedown", "page(1)", show=False),
+        Binding("enter", "enter", show=False),
+        Binding("g", "jump", show=False),
+        Binding("slash,ctrl+k", "find", show=False),
+        Binding("space", "toggle", show=False),
+        Binding("right,l", "open", show=False),
+        Binding("left,h", "close", show=False),
+        Binding("e", "all(True)", show=False),
+        Binding("c", "all(False)", show=False),
+        Binding("s", "sort", show=False),
+        Binding("G", "groups", show=False),
+        Binding("m", "regroup", show=False),
+        Binding("P", "prune", show=False),
+        Binding("p", "park", show=False),
+        Binding("u", "unpark", show=False),
+        Binding("o", "new_window", show=False),
+        Binding("r", "refresh_now", show=False),
+        Binding("question_mark", "help", show=False),
+        Binding("q", "quit", show=False),
+        Binding("ctrl+c", "quit_now", show=False, priority=True),
+    ]
+
+    def __init__(self, loader, interval=data.DEFAULT_INTERVAL_S, state_path=None, paths=None, **kw):
+        super().__init__(ansi_color=True, **kw)
+        self.loader = loader
+        self.paths = paths                    # None: no transcript scan, and the Resume tab stays empty
+        self.resume_data = None               # resume.Loaded from the latest scan
+        self.resume_rows = {}                 # sessionId -> entry shown on the Resume tab
+        self.scanning = False
+        self.scanned_at = 0.0
+        self.resuming = False
+        self.opened_at = {}                   # sessionId -> when a window was opened for it
+        self.interval = interval
+        self.snapshot = None
+        self.active = 0
+        self.status_text = None
+        self.status_until = 0.0
+        self.loading = False
+        self.refreshes = 0
+        self.utf8 = data.is_utf8(sys.stdout)      # read before Textual swaps stdout for its capture
+        self.jump_calls = []
+        self.prune_clock = time.time
+        self.state_path = state_path or config.state_path()
+        self.state, self._state_warning = config.load_state(self.state_path)
+        self.sorts = [views.sort_id(i, self.state["sort"].get(str(i))) for i in range(len(views.TAB_TITLES))]
+        self.grouped = self.state["groups"]
+        self.needs_seen = []
+        self.sortline_plain = []
+        self.footer_plain = ""
+        self._cfg_warned = None
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="head"):
+            with Vertical(id="headtext"):
+                yield Static(Text("fleetwatch · loading…", no_wrap=True), id="top")
+                yield Static("", id="status")
+            yield Static("", id="radar")
+        with ContentSwitcher(initial="pane0"):
+            for i, empty in enumerate(views.EMPTY):
+                with Vertical(id="pane%d" % i, classes="pane"):
+                    yield Static("", id="sort%d" % i, classes="sortline")
+                    yield FoldList(empty, id="tab%d" % i)
+        yield Static("", id="footer")
+        yield TabBar(id="tabs")
+
+    def on_resize(self, event):
+        self.update_footer(event.size.width)
+        self.show_header()
+        self.show_radar()
+
+    def show_radar(self):
+        """The radar mark in the header's corner; one glyph on a short terminal, ASCII off UTF-8."""
+        tall = self.size.height >= RADAR_MIN_ROWS and self.size.width >= RADAR_MIN_COLS
+        self.query_one("#head").set_class(tall, "tall")
+        alert = bool(self.snapshot and self.snapshot.counts[0])
+        if tall:
+            cells = radar.mark(alert, self.refreshes, self.utf8)
+        else:
+            cells = [[radar.glyph(alert, self.utf8)]]
+        text = Text(no_wrap=True)
+        for i, line in enumerate(cells):
+            text.append("\n" if i else "")
+            for ch, color in line:
+                text.append(ch, style=color)
+        self.query_one("#radar", Static).update(text)
+
+    def update_footer(self, width=None):
+        node = self.lists[self.active].current() if getattr(self, "lists", None) else None
+        width = (width or self.size.width or 80) - 2
+        if self.active == views.RESUME_TAB:
+            text = footer_text(width, False, HOTKEY_RESUME_HINTS if resume.in_hotkey_window() else RESUME_HINTS,
+                               RESUME_DROP)
+        else:
+            text = footer_text(width, node is not None and node.session is not None)
+        self.footer_plain = text.plain
+        self.query_one("#footer", Static).update(text)
+
+    def on_mount(self):
+        self.lists = [self.query_one("#tab%d" % i, FoldList) for i in range(len(views.TAB_TITLES))]
+        for i, lst in enumerate(self.lists):
+            lst.overrides.update({k: v for k, v in self.state["folds"].items()
+                                  if k.startswith("grp:%d:" % i)})
+            lst.on_fold = self.save_folds
+            lst.on_move = self.update_footer
+        self.update_sortlines()
+        self.query_one(TabBar).update_tabs(self.tab_counts(), 0)
+        self.lists[0].focus()
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                loop.add_signal_handler(sig, self.exit)
+        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
+            pass
+        if self._state_warning:
+            self.say(self._state_warning)
+        self.refresh_now()
+        self.set_interval(self.interval, self.refresh_now)
+        self.set_interval(1.0, self._expire_status)
+        self.set_interval(RESCAN_SECONDS, self.scan_resume)
+
+    def check_action(self, action, parameters):
+        """While a picker or the help panel is open, keys belong to it, not to the tabs behind."""
+        if isinstance(self.screen, ModalScreen) and action != "quit_now":
+            return False
+        return True
+
+    # ---- refresh
+
+    def action_refresh_now(self):
+        self.refresh_now()
+
+    def refresh_now(self):
+        if self.loading:
+            return
+        self.loading = True
+        self.run_worker(self._load, thread=True, exclusive=False, group="load")
+
+    def _load(self):
+        try:
+            snap = self.loader()
+        except Exception as exc:
+            self.call_from_thread(self._failed, data.clean(exc)[:80] or type(exc).__name__)
+            return
+        self.call_from_thread(self.apply, snap)
+
+    def _failed(self, reason):
+        self.loading = False
+        self.say("refresh failed: %s" % reason)
+
+    def show_header(self):
+        snap = self.snapshot
+        if snap is not None:
+            narrow = self.size.width < 100
+            self.query_one("#top", Static).update(snap.header_short if narrow else snap.header)
+
+    def apply(self, snap):
+        self.loading = False
+        self.snapshot = snap
+        self.refreshes += 1
+        self.rebuild()
+        self.show_header()
+        self.show_radar()
+        self.query_one(TabBar).update_tabs(self.tab_counts(), self.active)
+        # The first scan waits for the first snapshot, so reading transcripts never delays the first paint.
+        if self.resume_data is None:
+            self.scan_resume()
+        for w in snap.warnings:
+            if w.startswith("restored status file"):
+                self.say(w)
+        if snap.cfg_warning != self._cfg_warned:
+            self._cfg_warned = snap.cfg_warning
+            if snap.cfg_warning:
+                self.say(snap.cfg_warning)
+
+    def rebuild(self):
+        """Lay the tabs out again from the current snapshot, sorts and grouping."""
+        snap = self.snapshot
+        if snap is None:
+            return
+        tabs, self.needs_seen = views.build_tabs(
+            snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
+            self.needs_seen, len(snap.prune_plan.candidates))
+        for lst, nodes in zip(self.lists, tabs):
+            lst.set_nodes(nodes)
+        self.rebuild_resume()
+
+    def tab_counts(self):
+        counts = list(self.snapshot.counts) if self.snapshot else [0] * views.RESUME_TAB
+        return counts + [len(self.resume_rows)]
+
+    def rebuild_resume(self):
+        """Lay out the Resume tab from the latest scan and who holds what right now."""
+        lst = self.lists[views.RESUME_TAB]
+        if self.resume_data is None:
+            lst._layout()      # shows "Loading…" until the first scan lands
+            lst._repaint()
+            return
+        snap = self.snapshot
+        entries = resume.offered(resume.mark_held(self.resume_data.entries(), snap.held if snap else {}))
+        self.resume_rows = {e["sid"]: e for e in entries}
+        first = not lst.loaded
+        lst.set_nodes(views.resume_nodes(entries, time.time(), self.sorts[views.RESUME_TAB],
+                                         snap.groups if snap and self.grouped else None))
+        if first:
+            # Land on a session, so that the first Enter resumes rather than folds a section.
+            for key in lst._order:
+                if not lst._by_key[key].section:
+                    lst.move_to(key)
+                    break
+
+    def scan_resume(self):
+        if self.paths is None or self.scanning:
+            return
+        self.scanning = True
+        self.run_worker(self._scan_resume, thread=True, exclusive=False, group="resume-scan")
+
+    def _scan_resume(self):
+        warning = None
+        try:
+            loaded = resume.load(self.paths)
+        except park.ParkedError as exc:
+            warning = str(exc)
+            loaded = resume.Loaded(resume.scan(self.paths), resume.read_personas(self.paths), {})
+        except Exception as exc:
+            self.call_from_thread(self._scan_failed, data.clean(exc)[:80] or type(exc).__name__)
+            return
+        self.call_from_thread(self._apply_resume, loaded, warning)
+
+    def _scan_failed(self, reason):
+        self.scanning = False
+        self.say("could not read the transcripts: %s" % reason)
+
+    def _apply_resume(self, loaded, warning):
+        self.scanning = False
+        self.scanned_at = time.monotonic()
+        self.resume_data = loaded
+        self.rebuild_resume()
+        self.query_one(TabBar).update_tabs(self.tab_counts(), self.active)
+        if warning:
+            self.say(warning)
+
+    def update_sortlines(self):
+        self.sortline_plain = []
+        for i in range(len(views.TAB_TITLES)):
+            t = Text("sorted by: %s" % views.sort_label(i, self.sorts[i]), no_wrap=True, overflow="ellipsis")
+            t.append("  (s changes)", style="dim")
+            if self.grouped:
+                t.append("  ·  grouped by project folder (G ungroups, m moves a session)", style="dim")
+            self.sortline_plain.append(t.plain)
+            self.query_one("#sort%d" % i, Static).update(t)
+
+    # ---- remembered choices
+
+    def _save_state(self):
+        if not config.save_state(self.state, self.state_path):
+            self.say("could not save %s" % os.path.basename(self.state_path))
+
+    def save_folds(self):
+        folds = {}
+        for lst in self.lists:
+            folds.update({k: v for k, v in lst.overrides.items() if k.startswith("grp:")})
+        if folds != self.state["folds"]:
+            self.state["folds"] = folds
+            self._save_state()
+
+    # ---- status line
+
+    def say(self, text):
+        self.status_text = data.clean(text)
+        self.status_until = time.monotonic() + STATUS_SECONDS
+        self.query_one("#status", Static).update(Text(self.status_text, style="bold", no_wrap=True,
+                                                      overflow="ellipsis"))
+
+    def _expire_status(self):
+        if self.status_text and time.monotonic() >= self.status_until:
+            self.status_text = None
+            self.query_one("#status", Static).update("")
+
+    # ---- actions
+
+    @property
+    def current(self):
+        return self.lists[self.active]
+
+    def show_tab(self, i):
+        self.active = i % len(views.TAB_TITLES)
+        self.query_one(ContentSwitcher).current = "pane%d" % self.active
+        self.query_one(TabBar).update_tabs(self.tab_counts(), self.active)
+        self.current.focus()
+        self.update_footer()
+        if self.active == views.RESUME_TAB and time.monotonic() - self.scanned_at > TAB_OPEN_RESCAN_SECONDS:
+            self.scan_resume()
+
+    def action_tab(self, i):
+        self.show_tab(i)
+
+    def action_next_tab(self, d):
+        self.show_tab(self.active + d)
+
+    def action_move(self, d):
+        self.current.move(d)
+
+    def action_edge(self, which):
+        order = self.current._order
+        if order:
+            self.current.move_to(order[which])
+
+    def action_page(self, d):
+        self.current.page(d)
+
+    def action_open(self):
+        node = self.current.current()
+        if node is not None and node.expandable:
+            self.current.set_open(node.key, True)
+
+    def action_close(self):
+        node = self.current.current()
+        if node is not None and node.expandable:
+            self.current.set_open(node.key, False)
+
+    def action_toggle(self):
+        self.current.toggle()
+
+    def action_all(self, value):
+        self.current.set_all(value)
+
+    def action_help(self):
+        self.push_screen(HelpScreen())
+
+    def action_sort(self):
+        self.sorts[self.active] = views.next_sort(self.active, self.sorts[self.active])
+        self.state["sort"][str(self.active)] = self.sorts[self.active]
+        self._save_state()
+        self.update_sortlines()
+        self.rebuild()
+
+    def action_groups(self):
+        self.grouped = not self.grouped
+        self.state["groups"] = self.grouped
+        self._save_state()
+        self.update_sortlines()
+        self.rebuild()
+
+    def action_regroup(self):
+        node = self.current.current()
+        if node is None or node.session is None or self.snapshot is None:
+            self.say("no session is highlighted")
+            return
+        snap, name = self.snapshot, node.session
+        names = snap.groups.names()
+        current = snap.grouping.of(name)
+
+        def chosen(group):
+            if group is None:
+                return
+            try:
+                config.set_override(config.groups_path(), name, group,
+                                    snap.groups.by_path(snap.records[name]["cwd"]),
+                                    snap.records[name]["sessionId"])
+            except (OSError, ValueError) as exc:
+                self.say("could not save the group: %s" % (data.clean(exc)[:70] or type(exc).__name__))
+                return
+            self.say("moved %s to %s" % (name, group))
+            self.refresh_now()
+        self.push_screen(GroupPicker(name, names, current), chosen)
+
+    def find_entries(self):
+        snap = self.snapshot
+        if snap is None:
+            return []
+        out = []
+        for x in snap.view["rows"]:
+            name = x["name"]
+            tty, reason, _ = snap.target(name)
+            if tty is None:
+                status = "not in iTerm"
+            elif x["qs"]:
+                status = "%d question%s" % (len(x["qs"]), "" if len(x["qs"]) == 1 else "s")
+            elif x["stuck"] is not None or x["helper_stuck"]:
+                status = "needs you"
+            elif x["working"]:
+                status = "working"
+            else:
+                status = "idle"
+            out.append({"name": name, "persona": x["persona"], "group": snap.grouping.of(name),
+                        "status": status, "updated": x["updated"]})
+        return out
+
+    def action_find(self):
+        if self.snapshot is None:
+            self.say("still loading")
+            return
+        if self.active == views.RESUME_TAB:
+            self.push_screen(ResumeFindScreen(self.resume_find_entries()))
+            return
+        self.push_screen(FindScreen(self.find_entries()))
+
+    def resume_find_entries(self):
+        now, out = time.time(), []
+        for e in self.resume_rows.values():
+            status = " ".join((["parked"] if e["parked"] else []) + resume.tags(e))
+            date = data.date_label(e["last"], now)
+            # A row that wraps would hide the next result, so the folder takes only what is left.
+            used = len(e["name"]) + len(date) + len(status) + (len(e["persona"]) + 3 if e["persona"] else 0)
+            out.append({"sid": e["sid"], "name": e["name"], "persona": e["persona"], "updated": e["last"],
+                        "group": "%s  %s" % (date, resume.short_folder(e["cwd"], max(FIND_ROW_ROOM - used, 8))),
+                        "status": status})
+        return out
+
+    def find_jump(self, name):
+        tty, reason, shown = self.snapshot.target(name)
+        if tty is None:
+            self.say(reason)
+            return
+        self.run_worker(lambda: self._do_jump(shown, tty, True), thread=True, group="jump")
+
+    def _close_find(self):
+        if isinstance(self.screen, FindScreen):
+            self.screen.dismiss()
+
+    def action_jump(self):
+        node = self.current.current()
+        if node is not None and node.resume:
+            self._jump_held(node.resume)
+            return
+        if (node is not None and self.snapshot is not None and node.session in self.snapshot.gone
+                and node.helper is None and len(node.sessions) <= 1):
+            self.offer_reopen(node.session)
+            return
+        if node is None or (node.session is None and node.helper is None):
+            self.say("no session is highlighted")
+            return
+        if self.snapshot is None:
+            return
+        if len(node.sessions) > 1:
+            self.push_screen(SessionPicker(node.sessions), self._picked)
+            return
+        tty, reason, name = self.snapshot.target(node.session, node.helper)
+        if tty is None:
+            self.say(reason)
+            return
+        self.run_worker(lambda: self._do_jump(name, tty), thread=True, group="jump")
+
+    def offer_reopen(self, name):
+        """Enter on a session that has ended: confirm, then open it as `o` does on the Resume tab."""
+        rec = self.snapshot.gone[name]
+        if self.resume_data is None:
+            self.say("fleetwatch is still reading the Resume list; try again in a moment")
+            return
+        held = self.snapshot.held if self.snapshot else {}
+        entries = resume.mark_held(self.resume_data.entries(), held)
+        sid = rec.get("sessionId")
+        entry = next((e for e in entries if sid and e["sid"] == sid), None)
+        if entry is None:
+            entry = next((e for e in entries if e["name"].casefold() == name.casefold()), None)
+        if entry is None:
+            self.say("%s has no custom name, so fleetwatch can't reopen it; prune it with P if it's finished" % name)
+            return
+        if entry["held"]:
+            self.say("%s is still running, so fleetwatch won't reopen it" % name)
+            return
+        tags = resume.tags(entry)
+        if "no transcript" in tags:
+            self.say("%s has no transcript in the projects folder or the archive, so fleetwatch can't reopen it" % name)
+            return
+        if "folder gone" in tags or "folder unusable" in tags:
+            self.say("%s: its folder is %s, so fleetwatch can't reopen it" % (
+                name, "gone" if "folder gone" in tags else "unusable"))
+            return
+        sid = entry["sid"]
+
+        def chosen(yes):
+            if yes:
+                self.resume_rows.setdefault(sid, entry)
+                self.start_resume(sid, False)
+        self.push_screen(ReopenScreen(name), chosen)
+
+    def _picked(self, name):
+        if name is None or self.snapshot is None:
+            return
+        tty, reason, shown = self.snapshot.target(name)
+        if tty is None:
+            self.say(reason)
+            return
+        self.run_worker(lambda: self._do_jump(shown, tty), thread=True, group="jump")
+
+    def action_enter(self):
+        node = self.current.current()
+        if node is not None and node.section:
+            self.current.toggle()
+        elif node is not None and node.resume:
+            self.start_resume(node.resume, True)
+        else:
+            self.action_jump()
+
+    def _do_jump(self, name, tty, close_find=False):
+        self.jump_calls.append(tty)
+        ok, reason = iterm.jump_to_tty(tty)
+        if ok and close_find:
+            self.call_from_thread(self._close_find)
+        self.call_from_thread(self.say, ("jumped to %s" % name) if ok
+                              else "could not reach iTerm2: %s" % reason)
+
+    # ---- resume and park
+
+    def _jump_held(self, sid):
+        e = self.resume_rows.get(sid)
+        name = e["name"] if e else sid
+        if self.snapshot is None or sid not in self.snapshot.held:
+            self.say("%s is not running; Enter resumes it" % name)
+            return
+        tty, reason = self.snapshot.held_target(sid, name)
+        if tty is None:
+            self.say(reason)
+            return
+        self.run_worker(lambda: self._do_jump(name, tty, True), thread=True, group="jump")
+
+    def action_new_window(self):
+        node = self.current.current()
+        if self.active != views.RESUME_TAB:
+            self.say("o opens a session from the Resume tab (4)")
+        elif node is None or not node.resume:
+            self.say("no session is highlighted")
+        else:
+            self.start_resume(node.resume, False)
+
+    def start_resume(self, sid, here):
+        """Enter or o on a row. The gate and any archive copy run off the UI thread."""
+        e = self.resume_rows.get(sid)
+        if e is None or self.resuming:
+            return
+        here = here and not resume.in_hotkey_window()
+        opened = self.opened_at.get(sid)
+        if opened is not None and time.monotonic() - opened < REOPEN_GUARD_SECONDS:
+            self.say("%s was just opened in a new window" % e["name"])
+            return
+        self.resuming = True
+        self.run_worker(lambda: self._run_resume(e, here), thread=True, exclusive=False, group="resume-go")
+
+    def _run_resume(self, entry, here):
+        try:
+            ready = resume.prepare(entry, self.paths)
+        except resume.Blocked as blocked:
+            self.call_from_thread(self._resume_blocked, entry, blocked)
+            return
+        except Exception as exc:
+            self.call_from_thread(self._resume_failed, "could not resume: %s" % (
+                data.clean(exc)[:80] or type(exc).__name__))
+            return
+        if here:
+            self.call_from_thread(self.exit, ready)
+            return
+        ok, info = resume.open_new_window(ready)
+        self.call_from_thread(self._window_opened, ready, ok, info)
+
+    def _resume_failed(self, message):
+        self.resuming = False
+        self.say(message)
+
+    def _resume_blocked(self, entry, blocked):
+        self.resuming = False
+        if blocked.kind != "live":
+            self.say(str(blocked))
+            return
+        tty, _ = self.snapshot.held_target(entry["sid"], entry["name"]) if self.snapshot else (None, None)
+        if tty is None and blocked.record is not None:
+            # A session that started since the last refresh is not in the snapshot's map yet.
+            ttys = iterm.jump_context()
+            tty = ttys["ttys"].get(blocked.record.get("pid"))
+            tty = tty if ttys["iterm"] and tty in ttys["iterm"] else None
+
+        def chosen(jump):
+            if jump:
+                self._close_find()
+                self.run_worker(lambda: self._do_jump(entry["name"], tty), thread=True, group="jump")
+        self.push_screen(StillRunningScreen(str(blocked), tty is not None), chosen)
+
+    def _window_opened(self, entry, ok, info):
+        self.resuming = False
+        if not ok:
+            self.say("could not reach iTerm2: %s" % info)
+            return
+        self.opened_at[entry["sid"]] = time.monotonic()
+        self._close_find()
+        notes = resume.notes_for(entry)
+        self.say("opened %s in a new window%s" % (entry["name"], ". " + notes[-1] if notes else ""))
+        self._reload_parked()
+
+    def _reload_parked(self):
+        """Pick up a change to the parked file now, without waiting for the next scan."""
+        if self.resume_data is None:
+            return
+        try:
+            self.resume_data.parked = park.load()
+        except park.ParkedError as exc:
+            self.say(str(exc))
+            return
+        self.rebuild_resume()
+        self.query_one(TabBar).update_tabs(self.tab_counts(), self.active)
+
+    def _row_session(self):
+        """(sessionId, name) of the highlighted row on any tab, else (None, None)."""
+        node = self.current.current()
+        if node is None:
+            return None, None
+        if node.resume:
+            e = self.resume_rows.get(node.resume)
+            return (node.resume, e["name"]) if e else (None, None)
+        if node.session and self.snapshot is not None:
+            rec = self.snapshot.records.get(node.session)
+            if rec is not None and rec.get("sessionId"):
+                return rec["sessionId"], node.session
+        return None, None
+
+    def action_park(self):
+        sid, name = self._row_session()
+        if sid is None:
+            self.say("no session is highlighted")
+            return
+        try:
+            note = data.clean(park.load().get(sid, {}).get("note") or "")
+        except park.ParkedError as exc:
+            self.say(str(exc))
+            return
+
+        def chosen(text):
+            if text is None:
+                return
+            try:
+                saved = park.park(sid, name, text)
+            except (park.ParkedError, OSError) as exc:
+                self.say("could not park: %s" % (data.clean(exc)[:80] or type(exc).__name__))
+                return
+            self.say("parked %s%s" % (name, ": " + saved if saved else ""))
+            self._reload_parked()
+        self.push_screen(ParkScreen(name, note), chosen)
+
+    def action_unpark(self):
+        sid, name = self._row_session()
+        if sid is None:
+            self.say("no session is highlighted")
+            return
+        try:
+            gone = park.unpark(sid)
+        except (park.ParkedError, OSError) as exc:
+            self.say("could not unpark: %s" % (data.clean(exc)[:80] or type(exc).__name__))
+            return
+        self.say(("unparked %s" if gone is not None else "%s is not parked") % name)
+        self._reload_parked()
+
+    def action_prune(self):
+        if self.snapshot is None:
+            self.say("still loading")
+            return
+        plan = self.snapshot.prune_plan
+        self.push_screen(PruneScreen(plan), lambda ok: ok and self._start_prune(plan))
+
+    def _start_prune(self, plan):
+        self.say("pruning %d status files…" % len(plan.candidates))
+        self.run_worker(lambda: self._run_prune(plan), thread=True, exclusive=False, group="prune")
+
+    def _run_prune(self, plan):
+        try:
+            moved, skipped = prune.apply(plan, self.prune_clock())
+        except Exception as exc:
+            self.call_from_thread(self.say, "prune failed: %s" % (data.clean(exc)[:80] or type(exc).__name__))
+            return
+        self.call_from_thread(self._prune_done, moved, skipped)
+
+    def _prune_done(self, moved, skipped):
+        self.say("pruned %d status files%s" % (len(moved), ", skipped %d" % len(skipped) if skipped else ""))
+        self.refresh_now()
+
+    async def action_quit(self):
+        self.exit()
+
+    async def action_quit_now(self):
+        self.exit()
+
+
+def run(paths, window_s, horizon, interval):
+    """Run the app. Returns the entry to resume in this terminal, once the terminal is restored."""
+    app = FleetwatchApp(lambda: gather(paths, window_s, horizon), interval, paths=paths)
+    return app.run()

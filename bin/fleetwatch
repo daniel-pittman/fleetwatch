@@ -1,0 +1,4 @@
+#!/bin/sh
+# -P keeps the working directory off sys.path, so a module file in the folder a session
+# works in (yaml.py, json.py) never shadows one fleetwatch imports.
+exec "$HOME/.venvs/fleetwatch/bin/python" -P -m fleetwatch "$@"

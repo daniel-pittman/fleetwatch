@@ -1,0 +1,36 @@
+ fleetwatch | Sun Oct 18 2:00 PM MDT
+ 4 questions | 1 stuck | 1 overdue | 2 need a date | 2 working | 1 idle | 2
+   coming up this week (1 yours)
+=== FOR YOU ====================================================================
+ Stuck Session (R...  stuck on a prompt for 6 min | 1 helper | updated 6 min ago
+   Overdue (Oct 10): Overdue thing
+   1. Which branch should the fix land on?
+   2. Helper question that rolls up [wt-helper-1]
+
+ Asker Development (Piper)                                    updated 40 min ago
+   Needs a date: Email the registrar about the term dates
+   1. Approve the schema change? | 3.0h
+   2. Is the staging deploy allowed this week or should it wait for the freeze
+      to lift and the release train to pass?
+
+ Quiet One                        quiet: expected every 30 min | updated 2 h ago
+   Needs a date: Write the ITS ticket
+=== COMING UP ==================================================================
+ OVERDUE   Oct 10            +  Overdue thing                     Stuck Session
+ THIS WEEK tomorrow 10:00 AM o  Team meeting                             Worker
+           Oct 22            +  Pens down for LA applications             Asker
+ NEXT 2 WK Oct 28            ^  Dev deploy                         Asker+Worker
+           Nov 5             +  Faculty interviews                       Worker
+ LATER     1 more, first Mar 1 (Spring launch) | fleetwatch --horizon 90d
+ NO DATE   Asker      + Email the registrar about the term dates
+           Quiet One  + Write the ITS ticket
+=== NOTHING FOR YOU ============================================================
+ working   Worker  reviewing PR 720
+ idle      Sleeper (exited)
+
+ helpers (--all)
+  Stuck Session
+    - wt-helper-1 busy
+
+ stale
+  Ancient: idle, last active Oct 13

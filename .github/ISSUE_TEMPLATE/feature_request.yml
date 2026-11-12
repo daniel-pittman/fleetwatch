@@ -1,0 +1,19 @@
+name: Feature request
+description: Suggest a change to what fleetwatch shows or does.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not report a security vulnerability here, because issues are public. Use the private security advisory link on the new-issue page."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like fleetwatch to do?
+    validations:
+      required: true

@@ -1,0 +1,31 @@
+name: Bug report
+description: Something in fleetwatch does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security vulnerability here: issues are public.
+        Use the private security advisory link on the new-issue page instead.
+        Do not paste real session names, transcript text, paths with your username, or tokens.
+        Replace them with fictional examples.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The command or keys, in order.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `fleetwatch --version` if available, your Python version and operating system.
+    validations:
+      required: true

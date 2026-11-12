@@ -1,0 +1,36 @@
+[1m fleetwatch · Sun Oct 18 2:00 PM MDT[0m
+ 4 questions · [1;31m1[0m [1;31mstuck[0m · [1;31m1[0m [1;31moverdue[0m · 2 need a date · 2 working · 1 idle · 2 coming up this week (1
+   yours)
+[1;31m━━━ FOR YOU ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+ [1mStuck Session (Robin)[0m                    [1;31mstuck on a prompt for 6 min[0m[2m · [0m[36m1 helper[0m[2m · [0m[2mupdated 6 min ago[0m
+   [31mOverdue[0m [31m(Oct[0m [31m10):[0m [31mOverdue[0m [31mthing[0m
+   1. Which branch should the fix land on?
+   2. Helper question that rolls up [2m[wt-helper-1][0m
+
+ [1mAsker Development (Piper)[0m                                                        [2mupdated 40 min ago[0m
+   [2mNeeds[0m [2ma[0m [2mdate:[0m [2mEmail[0m [2mthe[0m [2mregistrar[0m [2mabout[0m [2mthe[0m [2mterm[0m [2mdates[0m
+   1. Approve the schema change? [2m·[0m [2m3.0h[0m
+   2. Is the staging deploy allowed this week or should it wait for the freeze to lift and the
+      release train to pass?
+
+ [1mQuiet One[0m                                            [33mquiet: expected every 30 min[0m[2m · [0m[2mupdated 2 h ago[0m
+   [2mNeeds[0m [2ma[0m [2mdate:[0m [2mWrite[0m [2mthe[0m [2mITS[0m [2mticket[0m
+[1;36m━━━ COMING UP ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[1;31m OVERDUE   [0m[1;31mOct 10            [0m[1;31m✎  [0m[1;31mOverdue thing[0m                                         [2mStuck Session[0m
+[1m THIS WEEK [0mtomorrow 10:00 AM ●  Team meeting                                                 [2mWorker[0m
+           Oct 22            ✎  Pens down for LA applications                                 [2mAsker[0m
+[1m NEXT 2 WK [0mOct 28            ▲  Dev deploy                                             [2mAsker+Worker[0m
+           Nov 5             ✎  Faculty interviews                                           [2mWorker[0m
+[1m LATER     [0m[2m1[0m [2mmore,[0m [2mfirst[0m [2mMar[0m [2m1[0m [2m(Spring[0m [2mlaunch)[0m [2m·[0m [2mfleetwatch[0m [2m--horizon[0m [2m90d[0m
+[1m NO DATE   [0m[2mAsker    [0m  ✎ Email the registrar about the term dates
+           [2mQuiet One[0m  ✎ Write the ITS ticket
+[1;32m━━━ NOTHING FOR YOU ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m
+[32m working   [0mWorker  reviewing PR 720
+[36m idle      [0mSleeper (exited)
+
+[1m helpers (--all)[0m
+  Stuck Session
+[2m    ↳ [0mwt-helper-1[2m busy[0m
+
+[1;90m stale[0m
+  Ancient: idle, last active Oct 13
