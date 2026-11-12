@@ -16,6 +16,16 @@ When you run many Claude Code sessions at once, each on its own job and some of 
   <img src="docs/images/board.png" width="900" alt="The fleetwatch board on its demo data: Needs you lists Billing API, stuck on a prompt with two questions; Release Notes, with an overdue item in red; Checkout Flow, with two questions; and Newsletter, with an item due today. A radar mark in the top right corner shows one amber blip.">
 </p>
 
+## Is fleetwatch for you?
+
+**Do you run many Claude Code sessions at once, and lose track of which ones need you?** One is stuck on a permission prompt. Another asked you a question twenty minutes ago, and it scrolled out of view. A third left you a to-do with a deadline, and you only find out when you happen to click into its tab. fleetwatch puts all of that on one screen: every session, what it is working on, and exactly what it is waiting on from you, with the oldest question first. One hotkey brings the board up over whatever you are doing, and Enter takes you straight to that session's terminal tab. You stop checking tabs one by one and spend your time answering the sessions that are actually waiting.
+
+**Has compaction made a session forget something you settled an hour ago?** When a long conversation is compacted, the details go first: the exact decision, the error message, the reason you chose one approach over another. fleetwatch can keep a searchable index of each session's full transcript and its reference documents, so the session, or you, can pull those details back with one command instead of explaining them again. Search combines keyword matching with semantic similarity, so "what did we decide about retries" finds the right exchange even when the wording differs.
+
+**Do you want that memory without sending your data anywhere?** The indexes live on your machine, in folders you choose. Every transcript is scrubbed before anything is stored: secrets, email addresses, phone numbers, ids and person names are replaced with placeholders, and you can add rules of your own.
+
+**Do you want your agents to share what they learn, but not everything?** Every index belongs to a trust group, and the groups decide which sessions may read which indexes. A session always reads its own. You can open a shared group to many sessions at once, for team lessons learned, a methodology library or project notes, while personal indexes stay readable only by their owner. Protected groups, such as one for student records, are readable by their owner session and the sessions you name, and their stricter scrubbing rules cannot be switched off by accident.
+
 **The headline: a board that floats over every terminal.** On macOS with iTerm2, one command puts fleetwatch behind a hotkey:
 
     fleetwatch iterm install
@@ -43,24 +53,37 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 
 1. **Look.** `fleetwatch --demo`.
 2. **Install the overlay** (macOS, iTerm2): `fleetwatch iterm install`, then Control-Shift-F.
-3. **Teach your sessions to report.** Add a paragraph like this to `~/.claude/CLAUDE.md`, which every session reads:
+3. **Required: teach every session to report.** The board sees that a session is running on its own, but it learns what a session is working on, what it is asking you and what it needs you to do only from the status the session writes. So this instruction has to reach every session: put it in your global `~/.claude/CLAUDE.md`, which every Claude Code session reads at startup.
+
+   ```markdown
+   ## fleetwatch: report your status (every session)
+
+   Every session reports its status by piping JSON to `fleetwatch write-status`:
+   - `working_on`: one line on what you are doing now.
+   - `questions`: the decisions waiting on me, a few words each. Remove a question
+     in the same turn it is answered.
+   - `upcoming`: only the dated things I must do myself, each with `what`, `due`
+     (YYYY-MM-DD), `kind` (deadline, deploy, meeting, milestone, todo or checkin)
+     and `"yours": true`. When the real date is unknown, use `"kind": "checkin"`
+     with the day to look again.
+
+   Write it whenever your questions change, and at the end of any turn that leaves
+   work running. Subagents do not write it; their session does.
+   ```
+
+   A session then writes, for example:
 
    ```
-   Report your status by piping JSON to `fleetwatch write-status`: what you are
-   working on (working_on), the questions waiting on me (questions), and only the
-   dated things I must do myself (upcoming, with "yours": true and a due date).
-   Write it whenever your questions change and at the end of any turn that
-   leaves work running.
+   echo '{"working_on": "adding retry to the invoice job",
+          "questions": ["Should refunds over the limit need a second approver?"],
+          "upcoming": [{"what": "Approve the retry PR", "due": "2026-11-14", "kind": "todo", "yours": true}]}' \
+     | fleetwatch write-status
    ```
 
-   A session then runs, for example:
-
-   ```
-   echo '{"working_on": "adding retry to the invoice job", "questions": ["Should refunds over the limit need a second approver?"]}' | fleetwatch write-status
-   ```
+   `write-status` finds the session it runs under, stamps the name, id and time, and refuses a malformed item with a message that tells the session how to fix it, so sessions learn the format on their first try. The full format is under How sessions report.
 
 4. **Run the board.** `fleetwatch` in any terminal, or Control-Shift-F.
-5. **Give a session a memory** (needs the extras). From inside the session: `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). Then `fleetwatch search "what did we decide about retries"`.
+5. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. From inside a session that should have one: `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). Then `fleetwatch search "what did we decide about retries"`.
 6. **Keep the indexes fresh.** `fleetwatch index schedule install`, then run the `launchctl` (or `systemctl`) command it prints.
 
 ## The three layers
