@@ -1,6 +1,7 @@
 """fleetwatch data: collection, rollup, timeline buckets and text cleaning. No UI."""
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -500,7 +501,9 @@ def make_row(r, now):
     }
 
 
-def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=()):
+def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=(), holds=None):
+    """The rollup every tab reads. `holds` (holds.Holds) hides snoozed and done items from the timeline,
+    the tasks and every count; view["held"] lists their rows, and view["item_keys"] every key reported."""
     seen = {}
     for k in ("needs", "questions", "quiet", "working", "idle"):
         for r in sections[k]:
@@ -511,17 +514,27 @@ def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=()):
             continue
         (orphans if looks_generated(r) else rows).append(r)
     up_warnings, up_items = [], []
-    for r in rows:
-        label = clean(r["name"])
+
+    def reported(r, label, only_yours):
+        out = []
         for src in [r] + r["children"]:
-            up_items += session_upcoming(src["status"] or {}, label, up_warnings)
+            for i in session_upcoming(src["status"] or {}, label, up_warnings):
+                if i["yours"] or not only_yours:
+                    i["key"] = item_key(r.get("sessionId") or "name-" + label, i)
+                    out.append(i)
+        return out
+    for r in rows:
+        up_items += reported(r, clean(r["name"]), False)
     gone = [r for r in stale if r.get("parent") is None and not looks_generated(r)]
     for r in gone:
-        label = clean(r["name"])
-        for src in [r] + r["children"]:
-            up_items += [i for i in session_upcoming(src["status"] or {}, label, up_warnings) if i["yours"]]
+        up_items += reported(r, clean(r["name"]), True)
+    item_keys = {i["key"] for i in up_items}
+    held_items = [i for i in up_items if holds and holds.status(i["key"], now)] if holds else []
+    held_ids = {id(i) for i in held_items}
+    up_items = [i for i in up_items if id(i) not in held_ids]
     rows = [make_row(r, now) for r in rows]
     timeline = build_timeline(up_items, now, horizon_days)
+    held = timeline_rows(build_timeline(held_items, now, horizon_days)) if held_items else []
     by_name = {}
     for x in rows:
         by_name.setdefault(x["name"], x)
@@ -547,6 +560,7 @@ def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=()):
         "working": [x for x in rest if not x["quiet"] and x["working"]],
         "idle": [x for x in rest if not x["quiet"] and not x["working"]],
         "timeline": timeline, "up_warnings": up_warnings, "task_counts": counts,
+        "held": held, "item_keys": item_keys,
     }
 
 
@@ -592,7 +606,8 @@ def attach_tasks(timeline, by_name, now):
             x = by_name.get(clean(name))
             if x is not None:
                 x["tasks"].append({"kind": kind, "what": row["what"], "due": row["due"],
-                                   "has_time": row["has_time"], "item": row["kind"]})
+                                   "has_time": row["has_time"], "item": row["kind"],
+                                   "keys": list(row.get("keys", ()))})
     order = {k: i for i, k in enumerate(TASK_KINDS)}
     for x in by_name.values():
         x["tasks"].sort(key=lambda t: (order[t["kind"]], t["due"].timestamp() if t["due"] else 0,
@@ -693,6 +708,14 @@ def dedup_key(it):
     return due, " ".join(it["what"].lower().split())
 
 
+def item_key(session_id, it):
+    """The identity a snooze or done hold is kept under: the owning session plus a hash of the item's
+    text, date and kind. Editing any of them makes a new item."""
+    due = it["due"].isoformat() if it["due"] else ""
+    raw = "\x1f".join((" ".join(it["what"].lower().split()), due, it["kind"]))
+    return "%s:%s" % (session_id, hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12])
+
+
 def build_timeline(items, now, horizon_days=DEFAULT_HORIZON_DAYS):
     """Merge duplicates and sort every item into its bucket."""
     now_dt = datetime.fromtimestamp(now, LOCAL_TZ)
@@ -701,9 +724,11 @@ def build_timeline(items, now, horizon_days=DEFAULT_HORIZON_DAYS):
     for it in items:
         key = dedup_key(it)
         if key not in merged:
-            merged[key] = dict(it, sessions=[it["session"]])
+            merged[key] = dict(it, sessions=[it["session"]], keys=[it["key"]] if it.get("key") else [])
             continue
         row = merged[key]
+        if it.get("key") and it["key"] not in row["keys"]:
+            row["keys"].append(it["key"])
         if it["session"] not in row["sessions"]:
             row["sessions"].append(it["session"])
         row["yours"] = row["yours"] or it["yours"]

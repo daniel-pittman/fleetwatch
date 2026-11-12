@@ -608,7 +608,7 @@ class OverrideEditTests(unittest.TestCase):
         path = os.path.join(self.tmp.name, "state.json")
         self.assertEqual(config.load_state(path), (config.default_state(), None))
         state = {"version": 2, "sort": {"0": "name"}, "groups": True, "folds": {"grp:0:A": False},
-                 "todo_group": "folder"}
+                 "todo_group": "folder", "holds": {"s1:abc": {"done": True}}}
         self.assertTrue(config.save_state(state, path))
         self.assertEqual(config.load_state(path), (state, None))
         self.assertEqual(sorted(os.listdir(self.tmp.name)), ["state.json"])
