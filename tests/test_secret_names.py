@@ -75,8 +75,14 @@ class GenericRuleOnDocumentNames(unittest.TestCase):
 
     def test_a_name_with_one_random_segment_is_still_secret(self):
         rng = random.Random(7)
-        tok = "2026-07-01_Faculty-" + random_run(rng, 28)
-        self.assertTrue(generic_secret(tok))
+        self.assertTrue(generic_secret("2026-07-01_Faculty-" + random_run(rng, 28)))
+        # A letters-only random segment has a vowel but no case pattern a word uses.
+        letters = "".join(rng.choice(string.ascii_letters) for _ in range(30))
+        self.assertRegex(letters, r"[a-z][A-Z].*[a-z]")
+        self.assertTrue(generic_secret("2026-07-01_Faculty-" + letters))
+        # An all-capitals run with no vowel is too long for an acronym and is not a word.
+        caps = "".join(rng.choice("BCDFGHJKLMNPQRSTVWXZ") for _ in range(24))
+        self.assertTrue(generic_secret("2026-07-01_Faculty-" + caps))
 
     def test_document_names_in_body_text_are_kept(self):
         with tempfile.TemporaryDirectory() as tmp:
