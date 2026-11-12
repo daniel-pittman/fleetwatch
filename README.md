@@ -94,6 +94,7 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 5. **Run the board.** `fleetwatch` in any terminal, or Control-Shift-F.
 6. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. A session can opt itself in, with no setup by hand: ask it to "give yourself a fleetwatch index in the work group", and it runs `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). `index add` finds the session it runs under and registers that session's own transcripts. From then on, the session searches its own memory with `fleetwatch search "what did we decide about retries"`. The recommended paragraph in the step 4 block makes every new session ask you this once, so no session is indexed without your yes.
 7. **Keep the indexes fresh.** `fleetwatch index schedule install`, then run the `launchctl` (or `systemctl`) command it prints.
+8. **Optional: get a desktop notification when something new needs you.** `fleetwatch notify --test` sends one, then `fleetwatch notify schedule install` and run the command it prints. See Notifications.
 
 ## The three layers
 
@@ -287,6 +288,47 @@ Without the file, the keep list is empty.
 ### Liveness
 
 Live is a registry pid that answers `kill -0`, or `busy` with activity in the last 15 minutes. A session that is not live and has no activity inside the window (default 24h) is stale and hidden unless `--all`.
+
+## Notifications
+
+The board helps only when you look at it. `fleetwatch notify` is a separate, opt-in process that tells you when something new needs you. It reads the same records the board reads and raises a desktop notification on these transitions:
+
+- a session becomes stuck on a permission prompt;
+- a session has a new question (a question already on the board when it started does not count, and a reworded question does);
+- one of your dated items becomes due today (once per item per day) or overdue (once);
+- an index problem appears;
+- a watch flag appears (once session watches are in your version).
+
+It never announces what was already there when it first ran: the first run records the board silently. It makes no network calls, and the board itself never notifies, so several open boards never duplicate.
+
+**Setup.**
+
+    fleetwatch notify --test              # send one notification and say whether it went out
+    fleetwatch notify schedule install    # write the launchd agent (macOS) or systemd user service
+    launchctl bootstrap gui/$(id -u) <the path it prints>
+
+`schedule install` prints the start command and never runs it. `fleetwatch notify --once` checks once and exits, and `fleetwatch notify --demo` prints what it would send for the built-in demo fleet and delivers nothing. Run `fleetwatch notify` with no flags to watch in a terminal.
+
+**Delivery.** On macOS it uses `terminal-notifier` when it is on your PATH, and a click on the banner raises that session's iTerm2 tab (the same jump as `fleetwatch jump NAME`, also available on its own with `--session-id ID`). Without it, `osascript` posts the banner and a click does nothing. On Linux it uses `notify-send`. Anywhere else it prints one line. `FLEETWATCH_NOTIFY_BACKEND=print` forces the printed line. Names and text go to these tools as separate arguments, never through a shell and never inside script source, because session names and questions are untrusted text. The operating system's Do Not Disturb applies as usual.
+
+**Privacy.** By default a banner shows the session name and the kind of event only ("Billing API is stuck on a prompt", "Checkout Flow has a new question"). Question and item text appears only with `show_text = true`, because a banner can appear during a screen share or a lecture. Index content is never shown.
+
+**Settings** (in `settings.toml`, re-read on every poll, so an edit applies without a restart; an invalid value is reported and the previous settings stay in force):
+
+```toml
+[notify]
+enabled = true                    # false: keep watching, announce nothing
+kinds = ["stuck", "question", "due", "index", "watch"]
+show_text = false                 # true: add the question or item text to the banner
+quiet_hours = "22:00-07:00"       # local time; "" (the default) means none
+poll_seconds = 20
+```
+
+**Limits.** At most one notification per session per kind per 10 minutes, and at most 5 a minute overall: anything beyond that becomes one summary ("4 more sessions need you"). Quiet hours hold everything and send one summary when they end. A kind you leave out of `kinds`, or anything seen while `enabled` is false, is skipped for good rather than saved up.
+
+**What it keeps.** The record of what it has announced is `notify-state.json` in the state folder (`$XDG_STATE_HOME/fleetwatch`, else `~/.local/state/fleetwatch`), readable only by you. It holds session names, hashes and times, never question text, so a restart does not repeat itself and does not miss what arrived while it was stopped.
+
+**Stopping it.** Press Control-C, or send SIGTERM or SIGHUP: it exits cleanly and sleeps between polls, so it never spins. To remove the background service run `fleetwatch notify schedule remove`, then the `launchctl bootout` (or `systemctl --user disable --now`) command it prints.
 
 ## How sessions report
 
