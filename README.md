@@ -13,7 +13,7 @@
 When you run many Claude Code sessions at once, each on its own job and some of them personas that watch a team's channel on a timer, the hard parts are knowing which one needs you and getting back what a session knew before it compacted or ended. fleetwatch is one screen of every session and what it needs from you (stuck permission prompts, questions, overdue and undated to-dos), a way back to the sessions you finished with, and a scrubbed, searchable memory of each session's transcript and reference folders. It runs on one machine, with no service and no account.
 
 <p align="center">
-  <img src="docs/images/board.png" width="900" alt="The fleetwatch board on its demo data: Needs you lists Billing API, stuck on a prompt with two questions; Release Notes, with an overdue item in red; Checkout Flow, with two questions; and Newsletter, with an item due today. A radar mark in the top right corner shows one amber blip.">
+  <img src="docs/images/board.png" width="900" alt="The fleetwatch board on its demo data: Needs you lists Billing API, stuck on a prompt with two questions; Release Notes, with an overdue item in red; Checkout Flow, with two questions; and Newsletter, with an item due today. Each session row says whether it is idle, and an Indexes section lists three indexes that need a look. A radar mark floats over the bottom right corner with one amber blip.">
 </p>
 
 ## Is fleetwatch for you?
@@ -113,7 +113,7 @@ The board loads the memory layers only for the `search` and `index` commands, so
     fleetwatch iterm install | status | uninstall
     fleetwatch --demo [--once]
 
-Live by default on a terminal: a Textual app with four tabs along the bottom, redrawn every 5 seconds (`--interval`) without moving the cursor, expanded rows or scroll position. Piped output, `--once` and `--json` print one snapshot with no escape codes and carry the full data.
+Live by default on a terminal: a Textual app with five tabs along the bottom, redrawn every 5 seconds (`--interval`) without moving the cursor, expanded rows or scroll position. Piped output, `--once` and `--json` print one snapshot with no escape codes and carry the full data.
 
 Tabs (switch with `1` to `4`, Tab, Shift-Tab or the mouse; each label carries a count):
 
@@ -192,7 +192,15 @@ If Control-Shift-F does nothing, set the hotkey once in the UI: Settings, Profil
 
 ### The radar mark
 
-The top right corner of the board carries a small radar: rings, a sweep that advances one step per refresh, and a few blips. One blip is amber while Needs you has items and teal when nothing needs you. On a terminal under 32 rows (or 70 columns) it shrinks to a single `◉` in the same two colours, and where the terminal is not UTF-8 it is drawn in plain ASCII. `--once` and `--json` never print it.
+A small radar floats over the bottom right corner of the board, above the hint line and the tab bar: rings, a sweep that advances one step per refresh, and a few blips. It takes no room from the lists. One blip is amber while Needs you has items and teal when nothing needs you. On a terminal under 32 rows or 100 columns it is hidden, and where the terminal is not UTF-8 it is drawn in plain ASCII. It is decoration only: everything it signals is also written on the board. `--once` and `--json` never print it.
+
+### The Indexes tab
+
+Tab 5 shows the health of every registered index, grouped by trust group, without opening any of them. Each row gives the kind (session or plain), when it last refreshed and whether that worked, whether it is stale (older than twice the refresh schedule's interval, or older than two days when no schedule is installed), whether the protection check passes for a protected group, and its exchange and corpus file counts. It shows statuses and numbers only: a failure is named by a category such as `build`, never by its error text, and nothing from a corpus, probe, tag or path is shown. The board only reads; it never refreshes or writes an index. An index that failed, is refused by the protection check or is stale also appears in an Indexes section on Needs you. `y` on an index row copies `fleetwatch search --index NAME "` to the clipboard, ready for a query. Without the `memory` extra the tab says to install `fleetwatch[memory]`.
+
+<p align="center">
+  <img src="docs/images/board-indexes.png" width="900" alt="The Indexes tab on the demo data, grouped by trust group. archive: release-history, a session index whose last refresh failed (build) 40 minutes ago, with 530 exchanges and 41 files. ferpa: advising-notes, a session index refreshed 20 minutes ago whose protection check is refused (settings), with 77 exchanges and 12 files. team: site-docs, a plain index refreshed 5 hours ago and marked stale, with 212 files; and storefront-sessions, refreshed 14 minutes ago, with 1842 exchanges and 96 files. The hint line offers y to copy a search command.">
+</p>
 
 ### Resume and park
 

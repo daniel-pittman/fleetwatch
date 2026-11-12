@@ -19,13 +19,17 @@ sys.path.insert(0, os.path.join(HERE, "..", ".."))
 from fleetwatch import app as fapp, data, demo  # noqa: E402
 
 # (file, (columns, rows), keys pressed after the first refresh). 120 columns is the hotkey window's
-# width. The full radar mark needs 32 rows; a shorter board shows a single glyph in its place.
+# width. The radar mark floats over the bottom right corner and needs 32 rows and 100 columns; a
+# shorter board hides it, so only the Needs you view shows it.
 VIEWS = (
     ("board-needs-you", (120, 32), "e"),
     ("board-todos", (120, 13), "2"),
     ("board-sessions", (120, 17), "3"),
     ("board-resume", (120, 14), "4 space"),
+    ("board-indexes", (120, 14), "5"),
 )
+# Views that also become a PNG in docs/images, for the README.
+PNGS = {"board-needs-you": "board", "board-indexes": "board-indexes"}
 
 
 async def shoot(paths, name, size, keys):
@@ -60,6 +64,10 @@ def main():
             subprocess.run(["gs", "-q", "-o", svg[:-4] + ".pdf", "-sDEVICE=pdfwrite", "-dNoOutputFonts", raw],
                            check=True)
             os.unlink(raw)
+            if name in PNGS:
+                png = os.path.join(HERE, "..", "images", PNGS[name] + ".png")
+                subprocess.run(["rsvg-convert", "-w", "2223", "-o", png, svg], check=True)
+                print("wrote", os.path.relpath(png))
             print("wrote", os.path.relpath(svg[:-4] + ".pdf"))
     finally:
         tmp.cleanup()

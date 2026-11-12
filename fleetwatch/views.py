@@ -7,18 +7,20 @@ from rich.text import Text
 from .config import OTHER
 from .data import (MARKERS_UTF8, LOCAL_TZ, ago, build_view, clean, date_label, day, dedup_key,
                    due_label, has_overdue, items_of, plural, short_name, task_label, timeline_rows)
+from .index_health import problem_rows
 from .resume import home_folder, left_off, short_folder, tags
 
 RED = "bold red"
 DIM = "dim"
-TAB_TITLES = ("Needs you", "Your to-dos", "Sessions", "Resume")
-SHORT_TITLES = ("Needs", "To-dos", "Sessions", "Resume")
-TINY_TITLES = ("Need", "Todo", "All", "Resume")   # the labels must still fit 60 columns
+TAB_TITLES = ("Needs you", "Your to-dos", "Sessions", "Resume", "Indexes")
+SHORT_TITLES = ("Needs", "To-dos", "Sessions", "Resume", "Indexes")
+TINY_TITLES = ("Need", "Todo", "All", "Resume", "Idx")   # the labels must still fit 60 columns
 EMPTY = ("Nothing waiting on you", "No to-dos for you", "No sessions found",
-         "No custom-named session is parked or stopped")
+         "No custom-named session is parked or stopped", "No indexes are registered")
 TODO_TAB = 1
 SESSIONS_TAB = 2
 RESUME_TAB = 3
+INDEXES_TAB = 4
 
 # Per tab: (id, label shown as "sorted by: <label>"). The first entry is the default.
 SORTS = (
@@ -27,6 +29,7 @@ SORTS = (
     (("date", "date"), ("overdue", "most overdue first"), ("session", "session")),
     (("recent", "last activity"), ("name", "name")),
     (("recent", "last active"), ("name", "name")),
+    (("name", "name"), ("problems", "problems first")),
 )
 
 
@@ -73,6 +76,7 @@ class Node:
     sort: tuple = ()                               # coarse rank that stabilise() keeps rows within
     hang: int = 0                                  # continuation lines of the head indent this much more
     resume: str = None                             # a Resume row: the sessionId it would bring back
+    index: str = None                              # an Indexes row: the index name
 
     @property
     def expandable(self):
@@ -125,10 +129,12 @@ def needs_nodes(view, now, sort="oldest"):
         head = [(x["name"], "bold")]
         if x["persona"]:
             head.append((" (%s)" % x["persona"], ""))
-        head.append(("   ", ""))
+        head.append(("  ", ""))
         bits = []
         if x.get("gone"):
             bits.append(("not running", DIM))
+        elif x["stuck"] is None:
+            bits.append(session_state(x))      # a stuck session says so below, with its age
         if x["stuck"] is not None:
             bits.append(("stuck on a prompt %s" % ago(x["stuck"]), RED))
         elif x["helper_stuck"]:
@@ -365,10 +371,9 @@ def resume_node(e, now):
         if e["note"]:
             t.append(": " + e["note"])
     line = left_off(e, now)
-    if line:
-        t.append("\n" + line, style=DIM)
-    body = [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown"))),
-            (Text("  "), Text("session " + e["sid"], style=DIM))]
+    body = [(Text("  "), Text(line, style=DIM))] if line else []
+    body += [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown"))),
+             (Text("  "), Text("session " + e["sid"], style=DIM))]
     if e["persona"]:
         body.append((Text("  "), Text("%s's scheduled loop does not come back with it" % e["persona"], style=DIM)))
     return Node("res:" + e["sid"], t, body, resume=e["sid"], hang=2)
@@ -397,13 +402,69 @@ def resume_nodes(entries, now, sort="recent", groups=None):
                   for g in order]
 
 
+def _age_text(seconds):
+    return ago(seconds) if seconds is not None else "never"
+
+
+def index_node(h, now):
+    """One index row: status and numbers, in words as well as color. Nothing from inside the index."""
+    problems = h.problems(now)
+    head = [(h.name, "bold"), ("  " + h.kind, DIM)]
+    if h.state == "never":
+        head += [(" · ", DIM), ("never refreshed", DIM)]
+    else:
+        word = "refreshed %s ago" % _age_text(h.age(now)) if h.state == "ok" else "refresh FAILED (%s) %s ago" % (
+            h.reason, _age_text(h.age(now)))
+        head += [(" · ", DIM), (word, RED if h.state == "failed" else "")]
+    if h.is_stale(now):
+        head += [(" · ", DIM), ("STALE", RED)]
+    if h.protection:
+        head += [(" · ", DIM), ("protection ok" if h.protection == "ok" else "protection REFUSED (%s)" % h.refusal,
+                              "" if h.protection == "ok" else RED)]
+    if h.exchanges is not None:
+        head += [(" · ", DIM), (plural(h.exchanges, "exchange"), DIM)]
+    if h.files is not None:
+        head += [(" · ", DIM), (plural(h.files, "file"), DIM)]
+    body = [(Text("  "), Text("group: %s" % h.group)),
+            (Text("  "), Text("refresh schedule: %s" % ("installed, stale after %s" % _age_text(h.stale_after)
+                                                         if h.scheduled else "not installed, stale after 2 d")))]
+    if problems:
+        body.insert(0, (Text("  "), Text("; ".join(problems), style=RED)))
+    return Node("idx:" + h.name, _row_text(head), body, session=None, index=h.name, hang=2)
+
+
+def index_nodes(rows, now, sort="name"):
+    """One folding section per trust group; with the problems-first sort, rows that need a look lead."""
+    def key(h):
+        return (not h.problems(now), h.name.casefold()) if sort == "problems" else (h.name.casefold(),)
+    out = []
+    for g in sorted({h.group for h in rows}, key=str.casefold):
+        kids = [index_node(h, now) for h in sorted((h for h in rows if h.group == g), key=key)]
+        out.append(_group_node(INDEXES_TAB, g, len(kids), kids))
+    return out
+
+
+def index_problem_group(rows, now):
+    """The Needs you section for indexes that failed, are refused or are stale; None when all are fine."""
+    bad = problem_rows(rows, now)
+    if not bad:
+        return None
+    kids = []
+    for h in bad:
+        t = Text(h.name, style="bold")
+        t.append("  " + "; ".join(h.problems(now)), style=RED)
+        kids.append(Node("needs-idx:" + h.name, t, index=h.name, hang=2))
+    head = _row_text([("Indexes", "bold"), (" · %d" % len(kids), DIM)])
+    return Node("needs-idx", head, children=kids, start_open=True, section=True)
+
+
 def tab_counts(view, stale):
     undated, dated, _other = todo_rows(view)
     return [len(view["for_you"]), len(undated) + len(dated),
             len(view["rows"]) + len(view["orphans"]) + len(stale)]
 
 
-def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0):
+def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), ready=0, indexes=()):
     """(node tree of each tab, Needs row order).
 
     Each tab is in its chosen sort order, optionally wrapped in group sections. `seen` is the
@@ -411,7 +472,11 @@ def build_tabs(view, stale, now, sorts=(None,) * 3, grouping=None, seen=(), read
     """
     s = [sort_id(i, sorts[i]) for i in range(3)]
     needs = stabilise(needs_nodes(view, now, s[0]), seen)
-    return [_grouped(0, needs, grouping),
+    needs_tab = list(_grouped(0, needs, grouping))
+    bad = index_problem_group(indexes, now)
+    if bad is not None:
+        needs_tab.append(bad)
+    return [needs_tab,
             todo_nodes(view, now, s[1], grouping),
             sessions_nodes(view, stale, now, s[2], grouping, ready)], [n.key for n in needs]
 

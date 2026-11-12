@@ -135,6 +135,23 @@ def build(root, now=None, parent_pid=None, helper_pid=None):
             "ps": "echo %d %d" % (helper_pid or 1, parent_pid), "archive": os.path.join(root, "archive")}
 
 
+def index_rows(now=None):
+    """Four synthetic indexes, one in each state the Indexes tab shows. Nothing here is read from disk."""
+    from .index_health import Health
+    now = time.time() if now is None else now
+    two_scheduled = 2 * 1800
+    return [
+        Health("storefront-sessions", "team", "session", "ok", finished=now - 14 * 60, stale_after=two_scheduled,
+               exchanges=1842, files=96, scheduled=True),
+        Health("site-docs", "team", "plain", "ok", finished=now - 5 * 3600, stale_after=two_scheduled,
+               files=212, scheduled=True),
+        Health("release-history", "archive", "session", "failed", "build", finished=now - 40 * 60,
+               stale_after=two_scheduled, exchanges=530, files=41, scheduled=True),
+        Health("advising-notes", "ferpa", "session", "ok", finished=now - 20 * 60, stale_after=two_scheduled,
+               protection="refused", refusal="settings", exchanges=77, files=12, scheduled=True),
+    ]
+
+
 def environ(root, paths):
     """The variables that keep every other fleetwatch module inside the demo folder."""
     return {"FLEETWATCH_CONFIG_DIR": os.path.join(root, "config"), "FLEETWATCH_PS_CMD": paths["ps"],
@@ -143,7 +160,8 @@ def environ(root, paths):
             "FLEETWATCH_AGENTS_CMD": paths["command"], "FLEETWATCH_SESSIONS_DIR": paths["sessions"],
             "FLEETWATCH_JOBS_DIR": paths["jobs"], "FLEETWATCH_STATUS_DIR": paths["status"],
             "FLEETWATCH_PROJECTS_DIR": paths["projects"], "FLEETWATCH_ARCHIVE_DIR": paths["archive"],
-            "FLEETWATCH_DISPLAY_HOME": os.path.join(root, HOME), "FLEETWATCH_NO_MIGRATE": "1"}
+            "FLEETWATCH_DISPLAY_HOME": os.path.join(root, HOME), "FLEETWATCH_NO_MIGRATE": "1",
+            "FLEETWATCH_DEMO": "1"}
 
 
 def prepare():

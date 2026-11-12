@@ -9,7 +9,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
@@ -17,12 +17,14 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, iterm, park, prune, radar, resume, views
+from . import config, data, find, index_health, iterm, park, prune, radar, resume, views
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
-# Below this size the radar shrinks to one glyph beside the header.
-RADAR_MIN_ROWS, RADAR_MIN_COLS = 32, 70
+# Below this size the radar is hidden: it floats over the bottom-right corner of the lists, so it only
+# appears where the rows to its left are not crowded.
+RADAR_MIN_ROWS, RADAR_MIN_COLS = 32, 100
+RADAR_BOTTOM_GAP = 2      # the hint line and the tab bar sit below it
 TAB_OPEN_RESCAN_SECONDS = 15.0
 # A window just opened takes a few seconds to show up as a live session. Until it can, this is what
 # stops a second press from putting two processes on one transcript.
@@ -34,7 +36,7 @@ OPEN, SHUT = "▾", "▸"
 HELP_LINES = [
     "fleetwatch keys",
     "",
-    "  1 to 4, Tab, Shift-Tab    switch tabs (or click one)",
+    "  1 to 5, Tab, Shift-Tab    switch tabs (or click one)",
     "  up/down, j/k              move the cursor; PgUp/PgDn and the wheel scroll",
     "  Enter, g                  jump to the row's session in iTerm2 (helpers: their own",
     "                            tab, else the parent's); on a section header, fold it;",
@@ -43,7 +45,9 @@ HELP_LINES = [
     "  /, Ctrl-K                 find a session by part of its name or persona, Enter jumps",
     "  Space                     open or close the row (▸ closed, ▾ open)",
     "  right arrow, left arrow   open, close",
+    "  z                         fold all: open every row and group in this tab, or close them all",
     "  e / c                     open all / close all rows in this tab",
+    "  y                         on the Indexes tab (5): copy a search command for the highlighted index",
     "  s                         change the sort order of this tab (remembered)",
     "  G                         group every tab by project folder, or ungroup",
     "  m                         move the highlighted session to another group",
@@ -52,6 +56,8 @@ HELP_LINES = [
     "  r                         refresh now",
     "  ?                         show or hide this help",
     "  q, Ctrl-C                 quit",
+    "",
+    "The Indexes tab (5) shows each index's health: status and counts only, never what is in it.",
     "",
     "On the Resume tab (4):",
     "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
@@ -65,14 +71,17 @@ HELP_LINES = [
 ]
 
 
-HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("s", "sort"), ("G", "groups"), ("m", "move"),
+HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("z", "fold all"), ("s", "sort"), ("G", "groups"), ("m", "move"),
          ("r", "refresh"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 CORE_HINTS = ("⏎", "␣", "?", "q")
-DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s")     # least important first
+DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s", "z")     # least important first
 RESUME_HINTS = [("⏎", "resume here"), ("o", "new window"), ("/", "find"), ("p", "park"), ("u", "unpark"),
-                ("␣", "details"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
+                ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 HOTKEY_RESUME_HINTS = [("⏎", "new window")] + RESUME_HINTS[2:]
-RESUME_DROP = ("⌃⇧F", "s", "␣", "u", "p")
+RESUME_DROP = ("⌃⇧F", "s", "z", "␣", "u", "p")
+INDEX_HINTS = [("y", "copy search"), ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"),
+               ("q", "quit"), ("⌃⇧F", "hide")]
+INDEX_DROP = ("⌃⇧F", "s", "z", "␣")
 
 
 def footer_text(width, show_move, hints=HINTS, drop_order=DROP_ORDER):
@@ -92,8 +101,9 @@ class Snapshot:
     """One collection: the view, counts, header, groups and the data the jump needs."""
 
     def __init__(self, sections, stale, now, warnings, horizon, jump=None, groups=None, cfg_warning=None,
-                 prune_plan=None, held=None):
+                 prune_plan=None, held=None, indexes=None):
         self.now = now
+        self.indexes = indexes if indexes is not None else index_health.Result()
         self.held = held or {}
         self.prune_plan = prune_plan or prune.Plan({}, now, config.default_prune())
         self.stale = stale
@@ -156,7 +166,7 @@ def gather(paths, window_s, horizon):
     warnings += [prune_warning] if prune_warning else []
     plan = prune.make_plan(paths, now, records, settings)
     return Snapshot(sections, stale, now, warnings, horizon, iterm.jump_context(), groups, cfg_warning, plan,
-                    resume.held_map(records))
+                    resume.held_map(records), index_health.load())
 
 
 class FoldList(ScrollView, can_focus=True):
@@ -337,6 +347,12 @@ class FoldList(ScrollView, can_focus=True):
         self._reveal()
         if self.on_fold:
             self.on_fold()
+
+    def toggle_all(self):
+        """Open everything, or close everything once nothing is left closed."""
+        def closed(nodes):
+            return any((n.expandable and not self.is_open(n)) or closed(n.children) for n in nodes)
+        self.set_all(closed(self.nodes))
 
     def toggle(self):
         node = self._by_key.get(self.cursor)
@@ -766,12 +782,9 @@ class SessionPicker(ModalScreen):
 class FleetwatchApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS = """
-    Screen { layout: vertical; }
+    Screen { layout: vertical; layers: base over; }
     #head { height: 2; }
-    #head.tall { height: 5; }
-    #headtext { width: 1fr; height: auto; }
-    #radar { width: 2; height: 1; }
-    #head.tall #radar { width: 9; height: 5; margin: 0 1 0 0; }
+    #radar { layer: over; width: 9; height: 5; }
     #top { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #status { height: 1; padding: 0 1; }
     ContentSwitcher { height: 1fr; }
@@ -785,6 +798,8 @@ class FleetwatchApp(App):
         Binding("2", "tab(1)", "To-dos", show=False),
         Binding("3", "tab(2)", "Sessions", show=False),
         Binding("4", "tab(3)", "Resume", show=False),
+        Binding("5", "tab(4)", "Indexes", show=False),
+        Binding("y", "copy_search", show=False),
         Binding("tab", "next_tab(1)", "Next tab", show=False, priority=True),
         Binding("shift+tab", "next_tab(-1)", "Previous tab", show=False, priority=True),
         Binding("up,k", "move(-1)", show=False),
@@ -799,6 +814,7 @@ class FleetwatchApp(App):
         Binding("space", "toggle", show=False),
         Binding("right,l", "open", show=False),
         Binding("left,h", "close", show=False),
+        Binding("z", "fold_all", show=False),
         Binding("e", "all(True)", show=False),
         Binding("c", "all(False)", show=False),
         Binding("s", "sort", show=False),
@@ -844,11 +860,10 @@ class FleetwatchApp(App):
         self._cfg_warned = None
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="head"):
-            with Vertical(id="headtext"):
-                yield Static(Text("fleetwatch · loading…", no_wrap=True), id="top")
-                yield Static("", id="status")
-            yield Static("", id="radar")
+        with Vertical(id="head"):
+            yield Static(Text("fleetwatch · loading…", no_wrap=True), id="top")
+            yield Static("", id="status")
+        yield Static("", id="radar")
         with ContentSwitcher(initial="pane0"):
             for i, empty in enumerate(views.EMPTY):
                 with Vertical(id="pane%d" % i, classes="pane"):
@@ -863,14 +878,17 @@ class FleetwatchApp(App):
         self.show_radar()
 
     def show_radar(self):
-        """The radar mark in the header's corner; one glyph on a short terminal, ASCII off UTF-8."""
-        tall = self.size.height >= RADAR_MIN_ROWS and self.size.width >= RADAR_MIN_COLS
-        self.query_one("#head").set_class(tall, "tall")
-        alert = bool(self.snapshot and self.snapshot.counts[0])
-        if tall:
-            cells = radar.mark(alert, self.refreshes, self.utf8)
-        else:
-            cells = [[radar.glyph(alert, self.utf8)]]
+        """The radar mark, floating over the bottom-right corner above the hint line and the tab bar.
+
+        It is decorative and takes no layout space; a terminal too small for it hides it. ASCII off UTF-8."""
+        box = self.query_one("#radar", Static)
+        fits = self.size.height >= RADAR_MIN_ROWS and self.size.width >= RADAR_MIN_COLS
+        box.display = fits
+        if not fits:
+            return
+        box.styles.offset = (self.size.width - radar.COLS - 1, self.size.height - radar.ROWS - RADAR_BOTTOM_GAP)
+        alert = bool(self.snapshot and self.tab_counts()[0])
+        cells = radar.mark(alert, self.refreshes, self.utf8)
         text = Text(no_wrap=True)
         for i, line in enumerate(cells):
             text.append("\n" if i else "")
@@ -881,7 +899,9 @@ class FleetwatchApp(App):
     def update_footer(self, width=None):
         node = self.lists[self.active].current() if getattr(self, "lists", None) else None
         width = (width or self.size.width or 80) - 2
-        if self.active == views.RESUME_TAB:
+        if self.active == views.INDEXES_TAB:
+            text = footer_text(width, False, INDEX_HINTS, INDEX_DROP)
+        elif self.active == views.RESUME_TAB:
             text = footer_text(width, False, HOTKEY_RESUME_HINTS if resume.in_hotkey_window() else RESUME_HINTS,
                                RESUME_DROP)
         else:
@@ -973,14 +993,19 @@ class FleetwatchApp(App):
             return
         tabs, self.needs_seen = views.build_tabs(
             snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
-            self.needs_seen, len(snap.prune_plan.candidates))
+            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows)
         for lst, nodes in zip(self.lists, tabs):
             lst.set_nodes(nodes)
+        index_list = self.lists[views.INDEXES_TAB]
+        index_list.empty = snap.indexes.note or views.EMPTY[views.INDEXES_TAB]
+        index_list.set_nodes(views.index_nodes(snap.indexes.rows, snap.now, self.sorts[views.INDEXES_TAB]))
         self.rebuild_resume()
 
     def tab_counts(self):
         counts = list(self.snapshot.counts) if self.snapshot else [0] * views.RESUME_TAB
-        return counts + [len(self.resume_rows)]
+        if self.snapshot:
+            counts[0] += len(index_health.problem_rows(self.snapshot.indexes.rows, self.snapshot.now))
+        return counts + [len(self.resume_rows), len(self.snapshot.indexes.rows) if self.snapshot else 0]
 
     def rebuild_resume(self):
         """Lay out the Resume tab from the latest scan and who holds what right now."""
@@ -1038,7 +1063,7 @@ class FleetwatchApp(App):
         for i in range(len(views.TAB_TITLES)):
             t = Text("sorted by: %s" % views.sort_label(i, self.sorts[i]), no_wrap=True, overflow="ellipsis")
             t.append("  (s changes)", style="dim")
-            if self.grouped:
+            if self.grouped and i != views.INDEXES_TAB:
                 t.append("  ·  grouped by project folder (G ungroups, m moves a session)", style="dim")
             self.sortline_plain.append(t.plain)
             self.query_one("#sort%d" % i, Static).update(t)
@@ -1114,6 +1139,18 @@ class FleetwatchApp(App):
 
     def action_toggle(self):
         self.current.toggle()
+
+    def action_copy_search(self):
+        """On an Indexes row: put `fleetwatch search --index NAME "` on the clipboard, open for the query."""
+        node = self.current.current() if self.active == views.INDEXES_TAB else None
+        if node is None or not node.index:
+            self.say("y copies a search command for the highlighted row on the Indexes tab (5)")
+            return
+        self.copy_to_clipboard('fleetwatch search --index %s "' % node.index)
+        self.say("copied the search command for %s" % node.index)
+
+    def action_fold_all(self):
+        self.current.toggle_all()
 
     def action_all(self, value):
         self.current.set_all(value)
@@ -1280,7 +1317,7 @@ class FleetwatchApp(App):
 
     def action_enter(self):
         node = self.current.current()
-        if node is not None and node.section:
+        if node is not None and (node.section or node.index):
             self.current.toggle()
         elif node is not None and node.resume:
             self.start_resume(node.resume, True)

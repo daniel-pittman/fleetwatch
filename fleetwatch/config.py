@@ -9,7 +9,7 @@ from .settings import config_dir
 from .data import clean, parse_window
 
 OTHER = "Other"
-SORT_TABS = ("0", "1", "2", "3")
+SORT_TABS = ("0", "1", "2", "3", "4")
 STATE_VERSION = 2
 # Tab index in a version-1 state file (five tabs) to its index now; the old to-dos tab (2) is gone.
 _OLD_TAB = {"0": "0", "1": "1", "3": "2", "4": "3"}

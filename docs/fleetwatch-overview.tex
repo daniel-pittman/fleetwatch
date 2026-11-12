@@ -118,23 +118,28 @@ numbered questions and items, and Enter jumps to that session's terminal tab.
 
 \begin{figure}[htbp]
   \centering
-  \shot[0 300 0 0]{The Needs you tab of the
+  \shot{The Needs you tab of the
     demo board. The header reads: 4 questions, 1 stuck, 1 overdue, 1 due today, 3 working,
-    1 quiet. Four sessions are open. Billing API, persona Robin, is stuck on a prompt for 7
+    1 quiet. Four sessions are open, each with its state. Billing API, persona Robin, is stuck on a prompt for 7
     minutes and has two questions, one from its helper. Release Notes has an overdue item in
     red: send the 2.4 release notes to the partner list. Checkout Flow has two questions, the
-    oldest waiting 3 hours. Newsletter has an item due today. A small radar mark sits in the
-    top right corner with one amber blip.}{board-needs-you}
-  \caption{Needs you, with every row open. The radar mark in the top right corner keeps its
+    oldest waiting 3 hours. Newsletter has an item due today. Below them an Indexes section lists three indexes
+    that need a look: site-docs is stale, release-history failed its last refresh, and
+    advising-notes was refused by the protection check. A small radar mark floats over the
+    bottom right corner with one amber blip.}{board-needs-you}
+  \caption{Needs you, with every row open. The radar mark in the bottom right corner keeps its
     one blip amber while anything here needs me.}
   \label{fig:board-needs-you}
 \end{figure}
 
-The header counts what needs me, and the radar mark in the top right corner turns its one
-blip amber while anything does. It is the first thing I look at. On a short terminal the
-mark shrinks to a single coloured dot.
+The header counts what needs me, and the radar mark floating over the bottom right corner
+turns its one blip amber while anything does. It is decoration: everything it signals is
+also written out. On a terminal under 32 rows or 100 columns it is hidden. Each row also
+says whether its session is working, idle or gone quiet, as on the Sessions tab. A last
+section, \emph{Indexes}, appears when a memory index failed its last refresh, failed its
+protection check or went stale.
 
-Three more tabs sit beside it (Figure~\ref{fig:board-sessions}). \emph{Your to-dos} puts my
+Four more tabs sit beside it (Figure~\ref{fig:board-sessions}). \emph{Your to-dos} puts my
 own items from every session in one list: undated items first, since they need a date, then
 dated ones, overdue first. Everything else a session mentions, such as milestones, meetings
 and its own internal work, folds into one closed \emph{Also noted} section. \emph{Sessions}
@@ -182,6 +187,25 @@ by part of its name.
     lists the keys: Enter resume here, o new window, / find, p park, u unpark.}{board-resume}
   \caption{Resume, with one parked session open to its folder and session ID.}
   \label{fig:board-resume}
+\end{figure}
+
+The last tab, \emph{Indexes} (Figure~\ref{fig:board-indexes}), is a health check on the
+session memory, grouped by trust group. Each index shows when it last refreshed and
+whether that worked, whether it is stale, whether the protection check passes for a
+protected group, and its counts of exchanges and files. It never shows what is inside an
+index, and it never refreshes one. \cmd{y} copies a search command for the highlighted
+index.
+
+\begin{figure}[htbp]
+  \centering
+  \shot{The Indexes tab of the demo board, grouped by trust group. archive: release-history,
+    a session index whose last refresh failed (build) 40 minutes ago, 530 exchanges, 41
+    files. ferpa: advising-notes, refreshed 20 minutes ago, protection refused (settings),
+    77 exchanges, 12 files. team: site-docs, a plain index refreshed 5 hours ago and marked
+    stale, 212 files; storefront-sessions, refreshed 14 minutes ago, 1842 exchanges, 96
+    files. The hint line offers y to copy a search command.}{board-indexes}
+  \caption{Indexes: status and counts only.}
+  \label{fig:board-indexes}
 \end{figure}
 
 Two more keys get a lot of use. \cmd{/} (or Ctrl-K) finds any live session by part of its
@@ -327,8 +351,8 @@ libraries and start quickly.
     each session, which writes one small status file with fleetwatch write-status; Claude
     Code, which provides the session registry, claude agents --json and the transcripts; and
     reference folders of Markdown, PDF and Office files. The status file and the registry
-    feed layer 1, the board, a Textual app with the tabs Needs you, Your to-dos, Sessions and
-    Resume, which feeds you through the hotkey overlay, where Enter jumps to a session's
+    feed layer 1, the board, a Textual app with the tabs Needs you, Your to-dos, Sessions,
+    Resume and Indexes, which feeds you through the hotkey overlay, where Enter jumps to a session's
     iTerm2 tab. Transcripts and reference folders feed layer 2, session memory, which parses,
     scrubs, tags and refreshes, and keeps the registry and trust groups. It sends scrubbed
     text to an optional tagger, a small Claude model, and passes a scrubbed corpus to layer

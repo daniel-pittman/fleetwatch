@@ -160,13 +160,13 @@ class AppTests(unittest.TestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 self.assertEqual(app.active, 0)
-                for key, want in (("2", 1), ("3", 2), ("4", 3), ("1", 0)):
+                for key, want in (("2", 1), ("3", 2), ("4", 3), ("5", 4), ("1", 0)):
                     await pilot.press(key)
                     self.assertEqual(app.active, want)
                 await pilot.press("tab")
                 self.assertEqual(app.active, 1)
                 await pilot.press("shift+tab", "shift+tab")
-                self.assertEqual(app.active, 3)
+                self.assertEqual(app.active, 4)
                 await pilot.press("tab")
                 self.assertEqual(app.active, 0)
                 tabs = app.query_one(fapp.TabBar)
@@ -196,7 +196,7 @@ class AppTests(unittest.TestCase):
                 await boot(app, pilot)
                 plain = app.query_one(fapp.TabBar).plain
                 self.assertLessEqual(len(plain), 58)
-                for i in "1234":
+                for i in "12345":
                     self.assertIn(i + " ", plain)
         run(go())
 

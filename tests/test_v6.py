@@ -289,7 +289,7 @@ class SortTests(Env):
             app2 = self.app()
             async with app2.run_test(size=(100, 30)) as pilot:
                 await boot(app2, pilot)
-                self.assertEqual(app2.sorts, ["count", "session", "name", "recent"])
+                self.assertEqual(app2.sorts, ["count", "session", "name", "recent", "name"])
                 self.assertIn("sorted by: session", app2.sortline_plain[1])
                 self.assertEqual(self.order(app2, 0, "needs:")[:2], ["Stuck Session", "Beta"])
         run(go())
@@ -301,7 +301,7 @@ class SortTests(Env):
             app = self.app()
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
-                self.assertEqual(app.sorts, ["oldest", "date", "recent", "recent"])
+                self.assertEqual(app.sorts, ["oldest", "date", "recent", "recent", "name"])
         run(go())
 
 
@@ -470,7 +470,7 @@ class GroupTests(Env):
                 async with app.run_test(size=(100, 30)) as pilot:
                     await boot(app, pilot)
                     self.assertIn("state.json is not valid", app.status_text, text)
-                    self.assertEqual(app.sorts, ["oldest", "date", "recent", "recent"])
+                    self.assertEqual(app.sorts, ["oldest", "date", "recent", "recent", "name"])
                     self.assertFalse(app.grouped)
                     await pilot.press("s")
                     with open(self.state) as fh:

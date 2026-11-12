@@ -1122,7 +1122,7 @@ class AppTests(AppWorld):
             async with app.run_test(size=(80, 24)) as pilot:
                 await boot(app, pilot)
                 bar = app.query_one(fapp.TabBar)
-                bar.update_tabs([14, 22, 39, 20], 0)
+                bar.update_tabs([14, 22, 39, 20, 4], 0)
                 self.assertIn("3 Sessions", bar.plain)
                 self.assertLessEqual(len(bar.plain), 78)
         asyncio.run(go())
@@ -1308,14 +1308,17 @@ class LeftOffTests(Tree):
         notes = resume.notes_for(e, self.NOW)
         self.assertEqual(notes[0], "It was parked: waiting on award.")
         self.assertTrue(notes[1].startswith("Where it left off: was: doing x"))
-        plain = views.resume_node(e, self.NOW).head.plain
-        self.assertLess(plain.index("waiting on award"), plain.index("was: doing x"))
+        node = views.resume_node(e, self.NOW)
+        self.assertIn("waiting on award", node.head.plain)
+        self.assertNotIn("was: doing x", node.head.plain)
+        self.assertEqual(node.body[0][1].plain.split(" · ")[0], "was: doing x")
 
     def test_unparked_row_shows_the_line_under_the_name(self):
         s, _ = self.transcript("Plain")
         self.status("q.json", session="Plain", sessionId=s, working_on="doing y")
-        plain = views.resume_node(self.one("Plain"), self.NOW).head.plain
-        self.assertEqual(plain.split("\n")[1].split(" · ")[0], "was: doing y")
+        node = views.resume_node(self.one("Plain"), self.NOW)
+        self.assertNotIn("was:", node.head.plain)
+        self.assertEqual(node.body[0][1].plain.split(" · ")[0], "was: doing y")
 
     def test_control_characters_are_cleaned(self):
         s, _ = self.transcript("Dirty")
