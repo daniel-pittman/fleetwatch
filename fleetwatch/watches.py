@@ -650,11 +650,9 @@ class BoardRow:
     checked: float = None
 
 
-def board_rows(now=None):
-    """The Watches section's rows from the state files: one per session and repo with something flagged, one
-    per watch in error, and one per session whose watches have not run for an hour. Reads only."""
-    now = time.time() if now is None else now
-    rows = []
+def _read_states(now):
+    """(sid, owner, owner state, checked, stale text or None, {repo: [watch state]}) per state file with
+    watches, from the stored fields that pass their shape checks. Reads only."""
     for path in sorted(glob.glob(os.path.join(glob.escape(state_dir()), "*.json"))):
         try:
             doc = data.load_json(path)
@@ -667,27 +665,68 @@ def board_rows(now=None):
         owner = data.clean(doc.get("session") or sid).strip()[:80]
         who = doc.get("owner_state") if doc.get("owner_state") in ("stopped", "quiet", "parked", "active") else "stopped"
         checked = data.to_epoch(doc.get("checked"))
+        stale = None
         if checked is None or now - checked > STALE_RUN_S:
             age = "yet" if checked is None else "for %s" % data.human(now - checked)
-            rows.append(BoardRow("watch-stale:" + sid, sid, owner, who, error="not checked %s; is the schedule "
-                                 "running? see fleetwatch watch schedule status" % age, checked=checked))
+            stale = "not checked %s; is the schedule running? see fleetwatch watch schedule status" % age
         by_repo = {}
         for ws in wmap.values():
-            if not isinstance(ws, dict) or ws.get("kind") not in KINDS or not valid_repo(ws.get("repo")):
-                continue
-            by_repo.setdefault(ws["repo"], []).append(ws)
-        for repo in sorted(by_repo, key=str.casefold):
-            flags = [f for ws in by_repo[repo] for f in _safe_flags(ws)]
-            if flags:
-                rows.append(BoardRow("watch:%s:%s" % (sid, repo), sid, owner, who, repo, summary(flags),
+            if isinstance(ws, dict) and ws.get("kind") in KINDS and valid_repo(ws.get("repo")):
+                by_repo.setdefault(ws["repo"], []).append(ws)
+        yield sid, owner, who, checked, stale, {r: by_repo[r] for r in sorted(by_repo, key=str.casefold)}
+
+
+def _error_of(ws):
+    err = ws.get("error")
+    if not err:
+        return None
+    return err if isinstance(err, str) and ERROR_TEXT.fullmatch(err) else "lookup failed"
+
+
+def board_rows(now=None):
+    """The Watches section's rows from the state files: one per session and repo with something flagged, one
+    per watch in error, and one per session whose watches have not run for an hour. Reads only."""
+    now = time.time() if now is None else now
+    rows = []
+    for sid, owner, who, checked, stale, by_repo in _read_states(now):
+        if stale:
+            rows.append(BoardRow("watch-stale:" + sid, sid, owner, who, error=stale, checked=checked))
+        for repo, states in by_repo.items():
+            flagged = [f for ws in states for f in _safe_flags(ws)]
+            if flagged:
+                rows.append(BoardRow("watch:%s:%s" % (sid, repo), sid, owner, who, repo, summary(flagged),
                                      checked=checked))
-            for ws in sorted(by_repo[repo], key=lambda w: w["kind"]):
-                err = ws.get("error")
-                if err:
-                    shown = err if isinstance(err, str) and ERROR_TEXT.fullmatch(err) else "lookup failed"
+            for ws in sorted(states, key=lambda w: w["kind"]):
+                if _error_of(ws):
                     rows.append(BoardRow("watch-err:%s:%s:%s" % (sid, repo, ws["kind"]), sid, owner, who, repo,
-                                         error=shown, kind=ws["kind"], checked=checked))
+                                         error=_error_of(ws), kind=ws["kind"], checked=checked))
     return rows
+
+
+def flags(paths=None, now=None):
+    """(key, owner name, text) for the desktop notifier: one per owner, repo and kind of flag, one per watch
+    in error, one per session whose watches have stalled. The key holds the session id, repo, kind and the
+    numbers, so a new number is a new key and an unchanged flag keeps its key. The text is counts and
+    numbers only. paths is accepted for the notifier's interface; the state folder comes from settings."""
+    now = time.time() if now is None else now
+    out = []
+    for sid, owner, _who, _checked, stale, by_repo in _read_states(now):
+        if stale:
+            out.append(("watch-stale:%s" % sid, owner, "watch error: " + stale))
+        for repo, states in by_repo.items():
+            short = repo.split("/", 1)[1]
+            flagged = [f for ws in states for f in _safe_flags(ws)]
+            for what in WHAT:
+                mine = [f for f in flagged if f["what"] == what]
+                if mine:
+                    refs = sorted({_ref_text(f["ref"]) for f in mine})
+                    out.append(("watch:%s:%s:%s:%s" % (sid, repo, what, ",".join(refs)), owner,
+                                "%s: %s" % (short, summary(mine)[0])))
+            for ws in sorted(states, key=lambda w: w["kind"]):
+                if _error_of(ws):
+                    out.append(("watch-err:%s:%s:%s" % (sid, repo, ws["kind"]), owner,
+                                "%s: watch error: %s" % (short, _error_of(ws))))
+    return out
 
 
 def print_report(sid, out, now=None):

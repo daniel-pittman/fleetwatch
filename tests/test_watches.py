@@ -684,7 +684,8 @@ class CanaryTests(unittest.TestCase):
         report = io.StringIO()
         watches.print_report(SID, report, NOW + 900)
         text = board_text(watches.board_rows(NOW + 900))
-        for where, blob in (("state", state), ("report", report.getvalue()), ("board", text)):
+        notes = repr(watches.flags(w.paths, NOW + 900))
+        for where, blob in (("state", state), ("report", report.getvalue()), ("board", text), ("notifier", notes)):
             self.assertNotIn(CANARY, blob, where)
             self.assertNotIn("outsider", blob, where)
             self.assertNotIn("teammate", blob, where)
@@ -794,6 +795,49 @@ class BoardRowTests(unittest.TestCase):
         text = board_text(watches.board_rows(NOW + 2 * 3600))
         self.assertIn("watch error: not checked for 2 h", text)
         self.assertIn("fleetwatch watch schedule status", text)
+
+
+class NotifierTests(unittest.TestCase):
+    """watches.flags(paths, now): (key, owner name, text) tuples for the desktop notifier."""
+
+    def setUp(self):
+        self.w = World(self)
+
+    def test_no_watch_state_is_an_empty_list(self):
+        self.assertEqual(watches.flags(self.w.paths, NOW), [])
+
+    def test_one_tuple_per_owner_repo_and_flag_type_with_counts_and_numbers(self):
+        self.w.session(watch_list=[{"kind": "external_activity", "repo": REPO},
+                                   {"kind": "pr_checks_failed", "repo": REPO}])
+        r = external_routes(issues=[issue(12, "outsider", 600), issue(15, "outsider", 300)])
+        r.update(checks_routes([pull(7, SHA_A)], {SHA_A: runs("failure")}))
+        self.w.routes(r)
+        self.w.run()
+        got = watches.flags(self.w.paths, NOW)
+        self.assertEqual([(n, t) for _k, n, t in got], [("Marlow", "widget: 2 external issues (#12, #15)"),
+                                                        ("Marlow", "widget: 1 failed check (#7)")])
+        keys = [k for k, _n, _t in got]
+        self.assertEqual(len(set(keys)), 2)
+        self.assertTrue(all(SID in k and REPO in k for k in keys))
+        self.assertEqual(keys, [k for k, _n, _t in watches.flags(self.w.paths, NOW + 60)])   # stable
+        # a new number is a new key, so the notifier tells you again
+        r[API + "/issues"] = [issue(12, "outsider", 600), issue(15, "outsider", 300), issue(16, "outsider", -60)]
+        self.w.routes(r)
+        self.w.run(now=NOW + 900)
+        later = [k for k, _n, _t in watches.flags(self.w.paths, NOW + 900)]
+        self.assertNotEqual(later[0], keys[0])
+        self.assertEqual(later[1], keys[1])
+        watches.ack(SID, None, None)
+        self.assertEqual(watches.flags(self.w.paths, NOW + 900), [])
+
+    def test_errors_and_a_stalled_run_are_tuples_too(self):
+        self.w.session()
+        self.w.routes({API + "/issues": {"__status__": 403}})
+        self.w.run()
+        self.assertEqual([t for _k, _n, t in watches.flags(self.w.paths, NOW)],
+                         ["widget: watch error: lookup failed (HTTP 403)"])
+        self.assertIn("watch error: not checked for 2 h",
+                      " ".join(t for _k, _n, t in watches.flags(self.w.paths, NOW + 2 * 3600)))
 
 
 class BoardCase(unittest.TestCase):
