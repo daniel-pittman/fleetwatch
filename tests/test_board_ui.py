@@ -149,7 +149,7 @@ class BoardTests(unittest.TestCase):
         self.assertIn("waiting on the new price list from finance", closed)     # the parked note stays in view
         self.assertEqual(one.count("was:"), 1)
         self.assertEqual(back, closed)
-        self.assertEqual(everything.count("was:"), 2)
+        self.assertEqual(everything.count("was:"), 3)
 
 
 if __name__ == "__main__":

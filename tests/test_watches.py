@@ -967,9 +967,10 @@ class PruneTests(unittest.TestCase):
         w = World(self)
         quiet = 30 * DAY
         w.session("Watcher", SID, updated_ago=quiet, watch_list=[{"kind": "pr_stale", "repo": REPO}])
-        w.session("Done", OTHER_SID, updated_ago=quiet, watch_list=[])
+        # A generated name: prune considers only unnamed sessions by default.
+        w.session("wt-done", OTHER_SID, updated_ago=quiet, watch_list=[])
         plan = prune.make_plan(w.paths, NOW, [], config.default_prune())
-        self.assertEqual([c["name"] for c in plan.candidates], ["Done"])
+        self.assertEqual([c["name"] for c in plan.candidates], ["wt-done"])
         self.assertEqual(plan.left["watches"], 1)
         self.assertIn("1 with watches", prune.listing(plan, "7 d"))
 

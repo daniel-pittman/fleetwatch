@@ -92,6 +92,18 @@ class PruneModalTests(unittest.TestCase):
         self.w.status("openq.json", session="Old Asker", sessionId="oa1", updated=standin.iso(-9 * 86400),
                       questions=["Still open?"])
         self.old = os.path.join(self.w.paths["status"], "old.json")
+        for sid in ("od1", "oa1"):
+            self.transcript(sid)
+
+    def transcript(self, sid, title=None):
+        folder = os.path.join(self.w.paths["projects"], "-some-project")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, sid + ".jsonl")
+        with open(path, "w") as fh:
+            fh.write("{}\n")
+            if title:
+                fh.write(json.dumps({"type": "custom-title", "customTitle": title}, separators=(",", ":")) + "\n")
+        os.utime(path, (standin.NOW - 9 * 86400, standin.NOW - 9 * 86400))
 
     def tearDown(self):
         self.w.close()
@@ -100,6 +112,78 @@ class PruneModalTests(unittest.TestCase):
         app = fapp.FleetwatchApp(self.w.snapshot, interval=3600)
         app.prune_clock = lambda: standin.NOW
         return app
+
+    def add_named_and_unknown(self):
+        self.w.status("named.json", session="Pricing Page", sessionId="nm1", updated=standin.iso(-9 * 86400))
+        self.transcript("nm1", "Pricing Page")
+        self.w.status("lost.json", session="Lost Name", sessionId="ls1", updated=standin.iso(-9 * 86400))
+
+    def dialog_text(self, app):
+        return "\n".join(str(w.render()) for w in app.screen.query("Static"))
+
+    def test_the_dialog_lists_only_unnamed_sessions_and_keeps_the_others_apart(self):
+        self.add_named_and_unknown()
+
+        async def go():
+            app = self.app()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await boot(app, pilot)
+                await pilot.press("P")
+                await pilot.pause(0.2)
+                text = self.dialog_text(app)
+                self.assertIn("1 ready · unnamed sessions only", text)
+                self.assertLess(text.index("Old Done"), text.index("Kept: named session (1)"))
+                self.assertIn("Kept: could not tell if named (1)", text)
+                self.assertIn("n include named sessions", text)
+                self.assertLess(text.index("Kept: named session"), text.index("Pricing Page"))
+        run(go())
+
+    def test_n_includes_named_sessions_and_y_prunes_them_but_never_the_unknown(self):
+        self.add_named_and_unknown()
+
+        async def go():
+            app = self.app()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await boot(app, pilot)
+                await pilot.press("P")
+                await pilot.pause(0.2)
+                await pilot.press("n")
+                await pilot.pause(0.2)
+                text = self.dialog_text(app)
+                self.assertIn("2 ready · named sessions included", text)
+                self.assertNotIn("Kept: named session", text)
+                self.assertIn("n leave out named sessions", text)
+                self.assertIn("named session, not live", text)
+                await pilot.press("n")
+                await pilot.pause(0.2)
+                self.assertIn("1 ready · unnamed sessions only", self.dialog_text(app))
+                await pilot.press("n", "y")
+                status = self.w.paths["status"]
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if not os.path.exists(os.path.join(status, "named.json")):
+                        break
+                self.assertFalse(os.path.exists(os.path.join(status, "named.json")))
+                self.assertFalse(os.path.exists(self.old))
+                self.assertTrue(os.path.exists(os.path.join(status, "lost.json")))
+        run(go())
+
+    def test_the_default_y_leaves_a_named_session_alone(self):
+        self.add_named_and_unknown()
+
+        async def go():
+            app = self.app()
+            async with app.run_test(size=(120, 40)) as pilot:
+                await boot(app, pilot)
+                await pilot.press("P")
+                await pilot.pause(0.2)
+                await pilot.press("y")
+                for _ in range(100):
+                    await pilot.pause(0.05)
+                    if not os.path.exists(self.old):
+                        break
+                self.assertTrue(os.path.exists(os.path.join(self.w.paths["status"], "named.json")))
+        run(go())
 
     def test_p_lists_candidates_and_escape_cancels(self):
         async def go():
@@ -257,10 +341,11 @@ class AppTests(unittest.TestCase):
 
     def test_todos_tab_orders_undated_then_dated_then_also_noted(self):
         async def go():
-            app = self.app()
+            app = fapp.FleetwatchApp(self.w.snapshot, interval=3600,
+                                     state_path=os.path.join(self.w.tmp.name, "state.json"))
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
-                await pilot.press("2")
+                await pilot.press("2", "G", "G")           # the flat list: time, folder, then no groups
                 lst = app.current
                 text = lst.visible_text()
                 for w in ("Email the registrar", "Write the ITS ticket", "Overdue thing",

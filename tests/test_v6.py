@@ -255,6 +255,7 @@ class SortTests(Env):
             app = self.app()
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
+                await pilot.press("2", "G", "G")       # the flat list: time, folder, then no groups
                 for mode, order in want.items():
                     await self.cycle(app, pilot, 1, mode)
                     self.assertEqual(whats(app), order, mode)
@@ -318,7 +319,7 @@ class GroupTests(Env):
             app = self.app()
             async with app.run_test(size=(100, 40)) as pilot:
                 await boot(app, pilot)
-                for i in range(4):
+                for i in (0, 2, 3):
                     self.assertNotIn("grp:", " ".join(app.lists[i]._order))
                 await pilot.press("G")
                 self.assertTrue(app.grouped)
@@ -333,10 +334,11 @@ class GroupTests(Env):
                 self.assertLess(text.index("▾ Personal"), text.index("▾ Other"))
                 self.assertIn("▸ Stale · 1", text)            # helpers and stale records stay ungrouped
                 await pilot.press("2")
-                self.assertIn("grp:1:Other", app.current._order)
-                await pilot.press("G")
+                self.assertNotIn("grp:1:Other", app.current._order)     # To-dos has its own G (by day)
+                self.assertIn("grp:1:t:overdue", app.current._order)
+                await pilot.press("1", "G")
                 self.assertFalse(app.grouped)
-                for i in range(4):
+                for i in (0, 2, 3):
                     self.assertNotIn("grp:", " ".join(app.lists[i]._order))
             with open(self.state) as fh:
                 self.assertFalse(json.load(fh)["groups"])
@@ -605,7 +607,8 @@ class OverrideEditTests(unittest.TestCase):
     def test_state_round_trip_and_atomic_save(self):
         path = os.path.join(self.tmp.name, "state.json")
         self.assertEqual(config.load_state(path), (config.default_state(), None))
-        state = {"version": 2, "sort": {"0": "name"}, "groups": True, "folds": {"grp:0:A": False}}
+        state = {"version": 2, "sort": {"0": "name"}, "groups": True, "folds": {"grp:0:A": False},
+                 "todo_group": "folder"}
         self.assertTrue(config.save_state(state, path))
         self.assertEqual(config.load_state(path), (state, None))
         self.assertEqual(sorted(os.listdir(self.tmp.name)), ["state.json"])

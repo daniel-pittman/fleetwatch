@@ -81,7 +81,7 @@ class FindAppTests(unittest.TestCase):
                     await pilot.pause(0.1)
                     self.assertNotIsInstance(app.screen, fapp.FindScreen)
                 await pilot.press("3")
-                await pilot.press("slash")
+                await pilot.press("ctrl+k")
                 await pilot.pause(0.1)
                 self.assertIsInstance(app.screen, fapp.FindScreen)
         asyncio.run(go())
@@ -91,7 +91,7 @@ class FindAppTests(unittest.TestCase):
             app = fapp.FleetwatchApp(self.w.snapshot, interval=3600)
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
-                await pilot.press("slash")
+                await pilot.press("ctrl+k")
                 await pilot.pause(0.1)
                 for ch in "robin":
                     await pilot.press(ch)
@@ -114,7 +114,7 @@ class FindAppTests(unittest.TestCase):
             app = fapp.FleetwatchApp(self.w.snapshot, interval=3600)
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
-                await pilot.press("slash")
+                await pilot.press("ctrl+k")
                 await pilot.pause(0.1)
                 for ch in "piper":
                     await pilot.press(ch)
@@ -132,7 +132,7 @@ class FindAppTests(unittest.TestCase):
             app = fapp.FleetwatchApp(self.w.snapshot, interval=3600)
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
-                await pilot.press("slash")
+                await pilot.press("ctrl+k")
                 await pilot.pause(0.1)
                 shown = [e["name"] for e in app.screen.shown]
                 self.assertGreater(len(shown), 1)

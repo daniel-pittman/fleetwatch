@@ -14,6 +14,7 @@ from . import data
 
 STUCK_SID = "d3a00001-0000-4000-8000-000000000001"
 RESUME_SIDS = ("d3a00002-0000-4000-8000-000000000002", "d3a00003-0000-4000-8000-000000000003")
+PRUNE_SIDS = tuple("d3a0000%d-0000-4000-8000-00000000000%d" % (i, i) for i in (4, 5, 6, 7))
 # The demo never starts a real session: Enter on a Resume row runs this in place of `claude`.
 RESUME_COMMAND = "echo demo, nothing resumed:"
 # The sessions' folders live under this folder of the temp root, which the board shows as ~, so the
@@ -85,23 +86,58 @@ def build(root, now=None, parent_pid=None, helper_pid=None):
     put("checkout.json", session="Checkout Flow", persona="Sage", updated=stamp(35 * 60),
         questions=[{"q": "Ship the new address form behind a flag or straight to everyone?", "since": stamp(3 * 3600)},
                    "Is it fine to drop support for the old payment sheet this release?"],
-        upcoming=[{"what": "Checkout load test", "due": day(4), "kind": "milestone"}])
+        upcoming=[{"what": "Checkout load test", "due": day(4), "kind": "milestone"},
+                  {"what": "Answer the pilot customer's pricing question", "due": day(1), "kind": "todo", "yours": True},
+                  {"what": "Sign off the load test plan", "due": day(4), "kind": "deadline", "yours": True},
+                  {"what": "Walk the pilot customer through checkout", "due": day(4) + "T14:00:00", "kind": "meeting",
+                   "yours": True}])
     put("search.json", session="Search Tuning", persona="Rowan", updated=stamp(2 * 60),
         working_on="comparing ranking models on the replay set",
-        upcoming=[{"what": "Index rebuild", "due": day(2), "kind": "deploy"}])
+        upcoming=[{"what": "Index rebuild", "due": day(2), "kind": "deploy"},
+                  {"what": "Approve the index rebuild window", "due": day(2), "kind": "deploy", "yours": True},
+                  {"what": "Review the ranking replay results", "due": day(2), "kind": "todo", "yours": True},
+                  {"what": "Search quality review", "due": day(5) + "T10:30:00", "kind": "meeting", "yours": True}])
     put("inventory.json", session="Inventory Sync", updated=stamp(95 * 60), cadence_min=30,
         working_on="waiting on the nightly import",
-        upcoming=[{"what": "Review supplier feed changes", "due": day(9), "kind": "deadline", "yours": True}])
+        upcoming=[{"what": "Review supplier feed changes", "due": day(9), "kind": "deadline", "yours": True},
+                  {"what": "Renew the supplier API key", "due": day(7), "kind": "todo", "yours": True},
+                  {"what": "Quarterly vendor review", "due": day(13), "kind": "meeting", "yours": True},
+                  {"what": "Plan next quarter's catalog import", "due": day(38), "kind": "milestone", "yours": True}])
     put("docs.json", session="Docs Site", persona="Piper", updated=stamp(4 * 60),
         working_on="rewriting the quick start",
-        upcoming=[{"what": "Docs freeze", "due": day(6), "kind": "milestone"}])
+        upcoming=[{"what": "Docs freeze", "due": day(6), "kind": "milestone"},
+                  {"what": "Review the quick start rewrite", "due": day(3), "kind": "todo", "yours": True},
+                  {"what": "Publish the quick start", "due": day(6), "kind": "deploy", "yours": True}])
     put("notes.json", session="Release Notes", persona="Piper", updated=stamp(50 * 60),
         upcoming=[{"what": "Send the 2.4 release notes to the partner list", "due": day(-3),
                    "kind": "deadline", "yours": True}])
     put("newsletter.json", session="Newsletter", updated=stamp(20 * 60),
         upcoming=[{"what": "Approve the autumn newsletter draft", "due": day(0), "kind": "deadline", "yours": True},
-                  {"what": "Team sync", "due": day(1), "kind": "meeting"}])
+                  {"what": "Team sync", "due": day(1), "kind": "meeting"},
+                  {"what": "Plan the autumn newsletter", "due": day(1), "kind": "meeting", "yours": True},
+                  {"what": "Send the autumn newsletter", "due": day(3), "kind": "deploy", "yours": True}])
     put("lint.json", session="wt-billing-lint", updated=stamp(60), questions=["Lint rule needs a decision"])
+    # Finished sessions' status files, quiet for days with nothing open, for the prune list: two unnamed (a
+    # transcript with no title, a generated name with no transcript), one the user named, and one whose
+    # transcript is gone so that fleetwatch cannot tell.
+    for fname, name, sid, title, folder, days in (
+            ("nightly-import.json", "Nightly Import Check", PRUNE_SIDS[0], None, "storefront/inventory", 4),
+            ("wt-cart-spike.json", "wt-cart-spike", PRUNE_SIDS[1], False, "storefront/checkout", 6),
+            ("holiday-banner.json", "Holiday Banner", PRUNE_SIDS[2], "Holiday Banner", "site/notes", 5),
+            ("old-spike.json", "Old Spike", PRUNE_SIDS[3], False, "storefront/search", 9)):
+        put(fname, session=name, sessionId=sid, updated=stamp(days * 86400), working_on="finished")
+        if title is not False:
+            cwd = os.path.join(home, "code", folder)
+            path = os.path.join(projects, "-demo-" + folder.replace("/", "-"), sid + ".jsonl")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "user", "cwd": cwd, "entrypoint": "cli", "sessionId": sid},
+                                    separators=(",", ":")) + "\n")
+                if title:
+                    fh.write(json.dumps({"type": "custom-title", "customTitle": title, "sessionId": sid},
+                                        separators=(",", ":")) + "\n")
+            t = now - days * 86400
+            os.utime(path, (t, t))
     for sid, title, folder, hours in ((RESUME_SIDS[0], "Pricing Page", "storefront/pricing", 20),
                                       (RESUME_SIDS[1], "Status Page", "site/status", 52)):
         cwd = os.path.join(home, "code", folder)
