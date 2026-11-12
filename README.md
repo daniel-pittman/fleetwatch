@@ -53,7 +53,8 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 
 1. **Look.** `fleetwatch --demo`.
 2. **Install the overlay** (macOS, iTerm2): `fleetwatch iterm install`, then Control-Shift-F.
-3. **Required: teach every session to report.** The board sees that a session is running on its own, but it learns what a session is working on, what it is asking you and what it needs you to do only from the status the session writes. So this instruction has to reach every session: put it in your global `~/.claude/CLAUDE.md`, which every Claude Code session reads at startup.
+3. **Name the sessions you want to keep.** fleetwatch keys a session on its name: its status file, its group, its index and the Resume tab all follow the name you give it. Name a session when you start it (`claude -n "Billing API"`) or later from inside it (`/rename Billing API`). A session you never name is treated as ephemeral: it still shows on the board while it runs, but Resume never lists it, so once it ends fleetwatch cannot bring it back.
+4. **Required: teach every session to report.** The board sees that a session is running on its own, but it learns what a session is working on, what it is asking you and what it needs you to do only from the status the session writes. So this instruction has to reach every session: put it in your global `~/.claude/CLAUDE.md`, which every Claude Code session reads at startup.
 
    ```markdown
    ## fleetwatch: report your status (every session)
@@ -90,9 +91,9 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 
    `write-status` finds the session it runs under, stamps the name, id and time, and refuses a malformed item with a message that tells the session how to fix it, so sessions learn the format on their first try. The full format is under How sessions report.
 
-4. **Run the board.** `fleetwatch` in any terminal, or Control-Shift-F.
-5. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. A session can opt itself in, with no setup by hand: ask it to "give yourself a fleetwatch index in the work group", and it runs `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). `index add` finds the session it runs under and registers that session's own transcripts. From then on, the session searches its own memory with `fleetwatch search "what did we decide about retries"`. The recommended paragraph in the step 3 block makes every new session ask you this once, so no session is indexed without your yes.
-6. **Keep the indexes fresh.** `fleetwatch index schedule install`, then run the `launchctl` (or `systemctl`) command it prints.
+5. **Run the board.** `fleetwatch` in any terminal, or Control-Shift-F.
+6. **Optional: give a session a memory** (needs the extras). Session memory is opt-in, one session at a time. Leave it off for a private session: a session with no index still shows on the board, and nothing from its transcript is stored. A session can opt itself in, with no setup by hand: ask it to "give yourself a fleetwatch index in the work group", and it runs `fleetwatch index add --group work`, then `fleetwatch index refresh` (the first one downloads the models, see Install). `index add` finds the session it runs under and registers that session's own transcripts. From then on, the session searches its own memory with `fleetwatch search "what did we decide about retries"`. The recommended paragraph in the step 4 block makes every new session ask you this once, so no session is indexed without your yes.
+7. **Keep the indexes fresh.** `fleetwatch index schedule install`, then run the `launchctl` (or `systemctl`) command it prints.
 
 ## The three layers
 
