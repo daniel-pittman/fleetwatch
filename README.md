@@ -34,7 +34,7 @@ Press Control-Shift-F from anywhere and the board floats over whatever you are d
 
 **Try it without any sessions.** `fleetwatch --demo` runs the live board on a fictional fleet: seven sessions in two groups, with a stuck permission prompt, questions, an overdue and a due-today item, a helper, and two sessions to resume, one of them parked. It reads and writes only a temporary folder, never your own files, and Enter on a Resume row resumes nothing. `fleetwatch --demo --once` prints a plain snapshot.
 
-A short illustrated overview: [docs/fleetwatch-overview.pdf](docs/fleetwatch-overview.pdf).
+How the pieces fit together, what the scrubber keeps and how trust groups work: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Install
 
