@@ -33,7 +33,12 @@ memory = [
 ]
 
 [tool.setuptools]
-packages = ["fleetwatch", "fleetwatch.search", "fleetwatch.memory"]
+# fleetwatch.memory.data holds data files only; the scanner reads its surname list at run
+# time to tell all-capital surnames from acronyms.
+packages = ["fleetwatch", "fleetwatch.search", "fleetwatch.memory", "fleetwatch.memory.data"]
+
+[tool.setuptools.package-data]
+"fleetwatch.memory.data" = ["*.gz", "README.md"]
 
 [tool.ruff]
 target-version = "py311"
