@@ -148,7 +148,18 @@ class ClaudeWorkflowTests(unittest.TestCase):
         for kind in ("issues/$PR/comments", "pulls/$PR/reviews", "pulls/$PR/comments"):
             self.assertIn(f'"{kind}"', run)
         self.assertIn("gh api --paginate", run)
-        self.assertIn('IN("OWNER", "MEMBER", "COLLABORATOR")', run)
+
+    def test_trusted_comment_authors_have_write_access(self):
+        # author_association MEMBER and COLLABORATOR also cover an
+        # organization's read-only and triage users; only the collaborators
+        # API says whether a login can write.
+        review = step_by_id(review_job(), "context")["run"]
+        bot = step_by_id(load("claude.yml")["jobs"]["claude"], "trusted")["run"]
+        for name, run in (("review context", review), ("bot trusted", bot)):
+            self.assertIn('"repos/$REPO/collaborators/$login/permission"', run, name)
+            self.assertIn("admin|maintain|write)", run, name)
+            self.assertNotIn('"MEMBER"', run, name)
+            self.assertNotIn('"COLLABORATOR"', run, name)
 
     def test_bot_reads_only_filtered_comments(self):
         (step,) = list(action_steps("claude.yml"))
@@ -175,6 +186,19 @@ class ClaudeWorkflowTests(unittest.TestCase):
         # mode, which posts no review for the extractor to read.
         for name in ("claude-code-review.yml", "claude.yml"):
             self.assertNotIn("workflow_dispatch", triggers(load(name)), name)
+
+    def test_no_dispatch_code_is_left(self):
+        # The trigger is gone, so every expression and branch that served it
+        # is dead; the one comment that says why there is no dispatch stays.
+        why = "  # No workflow_dispatch trigger."
+        for name in ("claude-code-review.yml", "claude.yml"):
+            with open(os.path.join(WF, name)) as fh:
+                text = fh.read()
+            self.assertNotIn("inputs.", text, name)
+            self.assertEqual(text.count("workflow_dispatch"), text.count(why), name)
+            self.assertNotIn('-z "${SHA:-}"', text, name)
+            self.assertNotIn('-n "${HEAD_SHA:-}"', text, name)
+        self.assertIs(review_step()["with"]["track_progress"], True)
 
     def test_context_step_refuses_a_fork_pr(self):
         run = step_by_id(review_job(), "context")["run"]
@@ -208,9 +232,32 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertNotIn("always()", cond)
 
     def test_only_the_workflow_bot_posts_the_scan_and_test_results(self):
+        # The prompt names the headings of this workflow's own sticky
+        # comments, whatever a repository calls its scan or CI job.
+        doc = load("claude-code-review.yml")
+        posted = {str(s["env"]["MARKER"]).removeprefix("### ")
+                  for name, job in doc["jobs"].items() if name != "review-gate"
+                  for s in job.get("steps", []) if "MARKER" in (s.get("env") or {})}
+        self.assertTrue(posted)
         prompt = " ".join(review_step()["with"]["prompt"].split())
-        self.assertRegex(prompt, r'Only github-actions\[bot\]\'s comments under the "Semgrep \(OSS\)" and '
-                                 r'"CI Tests" headings')
+        m = re.search(r"Only github-actions\[bot\]'s comments under the (.*?) headings? are ", prompt)
+        self.assertTrue(m, prompt)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', m.group(1))), posted)
+
+    @unittest.skipUnless(shutil.which("shellcheck"), "needs shellcheck")
+    def test_run_scripts_pass_shellcheck(self):
+        # The same check actionlint runs: expressions become placeholders of
+        # the same length, and the rules it leaves out stay out.
+        for name in ("claude-code-review.yml", "claude.yml"):
+            for job_id, job in load(name)["jobs"].items():
+                for step in job.get("steps", []):
+                    if "run" not in step:
+                        continue
+                    script = re.sub(r"\$\{\{.*?\}\}", lambda m: "_" * len(m.group(0)), step["run"])
+                    r = subprocess.run(["shellcheck", "--norc", "--shell=bash", "-f", "gcc",
+                                        "-e", "SC1091,SC2194,SC2050,SC2154,SC2157", "-"],
+                                       input=script, capture_output=True, text=True)
+                    self.assertEqual(r.stdout, "", (name, job_id, step.get("name")))
 
 
 FAKE_GH = textwrap.dedent("""\
@@ -224,9 +271,23 @@ FAKE_GH = textwrap.dedent("""\
       "api --paginate repos/o/r/"*)
         [ "${FAKE_GH_FAIL:-}" = api ] && exit 1
         cat "$FIXTURES/$(echo "${3#repos/o/r/}" | tr / _).json" ;;
+      "api repos/o/r/collaborators/"*"/permission --jq .permission")
+        login=${2#repos/o/r/collaborators/}; login=${login%/permission}
+        echo "$login" >> "$FIXTURES/permission-calls.txt"
+        perm=$(jq -r --arg l "$login" '.[$l] // empty' "$FIXTURES/permissions.json")
+        [ -n "$perm" ] || { echo "gh: $login is not a user (HTTP 404)" >&2; exit 1; }
+        echo "$perm" ;;
       *) echo "unexpected gh call: $*" >&2; exit 2 ;;
     esac
 """)
+
+# What the collaborators API answers for each login. A login missing here
+# makes the stand-in fail the lookup, as the API does for a deleted account.
+# The API's `permission` field is admin, write, read or none (maintain reads
+# as write, triage as read); the extra values check that only the three
+# write roles pass whichever spelling comes back.
+PERMISSIONS = {"maint": "admin", "pal": "write", "colab": "maintain", "mallory": "read",
+               "helper": "read", "claude": "none", "reader": "read", "triager": "triage"}
 
 
 def user(login, kind="User"):
@@ -253,6 +314,13 @@ ISSUE_PAGES = [
          "created_at": "2026-01-01T00:00:06Z"},
         {"user": user("helper"), "author_association": "CONTRIBUTOR", "body": "CONTRIBUTOR-TEXT",
          "created_at": "2026-01-01T00:00:07Z"},
+        # An organization member with read access only.
+        {"user": user("reader"), "author_association": "MEMBER", "body": "READONLY-MEMBER",
+         "created_at": "2026-01-01T00:00:07Z"},
+        {"user": user("gone"), "author_association": "MEMBER", "body": "LOOKUP-FAILED",
+         "created_at": "2026-01-01T00:00:07Z"},
+        {"user": user("maint"), "author_association": "OWNER", "body": "Owner again",
+         "created_at": "2026-01-01T00:00:07Z"},
     ],
 ]
 REVIEWS = [
@@ -266,7 +334,25 @@ REVIEW_COMMENTS = [
      "line": 1, "body": "OUTSIDER-INLINE", "created_at": "2026-01-01T00:00:10Z"},
     {"user": user("colab"), "author_association": "COLLABORATOR", "path": "src/a.py", "line": 3,
      "body": "Collaborator inline", "created_at": "2026-01-01T00:00:11Z"},
+    # An outside collaborator with the triage role.
+    {"user": user("triager"), "author_association": "COLLABORATOR", "path": "src/a.py", "line": 4,
+     "body": "TRIAGE-COLLABORATOR", "created_at": "2026-01-01T00:00:12Z"},
 ]
+COMMENT_FIXTURES = {"issues_7_comments.json": "\n".join(json.dumps(p) for p in ISSUE_PAGES),
+                    "pulls_7_reviews.json": json.dumps(REVIEWS),
+                    "pulls_7_comments.json": json.dumps(REVIEW_COMMENTS),
+                    "permissions.json": json.dumps(PERMISSIONS)}
+
+
+def write_fixtures(fixtures):
+    for name, text in COMMENT_FIXTURES.items():
+        with open(os.path.join(fixtures, name), "w") as fh:
+            fh.write(text)
+
+
+def permission_calls(fixtures):
+    path = os.path.join(fixtures, "permission-calls.txt")
+    return open(path).read().split() if os.path.exists(path) else []
 
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "needs bash and jq")
@@ -282,12 +368,8 @@ class ReviewContextStepTests(unittest.TestCase):
         with open(gh, "w") as fh:
             fh.write(FAKE_GH)
         os.chmod(gh, 0o755)
-        with open(os.path.join(fixtures, "issues_7_comments.json"), "w") as fh:
-            fh.write("\n".join(json.dumps(p) for p in ISSUE_PAGES))
-        with open(os.path.join(fixtures, "pulls_7_reviews.json"), "w") as fh:
-            json.dump(REVIEWS, fh)
-        with open(os.path.join(fixtures, "pulls_7_comments.json"), "w") as fh:
-            json.dump(REVIEW_COMMENTS, fh)
+        write_fixtures(fixtures)
+        self.fixtures = fixtures
         ctx = os.path.join(tmp, "work", "r", "pr-context")
         os.makedirs(ctx)
         with open(os.path.join(ctx, "planted.md"), "w") as fh:
@@ -317,10 +399,16 @@ class ReviewContextStepTests(unittest.TestCase):
         for kept in ("Owner note", "### CI Tests passed", "## Code review earlier", "Member approves",
                      "Collaborator inline", "on src/a.py line 3", "review APPROVED"):
             self.assertIn(kept, comments)
-        for dropped in ("OUTSIDER-", "IMPOSTOR-CLAUDE", "OTHER-BOT", "CONTRIBUTOR-TEXT", "--jq"):
+        for dropped in ("OUTSIDER-", "IMPOSTOR-CLAUDE", "OTHER-BOT", "CONTRIBUTOR-TEXT", "--jq",
+                        "READONLY-MEMBER", "TRIAGE-COLLABORATOR", "LOOKUP-FAILED"):
             self.assertNotIn(dropped, comments)
+        self.assertIn("Owner again", comments)
         self.assertEqual(outputs["actors"].split(","),
                          sorted(["claude[bot]", "colab", "github-actions[bot]", "maint", "pal"]))
+        # One lookup per human login, none for a bot.
+        calls = permission_calls(self.fixtures)
+        self.assertEqual(sorted(calls), sorted(set(calls)))
+        self.assertEqual(set(calls), set(PERMISSIONS) | {"gone"})
         with open(os.path.join(ctx, "pr.json")) as fh:
             self.assertEqual(json.load(fh)["headRefOid"], "abc")
 
@@ -330,10 +418,12 @@ class ReviewContextStepTests(unittest.TestCase):
         self.assertIn("moved from def to abc", r.stdout + r.stderr)
         self.assertEqual(outputs, {})
 
-    def test_a_dispatch_run_has_no_head_to_check(self):
+    def test_an_empty_head_sha_fails_the_step(self):
+        # Every run is a pull_request run, so the head is always known; an
+        # empty one is an error, never a reason to skip the check.
         r, outputs, _ = self.run_step(HEAD_SHA="")
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("actors", outputs)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(outputs, {})
 
     def test_a_failed_fetch_fails_the_step_and_sets_no_outputs(self):
         r, outputs, _ = self.run_step(FAKE_GH_FAIL="api")
@@ -347,6 +437,67 @@ class ReviewContextStepTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0, cross)
             self.assertIn("comes from a fork", r.stdout + r.stderr)
             self.assertEqual(outputs, {}, cross)
+
+
+BOT_GH = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    # gh api <path> --paginate --jq <filter>: the filter runs on each page.
+    set -eu
+    [ "$1" = api ] || { echo "unexpected gh call: $*" >&2; exit 2; }
+    path=$2; shift 2; filter=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --jq) filter=$2; shift 2 ;; --paginate) shift ;; *) echo "unexpected: $1" >&2; exit 2 ;; esac
+    done
+    case "$path" in
+      repos/o/r/collaborators/*/permission)
+        login=${path#repos/o/r/collaborators/}; login=${login%/permission}
+        echo "$login" >> "$FIXTURES/permission-calls.txt"
+        perm=$(jq -r --arg l "$login" '.[$l] // empty' "$FIXTURES/permissions.json")
+        [ -n "$perm" ] || { echo "gh: $login is not a user (HTTP 404)" >&2; exit 1; }
+        printf '{"permission":"%s"}\\n' "$perm" | jq -r "$filter" ;;
+      repos/o/r/*) jq -r "$filter" "$FIXTURES/$(echo "${path#repos/o/r/}" | tr / _).json" ;;
+      *) echo "unexpected path: $path" >&2; exit 2 ;;
+    esac
+""")
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "needs bash and jq")
+class BotTrustedAuthorsStepTests(unittest.TestCase):
+    """The bot's trusted-author list, run against a stand-in gh."""
+
+    def test_lists_only_authors_with_write_access(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        bindir, fixtures = os.path.join(tmp, "bin"), os.path.join(tmp, "fixtures")
+        runner_temp = os.path.join(tmp, "temp")
+        for d in (bindir, fixtures, runner_temp):
+            os.makedirs(d)
+        gh = os.path.join(bindir, "gh")
+        with open(gh, "w") as fh:
+            fh.write(BOT_GH)
+        os.chmod(gh, 0o755)
+        write_fixtures(fixtures)
+        event = os.path.join(tmp, "event.json")
+        with open(event, "w") as fh:
+            json.dump({"issue": {"number": 7, "pull_request": {"url": "u"}}}, fh)
+        script = os.path.join(tmp, "step.sh")
+        with open(script, "w") as fh:
+            fh.write(step_by_id(load("claude.yml")["jobs"]["claude"], "trusted")["run"])
+        out = os.path.join(tmp, "github_output")
+        open(out, "w").close()
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], FIXTURES=fixtures,
+                   RUNNER_TEMP=runner_temp, GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=event,
+                   REPO="o/r", GH_TOKEN="unused")
+        r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script],
+                           env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(out) as fh:
+            outputs = dict(line.split("=", 1) for line in fh.read().splitlines())
+        self.assertEqual(outputs["actors"].split(","),
+                         sorted(["claude[bot]", "colab", "github-actions[bot]", "maint", "pal"]))
+        calls = permission_calls(fixtures)
+        self.assertEqual(sorted(calls), sorted(set(calls)))
+        self.assertEqual(set(calls), set(PERMISSIONS) | {"gone"})
 
 
 GATE_GH = textwrap.dedent("""\
