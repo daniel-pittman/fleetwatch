@@ -9,7 +9,7 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.geometry import Size
 from textual.screen import ModalScreen
 from textual.scroll_view import ScrollView
@@ -21,8 +21,10 @@ from . import config, data, find, iterm, park, prune, radar, resume, views
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
-# Below this size the radar shrinks to one glyph beside the header.
-RADAR_MIN_ROWS, RADAR_MIN_COLS = 32, 70
+# Below this size the radar is hidden: it floats over the bottom-right corner of the lists, so it only
+# appears where the rows to its left are not crowded.
+RADAR_MIN_ROWS, RADAR_MIN_COLS = 32, 100
+RADAR_BOTTOM_GAP = 2      # the hint line and the tab bar sit below it
 TAB_OPEN_RESCAN_SECONDS = 15.0
 # A window just opened takes a few seconds to show up as a live session. Until it can, this is what
 # stops a second press from putting two processes on one transcript.
@@ -43,6 +45,7 @@ HELP_LINES = [
     "  /, Ctrl-K                 find a session by part of its name or persona, Enter jumps",
     "  Space                     open or close the row (▸ closed, ▾ open)",
     "  right arrow, left arrow   open, close",
+    "  z                         fold all: open every row and group in this tab, or close them all",
     "  e / c                     open all / close all rows in this tab",
     "  s                         change the sort order of this tab (remembered)",
     "  G                         group every tab by project folder, or ungroup",
@@ -65,14 +68,14 @@ HELP_LINES = [
 ]
 
 
-HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("s", "sort"), ("G", "groups"), ("m", "move"),
+HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("z", "fold all"), ("s", "sort"), ("G", "groups"), ("m", "move"),
          ("r", "refresh"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 CORE_HINTS = ("⏎", "␣", "?", "q")
-DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s")     # least important first
+DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s", "z")     # least important first
 RESUME_HINTS = [("⏎", "resume here"), ("o", "new window"), ("/", "find"), ("p", "park"), ("u", "unpark"),
-                ("␣", "details"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
+                ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 HOTKEY_RESUME_HINTS = [("⏎", "new window")] + RESUME_HINTS[2:]
-RESUME_DROP = ("⌃⇧F", "s", "␣", "u", "p")
+RESUME_DROP = ("⌃⇧F", "s", "z", "␣", "u", "p")
 
 
 def footer_text(width, show_move, hints=HINTS, drop_order=DROP_ORDER):
@@ -337,6 +340,12 @@ class FoldList(ScrollView, can_focus=True):
         self._reveal()
         if self.on_fold:
             self.on_fold()
+
+    def toggle_all(self):
+        """Open everything, or close everything once nothing is left closed."""
+        def closed(nodes):
+            return any((n.expandable and not self.is_open(n)) or closed(n.children) for n in nodes)
+        self.set_all(closed(self.nodes))
 
     def toggle(self):
         node = self._by_key.get(self.cursor)
@@ -766,12 +775,9 @@ class SessionPicker(ModalScreen):
 class FleetwatchApp(App):
     ENABLE_COMMAND_PALETTE = False
     CSS = """
-    Screen { layout: vertical; }
+    Screen { layout: vertical; layers: base over; }
     #head { height: 2; }
-    #head.tall { height: 5; }
-    #headtext { width: 1fr; height: auto; }
-    #radar { width: 2; height: 1; }
-    #head.tall #radar { width: 9; height: 5; margin: 0 1 0 0; }
+    #radar { layer: over; width: 9; height: 5; }
     #top { height: 1; padding: 0 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #status { height: 1; padding: 0 1; }
     ContentSwitcher { height: 1fr; }
@@ -799,6 +805,7 @@ class FleetwatchApp(App):
         Binding("space", "toggle", show=False),
         Binding("right,l", "open", show=False),
         Binding("left,h", "close", show=False),
+        Binding("z", "fold_all", show=False),
         Binding("e", "all(True)", show=False),
         Binding("c", "all(False)", show=False),
         Binding("s", "sort", show=False),
@@ -844,11 +851,10 @@ class FleetwatchApp(App):
         self._cfg_warned = None
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="head"):
-            with Vertical(id="headtext"):
-                yield Static(Text("fleetwatch · loading…", no_wrap=True), id="top")
-                yield Static("", id="status")
-            yield Static("", id="radar")
+        with Vertical(id="head"):
+            yield Static(Text("fleetwatch · loading…", no_wrap=True), id="top")
+            yield Static("", id="status")
+        yield Static("", id="radar")
         with ContentSwitcher(initial="pane0"):
             for i, empty in enumerate(views.EMPTY):
                 with Vertical(id="pane%d" % i, classes="pane"):
@@ -863,14 +869,17 @@ class FleetwatchApp(App):
         self.show_radar()
 
     def show_radar(self):
-        """The radar mark in the header's corner; one glyph on a short terminal, ASCII off UTF-8."""
-        tall = self.size.height >= RADAR_MIN_ROWS and self.size.width >= RADAR_MIN_COLS
-        self.query_one("#head").set_class(tall, "tall")
+        """The radar mark, floating over the bottom-right corner above the hint line and the tab bar.
+
+        It is decorative and takes no layout space; a terminal too small for it hides it. ASCII off UTF-8."""
+        box = self.query_one("#radar", Static)
+        fits = self.size.height >= RADAR_MIN_ROWS and self.size.width >= RADAR_MIN_COLS
+        box.display = fits
+        if not fits:
+            return
+        box.styles.offset = (self.size.width - radar.COLS - 1, self.size.height - radar.ROWS - RADAR_BOTTOM_GAP)
         alert = bool(self.snapshot and self.snapshot.counts[0])
-        if tall:
-            cells = radar.mark(alert, self.refreshes, self.utf8)
-        else:
-            cells = [[radar.glyph(alert, self.utf8)]]
+        cells = radar.mark(alert, self.refreshes, self.utf8)
         text = Text(no_wrap=True)
         for i, line in enumerate(cells):
             text.append("\n" if i else "")
@@ -1114,6 +1123,9 @@ class FleetwatchApp(App):
 
     def action_toggle(self):
         self.current.toggle()
+
+    def action_fold_all(self):
+        self.current.toggle_all()
 
     def action_all(self, value):
         self.current.set_all(value)

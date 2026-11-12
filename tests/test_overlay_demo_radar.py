@@ -110,8 +110,8 @@ class DemoTests(unittest.TestCase):
         self.assertIn("~/code/storefront/pricing", heads[0])
         self.assertIn("~/code/site/status", heads[1])
         self.assertIn("waiting on the new price list from finance", heads[0])
-        self.assertIn("was: moving the status page to the new host", heads[1])
         shown = "\n".join(heads + [t.plain for n in nodes for _, t in n.body])
+        self.assertIn("was: moving the status page to the new host", shown)
         self.assertNotIn(self.tmp.name, shown)
         self.assertNotIn(os.path.realpath(self.tmp.name), shown)
         self.assertTrue(all(e["folder_ok"] for e in entries), "the demo folders exist, so resume is offered")
@@ -256,9 +256,14 @@ class RadarInAppTests(unittest.TestCase):
         self.assertEqual([x.rstrip() for x in text.split("\n")], radar.plain(radar.rows(True, step)).split("\n"))
         self.assertTrue(any("245,185,80" in sp for sp in spans), spans)
 
-    def test_short_terminal_shows_one_glyph(self):
-        text, _, _ = self.screen((100, 30))
-        self.assertEqual(text, "◉")
+    def test_short_terminal_hides_the_mark(self):
+        async def go():
+            app = fapp.FleetwatchApp(lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
+                                     3600, paths=self.paths)
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause(1.5)
+                return app.query_one("#radar").display
+        self.assertFalse(asyncio.run(go()))
 
 
 class DemoPtyTests(unittest.TestCase):

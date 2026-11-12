@@ -125,10 +125,12 @@ def needs_nodes(view, now, sort="oldest"):
         head = [(x["name"], "bold")]
         if x["persona"]:
             head.append((" (%s)" % x["persona"], ""))
-        head.append(("   ", ""))
+        head.append(("  ", ""))
         bits = []
         if x.get("gone"):
             bits.append(("not running", DIM))
+        elif x["stuck"] is None:
+            bits.append(session_state(x))      # a stuck session says so below, with its age
         if x["stuck"] is not None:
             bits.append(("stuck on a prompt %s" % ago(x["stuck"]), RED))
         elif x["helper_stuck"]:
@@ -365,10 +367,9 @@ def resume_node(e, now):
         if e["note"]:
             t.append(": " + e["note"])
     line = left_off(e, now)
-    if line:
-        t.append("\n" + line, style=DIM)
-    body = [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown"))),
-            (Text("  "), Text("session " + e["sid"], style=DIM))]
+    body = [(Text("  "), Text(line, style=DIM))] if line else []
+    body += [(Text("  "), Text(clean(home_folder(e["cwd"]) if e["cwd"] else "folder unknown"))),
+             (Text("  "), Text("session " + e["sid"], style=DIM))]
     if e["persona"]:
         body.append((Text("  "), Text("%s's scheduled loop does not come back with it" % e["persona"], style=DIM)))
     return Node("res:" + e["sid"], t, body, resume=e["sid"], hang=2)
