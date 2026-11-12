@@ -169,6 +169,18 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertIn("'github-actions[bot]' 'claude[bot]'", run)
         self.assertNotRegex(run, r"echo github-actions\s*$")
 
+    def test_bot_runs_only_when_the_thread_author_can_write(self):
+        # The job's `if` checks the thread author by author_association, which
+        # on an organization's repository also admits read-only and triage
+        # members; the trusted step's lookup decides, and the agent's steps
+        # wait on it.
+        job = load("claude.yml")["jobs"]["claude"]
+        for name in ("Check out the repository", "Run Claude Code"):
+            cond = " ".join(str(step_by_name(job, name).get("if", "")).split())
+            self.assertIn("steps.guard.outputs.skip == 'false'", cond, name)
+            self.assertIn("steps.trusted.outputs.run == 'true'", cond, name)
+            self.assertNotIn("||", cond, name)
+
     def test_sticky_cleanup_is_paginated_and_deletes_only_its_own_comments(self):
         doc = load("claude-code-review.yml")
         runs = [s["run"] for job in doc["jobs"].values() for s in job["steps"]
@@ -463,9 +475,9 @@ BOT_GH = textwrap.dedent("""\
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "needs bash and jq")
 class BotTrustedAuthorsStepTests(unittest.TestCase):
-    """The bot's trusted-author list, run against a stand-in gh."""
+    """The bot's trusted-author list and thread-author check, run against a stand-in gh."""
 
-    def test_lists_only_authors_with_write_access(self):
+    def run_step(self, event):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
         bindir, fixtures = os.path.join(tmp, "bin"), os.path.join(tmp, "fixtures")
@@ -477,27 +489,64 @@ class BotTrustedAuthorsStepTests(unittest.TestCase):
             fh.write(BOT_GH)
         os.chmod(gh, 0o755)
         write_fixtures(fixtures)
-        event = os.path.join(tmp, "event.json")
-        with open(event, "w") as fh:
-            json.dump({"issue": {"number": 7, "pull_request": {"url": "u"}}}, fh)
+        event_path = os.path.join(tmp, "event.json")
+        with open(event_path, "w") as fh:
+            json.dump(event, fh)
         script = os.path.join(tmp, "step.sh")
         with open(script, "w") as fh:
             fh.write(step_by_id(load("claude.yml")["jobs"]["claude"], "trusted")["run"])
         out = os.path.join(tmp, "github_output")
         open(out, "w").close()
         env = dict(os.environ, PATH=bindir + os.pathsep + os.environ["PATH"], FIXTURES=fixtures,
-                   RUNNER_TEMP=runner_temp, GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=event,
+                   RUNNER_TEMP=runner_temp, GITHUB_OUTPUT=out, GITHUB_EVENT_PATH=event_path,
                    REPO="o/r", GH_TOKEN="unused")
         r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script],
                            env=env, capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stderr)
         with open(out) as fh:
             outputs = dict(line.split("=", 1) for line in fh.read().splitlines())
+        return r, outputs, permission_calls(fixtures)
+
+    def test_lists_only_authors_with_write_access(self):
+        # The thread author, maint, also commented: still one lookup.
+        r, outputs, calls = self.run_step(
+            {"issue": {"number": 7, "pull_request": {"url": "u"}, "user": user("maint")}})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(outputs["run"], "true")
         self.assertEqual(outputs["actors"].split(","),
                          sorted(["claude[bot]", "colab", "github-actions[bot]", "maint", "pal"]))
-        calls = permission_calls(fixtures)
         self.assertEqual(sorted(calls), sorted(set(calls)))
         self.assertEqual(set(calls), set(PERMISSIONS) | {"gone"})
+
+    def test_runs_only_for_a_thread_author_with_write_access(self):
+        # reader is a read-only organization member and triager an outside
+        # collaborator with triage; both pass the job's author_association
+        # filter. gone's lookup fails.
+        threads = {
+            "issue": lambda login: {"issue": {"number": 7, "user": user(login)}},
+            "pull request": lambda login: {"pull_request": {"number": 7, "user": user(login)}},
+        }
+        for kind, event in threads.items():
+            for login in ("reader", "triager", "gone"):
+                with self.subTest(kind=kind, author=login):
+                    r, outputs, calls = self.run_step(event(login))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(outputs.get("run"), "false")
+                    self.assertNotIn("actors", outputs)
+                    self.assertIn(f"{login} does not have write access", r.stdout)
+                    # No comment is fetched for a thread the bot will not answer.
+                    self.assertEqual(calls, [login])
+            with self.subTest(kind=kind, author="pal"):
+                r, outputs, calls = self.run_step(event("pal"))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(outputs.get("run"), "true")
+                self.assertIn("pal", outputs["actors"].split(","))
+                self.assertEqual(calls.count("pal"), 1)
+
+    def test_a_thread_without_an_author_does_not_run(self):
+        r, outputs, calls = self.run_step({"issue": {"number": 7}})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(outputs.get("run"), "false")
+        self.assertEqual(calls, [])
 
 
 GATE_GH = textwrap.dedent("""\
