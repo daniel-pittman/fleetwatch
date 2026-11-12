@@ -268,11 +268,33 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertIn("'github-actions[bot]' 'claude[bot]'", run)
         self.assertNotRegex(run, r"echo github-actions\s*$")
 
+    def test_bot_trigger_matches_only_the_event_and_the_mention(self):
+        # author_association is no gate: on an organization's repository the
+        # event payload reports a member whose membership is private as
+        # CONTRIBUTOR. The `if` holds only event checks and @claude checks;
+        # write access is the trusted step's job.
+        cond = " ".join(str(load("claude.yml")["jobs"]["claude"]["if"]).split())
+        self.assertNotIn("author_association", cond)
+        term = r"github\.event_name == '[a-z_]+'|contains\([^()]*\)"
+        mentions = {
+            "issue_comment": "contains(github.event.comment.body, '@claude')",
+            "pull_request_review_comment": "contains(github.event.comment.body, '@claude')",
+            "pull_request_review": "contains(github.event.review.body, '@claude')",
+            "issues": "(contains(github.event.issue.body, '@claude') || "
+                      "contains(github.event.issue.title, '@claude'))",
+        }
+        self.assertEqual(set(mentions), set(triggers(load("claude.yml"))))
+        for event, mention in mentions.items():
+            self.assertIn(f"(github.event_name == '{event}' && {mention})", cond, event)
+        expected = {f"github.event_name == '{e}'" for e in mentions}
+        expected |= {t for m in mentions.values() for t in re.findall(term, m)}
+        self.assertEqual(set(re.findall(term, cond)), expected)
+        # Nothing but those terms, parentheses, && and ||.
+        self.assertEqual(re.sub(term + r"|[()&|\s]", "", cond), "")
+
     def test_bot_runs_only_when_the_thread_author_can_write(self):
-        # The job's `if` checks the thread author by author_association, which
-        # on an organization's repository also admits read-only and triage
-        # members; the trusted step's lookup decides, and the agent's steps
-        # wait on it.
+        # The job's `if` checks no one; the trusted step's lookup decides, and
+        # the agent's steps wait on it.
         job = load("claude.yml")["jobs"]["claude"]
         for name in ("Check out the repository", "Run Claude Code"):
             cond = " ".join(str(step_by_name(job, name).get("if", "")).split())
@@ -632,9 +654,11 @@ class BotTrustedAuthorsStepTests(unittest.TestCase):
         return r, outputs, permission_calls(fixtures)
 
     def test_lists_only_authors_with_write_access(self):
-        # The thread author, maint, also commented: still one lookup.
+        # The thread author, maint, is also the commenter and commented
+        # earlier: still one lookup.
         r, outputs, calls = self.run_step(
-            {"issue": {"number": 7, "pull_request": {"url": "u"}, "user": user("maint")}})
+            {"issue": {"number": 7, "pull_request": {"url": "u"}, "user": user("maint")},
+             "comment": {"user": user("maint")}, "sender": user("maint")})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(outputs["run"], "true")
         self.assertEqual(outputs["actors"].split(","),
@@ -644,11 +668,13 @@ class BotTrustedAuthorsStepTests(unittest.TestCase):
 
     def test_runs_only_for_a_thread_author_with_write_access(self):
         # reader is a read-only organization member and triager an outside
-        # collaborator with triage; both pass the job's author_association
-        # filter. gone's lookup fails.
+        # collaborator with triage. gone's lookup fails. The commenter, maint,
+        # can write, so only the thread author stops the bot.
         threads = {
-            "issue": lambda login: {"issue": {"number": 7, "user": user(login)}},
-            "pull request": lambda login: {"pull_request": {"number": 7, "user": user(login)}},
+            "issue": lambda login: {"issue": {"number": 7, "user": user(login)},
+                                    "comment": {"user": user("maint")}, "sender": user("maint")},
+            "pull request": lambda login: {"pull_request": {"number": 7, "user": user(login)},
+                                           "review": {"user": user("maint")}, "sender": user("maint")},
         }
         for kind, event in threads.items():
             for login in ("reader", "triager", "gone"):
@@ -666,6 +692,55 @@ class BotTrustedAuthorsStepTests(unittest.TestCase):
                 self.assertEqual(outputs.get("run"), "true")
                 self.assertIn("pal", outputs["actors"].split(","))
                 self.assertEqual(calls.count("pal"), 1)
+
+    def test_runs_only_for_a_commenter_with_write_access(self):
+        # The job's `if` checks no one, so the step must stop a read-only
+        # commenter on its own, on every event the bot takes. The thread
+        # author, maint, can write.
+        events = {
+            "issue comment": lambda c: {"issue": {"number": 7, "user": user("maint")},
+                                        "comment": {"user": user(c)}, "sender": user(c)},
+            "PR conversation comment": lambda c: {
+                "issue": {"number": 7, "pull_request": {"url": "u"}, "user": user("maint")},
+                "comment": {"user": user(c)}, "sender": user(c)},
+            "review comment": lambda c: {"pull_request": {"number": 7, "user": user("maint")},
+                                         "comment": {"user": user(c)}, "sender": user(c)},
+            "review": lambda c: {"pull_request": {"number": 7, "user": user("maint")},
+                                 "review": {"user": user(c)}, "sender": user(c)},
+            "issue assigned": lambda c: {"issue": {"number": 7, "user": user("maint")},
+                                         "sender": user(c)},
+        }
+        for kind, event in events.items():
+            for login in ("reader", "triager", "gone"):
+                with self.subTest(kind=kind, commenter=login):
+                    r, outputs, calls = self.run_step(event(login))
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(outputs.get("run"), "false")
+                    self.assertNotIn("actors", outputs)
+                    self.assertIn(f"commenter {login} does not have write access", r.stdout)
+                    self.assertEqual(calls, ["maint", login])
+            with self.subTest(kind=kind, commenter="pal"):
+                r, outputs, calls = self.run_step(event("pal"))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(outputs.get("run"), "true")
+                self.assertIn("pal", outputs["actors"].split(","))
+                self.assertEqual(calls.count("pal"), 1)
+
+    def test_the_comment_author_is_the_commenter(self):
+        # The text that mentions @claude is the comment's; its author decides
+        # even when the sender could write.
+        r, outputs, calls = self.run_step(
+            {"issue": {"number": 7, "user": user("maint")},
+             "comment": {"user": user("reader")}, "sender": user("pal")})
+        self.assertEqual(outputs.get("run"), "false")
+        self.assertEqual(calls, ["maint", "reader"])
+
+    def test_an_event_without_a_commenter_does_not_run(self):
+        r, outputs, calls = self.run_step({"issue": {"number": 7, "user": user("maint")}})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(outputs.get("run"), "false")
+        self.assertIn("commenter (none) does not have write access", r.stdout)
+        self.assertEqual(calls, ["maint"])
 
     def test_a_thread_without_an_author_does_not_run(self):
         r, outputs, calls = self.run_step({"issue": {"number": 7}})
