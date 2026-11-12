@@ -10,5 +10,6 @@
 
 ### Checklist
 - [ ] Tests cover the change.
+- [ ] The README, help text and `docs/` describe the change, and changed screens have new screenshots (see CONTRIBUTING, "Keep the docs current").
 - [ ] Fixtures, docs and examples use fictional names and paths only (no real people, home directories, email addresses or cloud-drive paths).
 - [ ] No credentials or tokens in the diff.

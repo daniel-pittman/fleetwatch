@@ -31,6 +31,14 @@ FLEETWATCH_NO_MIGRATE=1 python -m unittest discover -s tests
 Both must pass; CI runs the same two commands on Python 3.11 to 3.14, on Linux and macOS.
 Add tests for new behavior and bug fixes.
 
+## Keep the docs current
+
+A change is done when the docs say what the code now does. In the same pull request, update
+everything the change affects: the README, command help and usage text, this file and
+SECURITY.md, and `docs/`. If the change alters a screen, retake its screenshots with
+`docs/figures/capture.py` (it runs the board in `--demo` mode, so only fictional data appears),
+and rebuild the illustrated overview with `docs/build.sh`.
+
 ## No personal data
 
 This repository is public. Tests, fixtures, docs and examples use fictional names
