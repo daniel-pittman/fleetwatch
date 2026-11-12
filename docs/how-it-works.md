@@ -37,7 +37,10 @@ fleetwatch has three layers. Each one reads less than the one above it needs to 
   `<data>/indexes/<name>/`. `fleetwatch index refresh` parses the transcript into exchanges,
   scrubs them, optionally tags them, and rebuilds the search database when something changed.
 - **The board** reads the registry and each index's state only to show the Indexes tab. It shows
-  statuses and counts, never what an index holds, and it never refreshes one.
+  statuses and counts, never what an index holds, and it never refreshes one. Each row names the
+  owner session from the registry, and Enter on it jumps to that session's iTerm2 tab or resumes it
+  through the same path as the Resume tab. A fresh refresh lock marks an index as refreshing, and
+  an index that a running refresh has not reached yet is waiting, not stale.
 - **A search** (`fleetwatch search`) finds the calling session's own index from process ancestry,
   checks the trust guard when you name another index, and hands the query to the engine.
 

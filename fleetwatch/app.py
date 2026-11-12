@@ -57,7 +57,9 @@ HELP_LINES = [
     "  ?                         show or hide this help",
     "  q, Ctrl-C                 quit",
     "",
-    "The Indexes tab (5) shows each index's health: status and counts only, never what is in it.",
+    "The Indexes tab (5) shows each index's health and its owner session: status and counts only, never what is",
+    "in it. Enter on an index row jumps to its owner's iTerm tab, or resumes the owner when it is not running;",
+    "with no owner it says which command to run. Space folds the row.",
     "",
     "On the Resume tab (4):",
     "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
@@ -79,7 +81,7 @@ RESUME_HINTS = [("⏎", "resume here"), ("o", "new window"), ("/", "find"), ("p"
                 ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
 HOTKEY_RESUME_HINTS = [("⏎", "new window")] + RESUME_HINTS[2:]
 RESUME_DROP = ("⌃⇧F", "s", "z", "␣", "u", "p")
-INDEX_HINTS = [("y", "copy search"), ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"),
+INDEX_HINTS = [("⏎", "go to owner"), ("y", "copy search"), ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"),
                ("q", "quit"), ("⌃⇧F", "hide")]
 INDEX_DROP = ("⌃⇧F", "s", "z", "␣")
 
@@ -839,6 +841,7 @@ class FleetwatchApp(App):
         self.scanning = False
         self.scanned_at = 0.0
         self.resuming = False
+        self.index_owner_states = {}          # index name -> "running" or "resume", from index_owners()
         self.opened_at = {}                   # sessionId -> when a window was opened for it
         self.interval = interval
         self.snapshot = None
@@ -991,15 +994,16 @@ class FleetwatchApp(App):
         snap = self.snapshot
         if snap is None:
             return
+        self.rebuild_resume(cascade=False)
+        self.index_owner_states = owners = self.index_owners()
         tabs, self.needs_seen = views.build_tabs(
             snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
-            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows)
+            self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners)
         for lst, nodes in zip(self.lists, tabs):
             lst.set_nodes(nodes)
         index_list = self.lists[views.INDEXES_TAB]
         index_list.empty = snap.indexes.note or views.EMPTY[views.INDEXES_TAB]
-        index_list.set_nodes(views.index_nodes(snap.indexes.rows, snap.now, self.sorts[views.INDEXES_TAB]))
-        self.rebuild_resume()
+        index_list.set_nodes(views.index_nodes(snap.indexes.rows, snap.now, self.sorts[views.INDEXES_TAB], owners))
 
     def tab_counts(self):
         counts = list(self.snapshot.counts) if self.snapshot else [0] * views.RESUME_TAB
@@ -1007,7 +1011,26 @@ class FleetwatchApp(App):
             counts[0] += len(index_health.problem_rows(self.snapshot.indexes.rows, self.snapshot.now))
         return counts + [len(self.resume_rows), len(self.snapshot.indexes.rows) if self.snapshot else 0]
 
-    def rebuild_resume(self):
+    def index_owner(self, h):
+        """(kind, sessionId, name) for an index's owner session: kind is "running" (held by a process or the
+        daemon) or "resume" (offered on the Resume tab), else None. The registry's session id wins over its
+        name, and a name that matches several sessions matches none."""
+        held = self.snapshot.held if self.snapshot else {}
+        pools = (("running", held), ("resume", self.resume_rows))
+        for kind, rows in pools:
+            if h.owner_id and h.owner_id in rows:
+                return kind, h.owner_id, data.clean(rows[h.owner_id]["name"])
+        for kind, rows in pools:
+            named = [sid for sid, r in rows.items() if h.owner and data.clean(r["name"]) == h.owner]
+            if len(named) == 1:
+                return kind, named[0], h.owner
+        return None
+
+    def index_owners(self):
+        rows = self.snapshot.indexes.rows if self.snapshot else []
+        return {h.name: found[0] for h in rows if (found := self.index_owner(h))}
+
+    def rebuild_resume(self, cascade=True):
         """Lay out the Resume tab from the latest scan and who holds what right now."""
         lst = self.lists[views.RESUME_TAB]
         if self.resume_data is None:
@@ -1026,6 +1049,8 @@ class FleetwatchApp(App):
                 if not lst._by_key[key].section:
                     lst.move_to(key)
                     break
+        if cascade and self.index_owners() != self.index_owner_states:
+            self.rebuild()
 
     def scan_resume(self):
         if self.paths is None or self.scanning:
@@ -1317,12 +1342,39 @@ class FleetwatchApp(App):
 
     def action_enter(self):
         node = self.current.current()
-        if node is not None and (node.section or node.index):
+        if node is not None and node.index and not node.section:
+            self.go_to_index_owner(node.index)
+        elif node is not None and node.section:
             self.current.toggle()
         elif node is not None and node.resume:
             self.start_resume(node.resume, True)
         else:
             self.action_jump()
+
+    def go_to_index_owner(self, name):
+        """Enter on an index row: jump to its owner's tab, or resume the owner, by the same paths a session
+        row and a Resume row use. With nobody to go to, say which command to run."""
+        h = next((r for r in self.snapshot.indexes.rows if r.name == name), None) if self.snapshot else None
+        if h is None:
+            return
+        found = self.index_owner(h)
+        if found is None:
+            command = ("fleetwatch index verify %s" % name if h.protection == "refused"
+                       else "fleetwatch index refresh %s" % name)
+            who = "no owner session" if not h.owner else "owner %s is not running and has nothing to resume" % h.owner
+            self.say("%s for %s; from a terminal, run: %s" % (who, name, command))
+            return
+        kind, sid, owner = found
+        if os.environ.get("FLEETWATCH_DEMO"):
+            self.say("demo: Enter would %s %s" % ("jump to" if kind == "running" else "resume", owner))
+        elif kind == "running":
+            tty, reason = self.snapshot.held_target(sid, owner)
+            if tty is None:
+                self.say(reason)
+            else:
+                self.run_worker(lambda: self._do_jump(owner, tty, True), thread=True, group="jump")
+        else:
+            self.start_resume(sid, True)
 
     def _do_jump(self, name, tty, close_find=False):
         self.jump_calls.append(tty)

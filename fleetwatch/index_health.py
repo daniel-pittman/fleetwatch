@@ -41,11 +41,14 @@ class Health:
     reason: str = ""               # a FAIL_CATEGORIES word when failed, else ""
     finished: float = None         # epoch seconds of the last refresh
     stale_after: float = None      # seconds without a successful refresh that count as stale
-    protection: str = None         # None (not protected), "ok" or "refused"
+    protection: str = None         # None (not protected), "ok", "refused" or "plain" (no scanner applies)
     refusal: str = ""              # REFUSED_SETTINGS or REFUSED_SCANNER when refused
     exchanges: int = None
     files: int = None
     scheduled: bool = False
+    owner: str = ""                # the registry's owner_session name ("" when none is recorded)
+    owner_id: str = ""             # the registry's owner_session_id
+    refresh_state: str = ""        # "refreshing" (its lock is fresh) or "waiting" (stale, a run is in progress)
 
     def age(self, now):
         return None if self.finished is None else max(now - self.finished, 0)
@@ -57,12 +60,34 @@ class Health:
     def problems(self, now):
         """Short words for what is wrong, empty when the index is healthy. A never-run index is new, not broken."""
         out = []
-        if self.state == "failed":
+        if self.state == "failed" and self.refresh_state != "refreshing":
             out.append("last refresh failed (%s)" % (self.reason or FAIL_OTHER))
         if self.protection == "refused":
             out.append("protection check refused (%s)" % (self.refusal or REFUSED_SETTINGS))
-        if self.is_stale(now):
+        if self.is_stale(now) and not self.refresh_state:
             out.append("stale")
+        return out
+
+    def next_steps(self, now):
+        """One plain sentence per problem saying what to do. Commands and setting names only."""
+        out = []
+        for problem in self.problems(now):
+            if problem.startswith("last refresh failed"):
+                out.append("details: fleetwatch index status %s, and the failures log (logs/failures.log in the "
+                           "index data folder)" % self.name)
+            elif problem.startswith("protection"):
+                what = ("the privacy scanner could not be built from the settings"
+                        if self.refusal == REFUSED_SCANNER else
+                        "the allowlist or denylist settings do not meet what a protected group requires")
+                out.append("%s; fleetwatch index verify %s names the setting to change" % (what, self.name))
+            else:
+                if not self.scheduled:
+                    out.append("the scheduled refresh is not installed; run fleetwatch index schedule install")
+                else:
+                    out.append("last successful refresh %s ago; check fleetwatch index schedule status"
+                               % data.ago(self.age(now)))
+        if self.state == "never" and not self.refresh_state:
+            out.append("not refreshed yet; run fleetwatch index refresh %s" % self.name)
         return out
 
 
@@ -130,6 +155,8 @@ def _protection(mod, name, entry, cache):
     group = entry.get("group")
     if not mod.fleetwatch_settings.is_protected(group, mod.SETTINGS.protected_groups):
         return None, ""
+    if entry.get("kind") == "plain":
+        return "plain", ""         # its own scripts build the corpus; there is no transcript scanner to check
     priv = entry.get("privacy") or {}
     root = mod.CONFIG_ROOT
     allow = root / str(priv.get("allowlist", ""))
@@ -160,7 +187,13 @@ def _corpus_files(root, name, stamp, cache):
     return count
 
 
-def _row(mod, name, entry, root, scheduled, interval_s, cache):
+def _lock_age(root, name):
+    """Seconds since the index's refresh lock was last touched, None when it holds none."""
+    mtime = _mtime(os.path.join(root, name, "state", "refresh.lock.d"))
+    return None if mtime is None else max(time.time() - mtime / 1e9, 0)
+
+
+def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False):
     protection, refusal = _protection(mod, name, entry, cache)
     path = os.path.join(root, name, "state", "last_run.json")
     state, reason, finished, exchanges = "never", "", None, None
@@ -179,9 +212,16 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache):
         pass
     files = _corpus_files(root, name, _mtime(path), cache) if state != "never" else None
     kind = "plain" if entry.get("kind") == "plain" else "session"
+    lock = _lock_age(root, name)
+    refresh_state = "refreshing" if lock is not None and lock < mod.LOCK_STALE_S else ""
+    stale_after = interval_s * STALE_FACTOR if scheduled else NO_SCHEDULE_STALE_S
+    if not refresh_state and run_active and state != "never" and finished is not None \
+            and time.time() - finished > stale_after:
+        refresh_state = "waiting"
     return Health(data.clean(name), data.clean(entry.get("group") or "?"), kind, state, reason, finished,
-                  interval_s * STALE_FACTOR if scheduled else NO_SCHEDULE_STALE_S, protection, refusal,
-                  exchanges, files, scheduled)
+                  stale_after, protection, refusal, exchanges, files, scheduled,
+                  data.clean(str(entry.get("owner_session") or "")), data.clean(str(entry.get("owner_session_id") or "")),
+                  refresh_state)
 
 
 def load(reg=None, root=None, scheduled=None, cache=None):
@@ -210,7 +250,12 @@ def load(reg=None, root=None, scheduled=None, cache=None):
         minutes = int((reg.get("defaults") or {}).get("schedule_minutes", 30))
     except (TypeError, ValueError):
         minutes = 30
-    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache)
+    names = sorted((reg.get("indexes") or {}))
+    # A scheduled `refresh --all` holds one index's lock at a time, so a fresh lock anywhere means a run is
+    # in progress and an index it has not reached yet is waiting, not stale.
+    ages = [_lock_age(str(root), n) for n in names]
+    run_active = any(a is not None and a < mod.LOCK_STALE_S for a in ages)
+    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache, run_active)
             for name, entry in sorted((reg.get("indexes") or {}).items())]
     return Result(rows, "" if rows else NO_INDEXES)
 
