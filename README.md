@@ -53,6 +53,19 @@ The `search` extra pulls in PyTorch and sentence-transformers. The first index b
 
 Reference folders with PDF, Office or scanned files also use `pdftotext`, `pandoc`, LibreOffice's `soffice` and `tesseract` when they are on the PATH.
 
+**Other programs it uses.** fleetwatch itself needs only Claude Code (it reads its records). Everything else is optional and switches on one feature:
+
+| Program | Used for | Without it |
+|---|---|---|
+| iTerm2 (macOS) | the hotkey window, and Enter jumping to a session's tab | the board runs in any terminal; Enter says it cannot reach iTerm2 |
+| `claude` (the Claude Code CLI) | Resume reopening a session; the session tagger during an index refresh | Resume cannot reopen; run refresh with `--no-tag` |
+| `gh`, logged in (`gh auth login`) | watches (read-only GitHub calls with your login) | watches report a lookup error |
+| `terminal-notifier` (macOS, `brew install terminal-notifier`) | a click on a notification raising that session's tab | banners still appear through `osascript`; a click does nothing |
+| `notify-send` (Linux) | desktop notifications | notifications print one line instead |
+| `pdftotext`, `pandoc`, `soffice`, `tesseract` | reading PDF, Office and scanned files in reference folders | those files are skipped, listed as "conversion failed" in the run report |
+
+The background pieces (the index refresh, watches and notifications) each install with a `schedule install` command that writes a launchd agent on macOS or a systemd user unit elsewhere, and prints the command that starts it.
+
 ## Quickstart
 
 1. **Look.** `fleetwatch --demo`.
@@ -347,7 +360,7 @@ It never announces what was already there when it first ran: the first run recor
 
 `schedule install` prints the start command and never runs it. `fleetwatch notify --once` checks once and exits, and `fleetwatch notify --demo` prints what it would send for the built-in demo fleet and delivers nothing. Run `fleetwatch notify` with no flags to watch in a terminal.
 
-**Delivery.** On macOS it uses `terminal-notifier` when it is on your PATH, and a click on the banner raises that session's iTerm2 tab (the same jump as `fleetwatch jump NAME`, also available on its own with `--session-id ID`). Without it, `osascript` posts the banner and a click does nothing. On Linux it uses `notify-send`. Anywhere else it prints one line. `FLEETWATCH_NOTIFY_BACKEND=print` forces the printed line. Names and text go to these tools as separate arguments, never through a shell and never inside script source, because session names and questions are untrusted text. The operating system's Do Not Disturb applies as usual.
+**Delivery.** On macOS it uses `terminal-notifier` when it is on your PATH, and a click on the banner raises that session's iTerm2 tab (the same jump as `fleetwatch jump NAME`, also available on its own with `--session-id ID`). Without it, `osascript` posts the banner and a click does nothing. The notifier picks its delivery once, when it starts: after installing `terminal-notifier`, restart it (`launchctl kickstart -k gui/$(id -u)/local.fleetwatch.notify`). On Linux it uses `notify-send`. Anywhere else it prints one line. `FLEETWATCH_NOTIFY_BACKEND=print` forces the printed line. Names and text go to these tools as separate arguments, never through a shell and never inside script source, because session names and questions are untrusted text. The operating system's Do Not Disturb applies as usual.
 
 **Privacy.** By default a banner shows the session name and the kind of event only ("Billing API is stuck on a prompt", "Checkout Flow has a new question"). `show_text = true` adds detail to a banner, so it is off by default: the text of a question or to-do, which can appear during a screen share or a lecture, and for the other kinds a short summary built by fleetwatch. An index banner then names the problem as a category (`last refresh failed (build)`, `stale`), and a watch banner gives the repo name, a count and a category. Those two are never outside text: nothing from inside an index, from a watch's GitHub data or from an error message is ever shown, with or without `show_text`.
 
