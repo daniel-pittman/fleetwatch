@@ -155,6 +155,17 @@ class BoardHoldTests(BoardCase):
         self.assertIn("marked done", status)
         self.assertEqual(self.status_hash(), before)         # no status file was touched
 
+    def test_the_footer_keeps_the_hold_counts_whole_at_80_columns(self):
+        async def script(app, pilot):
+            await pilot.press("2")
+            app.lists[1].move_to(self.todo(app).key)
+            await pilot.press("x")
+            await pilot.pause(0.3)
+            return app.footer_plain
+        footer = self.board((80, 40), script)
+        self.assertLessEqual(len(footer), 78)
+        self.assertIn("0z·1✓ u", footer)
+
     def test_u_shows_the_hidden_item_dimmed_and_x_puts_it_back(self):
         async def script(app, pilot):
             await pilot.press("2")

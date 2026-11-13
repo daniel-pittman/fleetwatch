@@ -1133,21 +1133,28 @@ class FleetwatchApp(App):
             text = footer_text(width, False, HOTKEY_RESUME_HINTS if resume.in_hotkey_window() else RESUME_HINTS,
                                RESUME_DROP)
         else:
+            show_move = node is not None and node.session is not None
             note = self.held_note() if self.active in (0, views.TODO_TAB) else ""
-            text = footer_text(width - len(note), node is not None and node.session is not None)
+            text = footer_text(width - len(note), show_move)
+            if note and len(text.plain) + len(note) > width:
+                note = self.held_note(short=True)
+                text = footer_text(width - len(note), show_move)
             if note:
                 text.append(note, style="dim")
         self.footer_plain = text.plain
         self.query_one("#footer", Static).update(text)
 
-    def held_note(self):
-        """'  ·  2 snoozed · 1 done (u shows them)', empty when nothing is hidden."""
+    def held_note(self, short=False):
+        """'  ·  2 snoozed · 1 done (u shows them)', or '  ·  2z·1✓ u' when the line is narrow;
+        empty when nothing is hidden."""
         snap = self.snapshot
         if snap is None:
             return ""
         snoozed, done = self.holds.counts(snap.view["held"], snap.now)
         if not snoozed and not done:
             return ""
+        if short:
+            return "  ·  %dz·%d✓ u" % (snoozed, done)
         return "  ·  %d snoozed · %d done (u %s them)" % (snoozed, done, "hides" if self.show_held else "shows")
 
     def on_mount(self):
