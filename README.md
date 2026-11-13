@@ -369,7 +369,7 @@ poll_seconds = 20
 
 ## How sessions report
 
-The board reads four inputs. Only the status folder is ever written, by `write-status` and `prune`.
+The board reads four inputs and never changes any of them except the status folder, which `write-status` and `prune` write. The board itself keeps only its own `state.json` and `groups.toml` in the config folder.
 
 1. `claude agents --json` (override with `--command` or `FLEETWATCH_AGENTS_CMD`). Interactive entries carry `status`, background entries carry `state`; both are read. On failure or an unexpected shape, one warning prints and the registry carries on alone.
 2. `~/.claude/sessions/*.json` (`--sessions-dir`, `FLEETWATCH_SESSIONS_DIR`). Only `.json` files are opened, never `.key`. Registry status `waiting` and `blocked` both mean a prompt is waiting.
