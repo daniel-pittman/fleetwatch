@@ -19,6 +19,11 @@ _OLD_TAB = {"0": "0", "1": "1", "3": "2", "4": "3"}
 
 
 
+def color_enabled():
+    """False when NO_COLOR is set to anything but the empty string (no-color.org)."""
+    return not os.environ.get("NO_COLOR")
+
+
 def groups_path():
     return os.path.join(config_dir(), "groups.toml")
 
@@ -242,7 +247,8 @@ def set_override(path, name, group, natural=None, session_id=None):
 # ---------------------------------------------------------------- state.json
 
 def default_state():
-    return {"version": STATE_VERSION, "sort": {}, "groups": False, "folds": {}, "todo_group": TODO_GROUP}
+    return {"version": STATE_VERSION, "sort": {}, "groups": False, "folds": {}, "todo_group": TODO_GROUP,
+            "holds": {}}
 
 
 def _migrate(sort, folds):
@@ -279,7 +285,8 @@ def load_state(path=None):
             sort, folds = _migrate(sort, folds)
         return {"version": STATE_VERSION, "sort": {k: v for k, v in sort.items() if k in SORT_TABS},
                 "groups": groups, "folds": folds,
-                "todo_group": raw.get("todo_group") if raw.get("todo_group") in TODO_GROUPS else TODO_GROUP}, None
+                "todo_group": raw.get("todo_group") if raw.get("todo_group") in TODO_GROUPS else TODO_GROUP,
+                "holds": raw.get("holds") if isinstance(raw.get("holds"), dict) else {}}, None
     except Exception as exc:
         return default_state(), "state.json is not valid (%s); using the defaults" % (
             clean(exc)[:60] or type(exc).__name__)

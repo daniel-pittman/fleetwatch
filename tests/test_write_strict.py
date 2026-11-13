@@ -66,5 +66,50 @@ class RefusalReachesTheCaller(Tree):
         self.assertEqual(os.listdir(self.paths["status"]), [])
 
 
+class HelperSessionsAreRefused(Tree):
+    """Helper sessions (worktree lanes, headless runs, unnamed sessions) do not write status."""
+
+    def run_ws(self, argv, payload='{"working_on": "x"}'):
+        out, err = io.StringIO(), io.StringIO()
+        code = write_status.run(argv, io.StringIO(payload), out, err, paths=self.paths,
+                                ppids={500: 400, 400: 300, 300: 1}, start_pid=500, now=None)
+        return code, out.getvalue(), err.getvalue()
+
+    def refused(self, name, extra=None, sid="sid-h"):
+        self.reg(name, sid, pid=300, extra=extra)
+        code, out, err = self.run_ws([])
+        self.assertEqual(code, 3, err)
+        self.assertEqual(os.listdir(self.paths["status"]), [])
+        return err
+
+    def test_a_helper_name_is_refused_with_the_rule(self):
+        for name in ("wt-board-polish", "run-17", "t3-lane", "0123456789abcdef0123456789abcdef"):
+            err = self.refused(name)
+            self.assertIn("helper sessions don't write status; the session that started you does", err, name)
+
+    def test_a_headless_sdk_run_is_refused(self):
+        err = self.refused("Billing API", extra={"entrypoint": "sdk-cli"})
+        self.assertIn("helper sessions don't write status", err)
+
+    def test_a_session_nobody_named_is_refused_and_told_how_to_name_it(self):
+        err = self.refused("quick-fox", extra={"nameSource": "derived"})
+        self.assertIn("name this session with /rename to report status", err)
+
+    def test_force_writes_anyway(self):
+        self.reg("wt-board-polish", "sid-h", pid=300)
+        code, out, err = self.run_ws(["--force"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(os.listdir(self.paths["status"])), 1)
+
+    def test_a_named_interactive_session_still_writes(self):
+        self.reg("Billing API", "sid-n", pid=300, extra={"nameSource": "user", "entrypoint": "cli"})
+        code, out, err = self.run_ws([])
+        self.assertEqual(code, 0, err)
+
+    def test_print_path_and_dry_run_are_not_refused(self):
+        self.reg("wt-x", "sid-h", pid=300)
+        self.assertEqual(self.run_ws(["--print-path"])[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,9 @@ import asyncio
 import os
 import signal
 import sys
+import textwrap
 import time
+from datetime import datetime
 
 from rich.text import Text
 from textual import events
@@ -17,7 +19,7 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, index_health, iterm, park, prune, radar, resume, views, watches
+from . import config, data, find, holds, index_health, iterm, park, prune, radar, resume, views, watches
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
@@ -34,51 +36,85 @@ FIND_ROW_ROOM = 60                        # the find box's row width less its se
 CURSOR = "reverse"
 OPEN, SHUT = "▾", "▸"
 
-HELP_LINES = [
-    "fleetwatch keys",
-    "",
-    "  1 to 5, Tab, Shift-Tab    switch tabs (or click one)",
-    "  up/down, j/k              move the cursor; PgUp/PgDn and the wheel scroll",
-    "  Enter, g                  jump to the row's session in iTerm2 (helpers: their own",
-    "                            tab, else the parent's); on a section header, fold it;",
-    "                            on a row tagged 'not running', offer to reopen it",
-    "  click, double click       select the row; double click jumps like Enter",
-    "  /                         find a row on this tab by part of its text; Enter does what",
-    "                            Enter does on that row",
-    "  Ctrl-K                    find a live session from any tab, Enter jumps",
-    "  Space                     open or close the row (▸ closed, ▾ open)",
-    "  right arrow, left arrow   open, close",
-    "  z                         fold all: open every row and group in this tab, or close them all",
-    "  e / c                     open all / close all rows in this tab",
-    "  y                         on the Indexes tab (5): copy a search command for the highlighted index",
-    "  s                         change the sort order of this tab (remembered)",
-    "  G                         group every tab by project folder, or ungroup; on To-dos, cycle",
-    "                            by day, by project folder and no groups",
-    "  m                         move the highlighted session to another group",
-    "  P                         prune unnamed finished sessions' status files (y moves them,",
-    "                            n adds the named ones, Esc cancels)",
-    "  p / u                     park the highlighted session with a note / unpark it",
-    "  r                         refresh now",
-    "  ?                         show or hide this help",
-    "  q, Ctrl-C                 quit",
-    "",
-    "The Indexes tab (5) shows each index's health and its owner session: status and counts only, never what is",
-    "in it. Enter on an index row jumps to its owner's iTerm tab, or resumes the owner when it is not running;",
-    "with no owner it says which command to run. Space folds the row.",
-    "",
-    "A Watches section on Needs you lists what a stopped session's watches found on GitHub: counts and issue",
-    "or PR numbers only. Enter goes to the owner session, which reads them with `fleetwatch watch report`.",
-    "",
-    "On the Resume tab (4):",
-    "  Enter                     resume here: fleetwatch exits and this terminal becomes the session",
-    "  o                         resume in a new iTerm window (Ctrl-O in the find box)",
-    "  /                         find by part of a name or folder; Enter resumes",
-    "",
-    "In the fleetwatch hotkey window:",
-    "  ⌃⇧F hides this window; q quits fleetwatch; a resume always opens a new window",
-    "",
-    "Press any key to go back.",
+# (keys, what they do). The board wraps each description under its own column, so every line fits the
+# terminal, and the help screen scrolls for the rest.
+HELP_KEYS = [
+    ("1 to 5, Tab, Shift-Tab", "switch tabs (or click one)"),
+    ("up/down, j/k", "move the cursor; PgUp/PgDn and the wheel scroll"),
+    ("Enter, g", "jump to the row's session in iTerm2 (helpers: their own tab, else the parent's); on a "
+                 "section header, fold it; on a row tagged 'not running', offer to reopen it"),
+    ("click", "select the row; click a tab to switch to it; click the ▸ or ▾ arrow to fold"),
+    ("double click", "jump like Enter"),
+    ("/", "find a row on this tab by part of its text; Enter does what Enter does on that row"),
+    ("Ctrl-K", "find a live session from any tab, Enter jumps"),
+    ("Space", "open or close the row (▸ closed, ▾ open)"),
+    ("right arrow, left arrow", "open, close"),
+    ("z", "fold all: open every row and group in this tab, or close them all"),
+    ("e / c", "open all / close all rows in this tab"),
+    ("y", "on the Indexes tab (5): copy the highlighted index's next command, or a search command for a "
+          "healthy one"),
+    ("s", "change the sort order of this tab (remembered)"),
+    ("G", "group every tab by project folder, or ungroup; on To-dos, cycle by day, by project folder and "
+          "no groups"),
+    ("m", "move the highlighted session to another group"),
+    ("S", "snooze the highlighted to-do (Your to-dos, or a task on Needs you): tomorrow, next week or a "
+          "date; it comes back by itself"),
+    ("x", "mark the highlighted to-do done; it stays hidden until the session reports it changed or gone"),
+    ("u", "on To-dos or a to-do row: show or hide the snoozed and done items (S or x on one puts it back); "
+          "elsewhere, unpark the highlighted session"),
+    ("P", "prune unnamed finished sessions' status files (y moves them, n adds the named ones, Esc cancels)"),
+    ("p", "park the highlighted session with a note"),
+    ("i", "on the Resume tab: details of the row (session ID, full folder, transcript)"),
+    ("r", "refresh now"),
+    ("?", "show or hide this help"),
+    ("q, Ctrl-C", "quit"),
 ]
+HELP_NOTES = [
+    "The Indexes tab (5) shows each index's health and its owner session: status and counts only, never what "
+    "is in it. Enter on an index row jumps to its owner's iTerm tab, or resumes the owner when it is not "
+    "running; with no owner it says which command to run. Space folds the row.",
+    "A Watches section on Needs you lists what a stopped session's watches found on GitHub: counts and issue "
+    "or PR numbers only. Enter goes to the owner session, which reads them with `fleetwatch watch report`.",
+    "Snoozed and done to-dos are the board's own memory; it never edits a session's status file.",
+]
+HELP_RESUME = [
+    ("Enter", "resume here: fleetwatch exits and this terminal becomes the session"),
+    ("o", "resume in a new iTerm window (Ctrl-O in the find box)"),
+    ("/", "find by part of a name or folder; Enter resumes"),
+    ("i", "details: session ID, full folder, transcript"),
+]
+HELP_HOTKEY = [("Ctrl-Shift-F", "hides this window; q quits fleetwatch; a resume always opens a new window")]
+HELP_COLUMN = 26
+HELP_CLOSE = "Esc, q or ? closes this help. Up, down, PgUp, PgDn, Home and End scroll."
+
+
+def help_lines(width):
+    """The help as plain lines no wider than `width`: each key's description wraps under its own column."""
+    col = min(HELP_COLUMN, max(width // 3, 8))
+    room = max(width - col - 2, 12)
+
+    def entries(rows):
+        out = []
+        for keys, what in rows:
+            parts = textwrap.wrap(what, room) or [""]
+            lead = ("  " + keys).ljust(col + 2) if len(keys) <= col - 1 else "  " + keys + "\n" + " " * (col + 2)
+            first = lead.split("\n")
+            if len(first) == 2:
+                out.append(first[0])
+                lead = first[1]
+            out.append(lead + parts[0])
+            out += [" " * (col + 2) + p for p in parts[1:]]
+        return out
+
+    lines = ["fleetwatch keys", ""] + entries(HELP_KEYS) + [""]
+    for note in HELP_NOTES:
+        lines += textwrap.wrap(note, width) + [""]
+    lines += ["On the Resume tab (4):"] + entries(HELP_RESUME) + ["", "In the fleetwatch hotkey window:"]
+    lines += entries(HELP_HOTKEY) + [""] + textwrap.wrap(HELP_CLOSE, width)
+    return lines
+
+
+HELP_LINES = help_lines(120)
 
 
 TODO_GROUP_NOTE = {
@@ -91,10 +127,11 @@ HINTS = [("⏎", "go to session"), ("/", "find"), ("␣", "fold"), ("z", "fold a
 CORE_HINTS = ("⏎", "␣", "?", "q")
 DROP_ORDER = ("⌃⇧F", "r", "G", "m", "s", "z")     # least important first
 RESUME_HINTS = [("⏎", "resume here"), ("o", "new window"), ("/", "find"), ("p", "park"), ("u", "unpark"),
-                ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"), ("q", "quit"), ("⌃⇧F", "hide")]
+                ("i", "details"), ("␣", "fold"), ("z", "fold all"), ("s", "sort"), ("?", "help"), ("q", "quit"),
+                ("⌃⇧F", "hide")]
 HOTKEY_RESUME_HINTS = [("⏎", "new window")] + RESUME_HINTS[2:]
-RESUME_DROP = ("⌃⇧F", "s", "z", "␣", "u", "p")
-INDEX_HINTS = [("⏎", "go to owner"), ("y", "copy search"), ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"),
+RESUME_DROP = ("⌃⇧F", "s", "z", "␣", "u", "i", "p")
+INDEX_HINTS = [("⏎", "go to owner"), ("y", "copy"), ("␣", "details"), ("z", "fold all"), ("s", "sort"), ("?", "help"),
                ("q", "quit"), ("⌃⇧F", "hide")]
 INDEX_DROP = ("⌃⇧F", "s", "z", "␣")
 
@@ -123,13 +160,21 @@ class Snapshot:
         self.held = held or {}
         self.prune_plan = prune_plan or prune.Plan({}, now, config.default_prune())
         self.stale = stale
-        self.warnings = list(warnings)
-        self.view = data.build_view(sections, now, horizon, stale)
-        self.counts = views.tab_counts(self.view, stale)
-        self.warnings += self.view["up_warnings"]
+        self.sections, self.horizon = sections, horizon
+        self.base_warnings = list(warnings)
         self.jump = jump or {"ttys": {}, "iterm": None, "err": "not read"}
         self.groups = groups if groups is not None else config.Groups()
         self.cfg_warning = cfg_warning
+        self.derive(None)
+
+    def derive(self, holds):
+        """Build the view, counts, header and lookups, hiding what `holds` (holds.Holds) snoozed or marked
+        done. The board calls this again whenever a hold changes, so every number follows the rows."""
+        now, stale = self.now, self.stale
+        self.holds = holds
+        self.view = data.build_view(self.sections, now, self.horizon, stale, holds)
+        self.counts = views.tab_counts(self.view, stale)
+        self.warnings = self.base_warnings + self.view["up_warnings"]
         self.records, self.helpers = {}, {}
         self.gone = {x["name"]: x["r"] for x in self.view["for_you"] if x.get("gone")}
         for x in self.view["rows"]:
@@ -141,8 +186,12 @@ class Snapshot:
         self.grouping = views.Grouping(
             {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
             self.groups.names())
-        self.header = views.header_text(self.view, self.counts, now, self.warnings)
-        self.header_short = views.header_text(self.view, self.counts, now, self.warnings, short=True)
+        bad = len(index_health.problem_rows(self.indexes.rows, now))
+        self.header = views.header_text(self.view, self.counts, now, self.warnings, False, bad, len(self.watches))
+        self.header_mid = views.header_text(self.view, self.counts, now, self.warnings, False, bad,
+                                            len(self.watches), stamp=False)
+        self.header_short = views.header_text(self.view, self.counts, now, self.warnings, True, bad,
+                                              len(self.watches))
 
     def _tty(self, rec, name):
         """(tty, None) when the record has an iTerm2 tab, else (None, reason)."""
@@ -202,6 +251,7 @@ class FoldList(ScrollView, can_focus=True):
         self._order = []           # visible cursor keys, top to bottom
         self._by_key = {}
         self._spans = {}           # key -> (first line, last line)
+        self._glyph_x = {}
         self._strips = []
         self._width = 0
         self.on_fold = None        # called after the user opens or closes something
@@ -240,6 +290,7 @@ class FoldList(ScrollView, can_focus=True):
         width = max(self._width, 20)
         console = self.app.console
         self._order, self._by_key, self._spans, lines = [], {}, {}, []
+        self._glyph_x = {}          # line index -> column of its fold arrow
 
         def wrap(label, text, indent, hang=0):
             pad = Text(" " * indent) + label
@@ -255,6 +306,8 @@ class FoldList(ScrollView, can_focus=True):
             glyph = (OPEN if self.is_open(node) else SHUT) if node.expandable else " "
             first = len(lines)
             head = node.head if self.is_open(node) or node.head_shut is None else node.head_shut
+            if node.expandable:
+                self._glyph_x[len(lines)] = depth * 2
             for ln in wrap(Text(glyph + " "), head, depth * 2, node.hang):
                 lines.append((node.key, ln))
             self._order.append(node.key)
@@ -401,21 +454,20 @@ class FoldList(ScrollView, can_focus=True):
         self.move_to(self._order[-1] if self._order else None)
 
     def on_click(self, event: events.Click):
+        """A click selects the row; a click on its fold arrow folds it; a double click does what Enter does
+        (a section header folds, a session row jumps)."""
         i = int(self.scroll_offset.y) + event.y
-        if 0 <= i < len(self._lines):
-            key = self._lines[i][0]
-            if key is None:
-                return
-            # A double click arrives as a second Click with chain 2, after the first click has
-            # already selected and toggled the row: jump like Enter, but never toggle a section
-            # again, or the double click would close what the first click opened.
-            if event.chain >= 2:
-                node = self._by_key.get(key)
-                if node is not None and not node.section:
-                    self.app.action_enter()
-                return
-            self.move_to(key)
+        if not 0 <= i < len(self._lines):
+            return
+        key = self._lines[i][0]
+        if key is None:
+            return
+        self.move_to(key)
+        gx = self._glyph_x.get(i)
+        if gx is not None and gx <= event.x + int(self.scroll_offset.x) <= gx + 1:
             self.toggle()
+        elif event.chain >= 2:
+            self.app.action_enter()
 
     def visible_text(self):
         """Plain text of every line, for tests and captures."""
@@ -475,17 +527,135 @@ class TabBar(Static):
 
 
 class HelpScreen(ModalScreen):
-    DEFAULT_CSS = "HelpScreen { align: center middle; } HelpScreen Static { width: auto; padding: 1 2; }"
+    """The key list, wrapped to the terminal and scrollable, so every line is reachable at 80x24."""
+
+    DEFAULT_CSS = """
+    HelpScreen { align: center middle; }
+    HelpScreen #helpbox { width: 100%; max-width: 110; height: 100%; padding: 0 1; }
+    HelpScreen #helptext { width: 100%; }
+    """
+    BINDINGS = [
+        Binding("escape,q,question_mark", "close", show=False),
+        Binding("down,j", "scroll(1)", show=False),
+        Binding("up,k", "scroll(-1)", show=False),
+        Binding("pagedown,space", "page(1)", show=False),
+        Binding("pageup", "page(-1)", show=False),
+        Binding("home", "edge(0)", show=False),
+        Binding("end", "edge(1)", show=False),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.lines = []
 
     def compose(self):
-        yield Static(Text("\n".join(HELP_LINES)))
+        with VerticalScroll(id="helpbox"):
+            yield Static("", id="helptext")
 
-    def on_key(self, event):
-        event.stop()
+    def on_mount(self):
+        self.query_one("#helpbox").focus()
+        self.fill()
+
+    def on_resize(self, event):
+        self.fill()
+
+    def fill(self):
+        width = max(self.size.width - 4, 20)
+        self.lines = help_lines(min(width, 106))
+        self.query_one("#helptext", Static).update(Text("\n".join(self.lines), no_wrap=True))
+
+    def action_close(self):
         self.dismiss()
+
+    def action_scroll(self, d):
+        self.query_one("#helpbox").scroll_relative(y=d, animate=False)
+
+    def action_page(self, d):
+        box = self.query_one("#helpbox")
+        box.scroll_relative(y=d * max(box.size.height - 1, 1), animate=False)
+
+    def action_edge(self, which):
+        box = self.query_one("#helpbox")
+        box.scroll_to(y=box.max_scroll_y if which else 0, animate=False)
 
     def on_click(self, event):
         self.dismiss()
+
+
+class DetailScreen(ModalScreen):
+    """The lines a Resume row leaves out: session ID, full folder, transcript path."""
+
+    DEFAULT_CSS = """
+    DetailScreen { align: center middle; }
+    DetailScreen #detail { width: 100%; max-width: 110; height: auto; max-height: 100%;
+                           border: round $primary; padding: 0 1; background: $surface; }
+    """
+    BINDINGS = [Binding("escape,q,i,enter,space", "close", show=False)]
+
+    def __init__(self, text):
+        super().__init__()
+        self.text = text
+
+    def compose(self):
+        with Vertical(id="detail"):
+            yield Static(self.text, id="detailtext")
+            yield Static(Text("Esc closes", style="dim"))
+
+    def action_close(self):
+        self.dismiss()
+
+
+class SnoozeScreen(ModalScreen):
+    """Pick when a to-do comes back: tomorrow, next Monday, or a typed date. Dismisses with the epoch of
+    that day's start, or None."""
+
+    DEFAULT_CSS = """
+    SnoozeScreen { align: center middle; }
+    SnoozeScreen #picker { width: 60; max-width: 95%; height: auto; max-height: 90%;
+                           border: round $primary; padding: 0 1; background: $surface; }
+    SnoozeScreen OptionList { height: auto; max-height: 8; border: none; padding: 0; }
+    SnoozeScreen Input { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, what, now):
+        super().__init__()
+        self.what, self.now = what, now
+        self.options = (("tomorrow", holds.tomorrow(now)), ("next week", holds.next_monday(now)))
+
+    def compose(self):
+        with Vertical(id="picker"):
+            yield Static(Text("Snooze: %s" % self.what, style="bold", no_wrap=True, overflow="ellipsis"))
+            yield OptionList(*[Option(Text("%s (%s)" % (label, d.strftime("%a %b %-d"))), id="d:%d" % i)
+                               for i, (label, d) in enumerate(self.options)],
+                             Option(Text("a date…", style="italic"), id="typed"), id="choices")
+            yield Input(placeholder="YYYY-MM-DD, then Enter", id="when")
+            yield Static("", id="problem")
+
+    def on_mount(self):
+        self.query_one("#when", Input).display = False
+        self.query_one("#choices", OptionList).focus()
+
+    def on_option_list_option_selected(self, event):
+        event.stop()
+        if event.option.id == "typed":
+            box = self.query_one("#when", Input)
+            box.display = True
+            box.focus()
+        else:
+            self.dismiss(holds.day_start(self.options[int(event.option.id.split(":")[1])][1]))
+
+    def on_input_submitted(self, event):
+        event.stop()
+        try:
+            day = holds.parse_date(event.value, self.now)
+        except ValueError as exc:
+            self.query_one("#problem", Static).update(Text(str(exc), style="bold"))
+            return
+        self.dismiss(holds.day_start(day))
+
+    def action_cancel(self):
+        self.dismiss(None)
 
 
 class PruneScreen(ModalScreen):
@@ -872,6 +1042,9 @@ class FleetwatchApp(App):
         Binding("P", "prune", show=False),
         Binding("p", "park", show=False),
         Binding("u", "unpark", show=False),
+        Binding("S", "snooze", show=False),
+        Binding("x", "done", show=False),
+        Binding("i", "details", show=False),
         Binding("o", "new_window", show=False),
         Binding("r", "refresh_now", show=False),
         Binding("question_mark", "help", show=False),
@@ -880,6 +1053,8 @@ class FleetwatchApp(App):
     ]
 
     def __init__(self, loader, interval=data.DEFAULT_INTERVAL_S, state_path=None, paths=None, **kw):
+        if os.environ.get("NO_COLOR") == "":
+            del os.environ["NO_COLOR"]           # no-color.org: an empty value means color on; Textual reads it as off
         super().__init__(ansi_color=True, **kw)
         self.loader = loader
         self.paths = paths                    # None: no transcript scan, and the Resume tab stays empty
@@ -905,6 +1080,8 @@ class FleetwatchApp(App):
         self.sorts = [views.sort_id(i, self.state["sort"].get(str(i))) for i in range(len(views.TAB_TITLES))]
         self.grouped = self.state["groups"]
         self.todo_group = self.state["todo_group"]
+        self.holds = holds.Holds(self.state.get("holds"))
+        self.show_held = False
         self.needs_seen = []
         self.sortline_plain = []
         self.footer_plain = ""
@@ -956,9 +1133,22 @@ class FleetwatchApp(App):
             text = footer_text(width, False, HOTKEY_RESUME_HINTS if resume.in_hotkey_window() else RESUME_HINTS,
                                RESUME_DROP)
         else:
-            text = footer_text(width, node is not None and node.session is not None)
+            note = self.held_note() if self.active in (0, views.TODO_TAB) else ""
+            text = footer_text(width - len(note), node is not None and node.session is not None)
+            if note:
+                text.append(note, style="dim")
         self.footer_plain = text.plain
         self.query_one("#footer", Static).update(text)
+
+    def held_note(self):
+        """'  ·  2 snoozed · 1 done (u shows them)', empty when nothing is hidden."""
+        snap = self.snapshot
+        if snap is None:
+            return ""
+        snoozed, done = self.holds.counts(snap.view["held"], snap.now)
+        if not snoozed and not done:
+            return ""
+        return "  ·  %d snoozed · %d done (u %s them)" % (snoozed, done, "hides" if self.show_held else "shows")
 
     def on_mount(self):
         self.lists = [self.query_one("#tab%d" % i, FoldList) for i in range(len(views.TAB_TITLES))]
@@ -1015,13 +1205,20 @@ class FleetwatchApp(App):
     def show_header(self):
         snap = self.snapshot
         if snap is not None:
-            narrow = self.size.width < 100
-            self.query_one("#top", Static).update(snap.header_short if narrow else snap.header)
+            # The widest form that fits: with the time, without it, then the short words.
+            room = self.size.width - 2
+            shown = next((h for h in (snap.header, snap.header_mid) if h.cell_len <= room), snap.header_short)
+            self.query_one("#top", Static).update(shown)
 
     def apply(self, snap):
         self.loading = False
         self.snapshot = snap
         self.refreshes += 1
+        snap.derive(self.holds)
+        if self.holds.prune(snap.view["item_keys"], snap.now):
+            self.state["holds"] = self.holds.as_dict()
+            self._save_state()
+            snap.derive(self.holds)
         self.rebuild()
         self.show_header()
         self.show_radar()
@@ -1047,7 +1244,7 @@ class FleetwatchApp(App):
         tabs, self.needs_seen = views.build_tabs(
             snap.view, snap.stale, snap.now, self.sorts, snap.grouping if self.grouped else None,
             self.needs_seen, len(snap.prune_plan.candidates), snap.indexes.rows, owners, snap.watches, snap.held,
-            todo_group=self.todo_group, folders=snap.grouping)
+            todo_group=self.todo_group, folders=snap.grouping, holds=self.holds, show_held=self.show_held)
         for lst, nodes in zip(self.lists, tabs):
             lst.set_nodes(nodes)
         index_list = self.lists[views.INDEXES_TAB]
@@ -1224,7 +1421,13 @@ class FleetwatchApp(App):
         """On an Indexes row: put `fleetwatch search --index NAME "` on the clipboard, open for the query."""
         node = self.current.current() if self.active == views.INDEXES_TAB else None
         if node is None or not node.index:
-            self.say("y copies a search command for the highlighted row on the Indexes tab (5)")
+            self.say("y copies a command for the highlighted row on the Indexes tab (5)")
+            return
+        h = next((r for r in self.snapshot.indexes.rows if r.name == node.index), None) if self.snapshot else None
+        steps = h.next_commands(self.snapshot.now) if h is not None else []
+        if steps:
+            self.copy_to_clipboard(steps[0])
+            self.say("copied: %s" % steps[0])
             return
         self.copy_to_clipboard('fleetwatch search --index %s "' % node.index)
         self.say("copied the search command for %s" % node.index)
@@ -1655,6 +1858,10 @@ class FleetwatchApp(App):
         self.push_screen(ParkScreen(name, note), chosen)
 
     def action_unpark(self):
+        node = self.current.current()
+        if self.active == views.TODO_TAB or (node is not None and node.todo):
+            self.action_toggle_held()
+            return
         sid, name = self._row_session()
         if sid is None:
             self.say("no session is highlighted")
@@ -1666,6 +1873,76 @@ class FleetwatchApp(App):
             return
         self.say(("unparked %s" if gone is not None else "%s is not parked") % name)
         self._reload_parked()
+
+    # ---- snooze and done (the board's own memory; a status file is never edited)
+
+    def action_toggle_held(self):
+        """u on a to-do: show or hide the snoozed and done items."""
+        self.show_held = not self.show_held
+        self.rebuild()
+        self.update_footer()
+        if not self.snapshot or not self.snapshot.view["held"]:
+            self.say("nothing is snoozed or done")
+
+    def _holds_changed(self, message):
+        self.state["holds"] = self.holds.as_dict()
+        self._save_state()
+        snap = self.snapshot
+        snap.derive(self.holds)
+        self.rebuild()
+        self.show_header()
+        self.show_radar()
+        self.query_one(TabBar).update_tabs(self.tab_counts(), self.active)
+        self.update_footer()
+        self.say(message)
+
+    def _todo_row(self, verb):
+        node = self.current.current()
+        if node is None or not node.todo or not node.todo[0]:
+            self.say("%s works on a to-do: highlight one on Your to-dos or a task on Needs you" % verb)
+            return None
+        return node
+
+    def action_snooze(self):
+        node = self._todo_row("S")
+        if node is None:
+            return
+        keys, what = node.todo
+        if node.held:
+            self.holds.clear(keys)
+            self._holds_changed("back on your list: %s" % what)
+            return
+
+        def chosen(until):
+            if until is None:
+                return
+            self.holds.snooze(keys, until)
+            when = datetime.fromtimestamp(until, data.LOCAL_TZ).strftime("%a %b %-d")
+            self._holds_changed("snoozed until %s: %s" % (when, what))
+        self.push_screen(SnoozeScreen(what, time.time()), chosen)
+
+    def action_done(self):
+        node = self._todo_row("x")
+        if node is None:
+            return
+        keys, what = node.todo
+        if node.held:
+            self.holds.clear(keys)
+            self._holds_changed("back on your list: %s" % what)
+            return
+        self.holds.done(keys)
+        self._holds_changed("marked done: %s (u shows it; it returns if the session changes it)" % what)
+
+    def action_details(self):
+        if self.active != views.RESUME_TAB:
+            self.say("i shows the details of a row on the Resume tab (4)")
+            return
+        node = self.current.current()
+        e = self.resume_rows.get(node.resume) if node is not None and node.resume else None
+        if e is None:
+            self.say("no session is highlighted")
+            return
+        self.push_screen(DetailScreen(views.resume_details(e, time.time())))
 
     def action_prune(self):
         if self.snapshot is None:

@@ -1088,7 +1088,7 @@ class AppTests(AppWorld):
             self.assertIn("Other · 2", self.rows(app))
         self.drive(body)
 
-    def test_row_opens_to_the_full_folder_and_id(self):
+    def test_row_opens_to_the_full_folder_and_i_adds_the_id_and_transcript(self):
         s, _ = self.transcript("Details")
 
         async def body(app, pilot):
@@ -1096,7 +1096,12 @@ class AppTests(AppWorld):
             await pilot.pause(0.1)
             text = self.rows(app)
             self.assertIn(self.folder, text.replace("\n", ""))
-            self.assertIn(s, text)
+            self.assertNotIn(s, text)               # the session ID is in the details view, not the row
+            await pilot.press("i")
+            await pilot.pause(0.2)
+            shown = str(app.screen.query_one("#detailtext").render())
+            self.assertIn(s, shown)
+            self.assertIn(self.folder, shown.replace("\n", ""))
         self.drive(body)
 
     def test_narrow_tab_bar_keeps_all_four(self):

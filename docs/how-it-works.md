@@ -28,7 +28,15 @@ fleetwatch has three layers. Each one reads less than the one above it needs to 
   session by walking up the process tree to the first process with a registry entry, stamps the
   name, session ID and time, and writes `~/.claude/state/fleetwatch/<name>.json`. The board joins
   the file to the live session by session ID first and by name second, so a renamed session keeps
-  its file.
+  its file. Only named, interactive sessions report: the command refuses (exit 3) when the caller
+  looks like a helper (a worktree or run id, a headless `-p` or SDK run, or a name Claude Code
+  derived itself), so helpers do not leave status files or orphan questions. `--force` overrides it.
+- **Snooze and done** (`S` and `x` on a to-do) are the board's own memory, kept in `state.json`
+  under `holds` and keyed by the session ID plus a hash of the item's text, date and kind. The
+  board never edits a status file. The view is built with the held items removed, so every row and
+  count (the tabs, the header, Needs you) follows what is visible, and the held rows are kept
+  aside for the `u` view. A snooze ends on its date; a done hold ends when the session reports the
+  item changed or gone.
 - **The index registry** (`<config>/indexes/registry.yaml`, plus one file per index in
   `registry.d/`) names every index, its trust group, its owner session and its transcript
   folders. `fleetwatch index add` creates an entry for the calling session.

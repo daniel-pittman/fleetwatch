@@ -90,6 +90,23 @@ class Health:
             out.append("not refreshed yet; run fleetwatch index refresh %s" % self.name)
         return out
 
+    def next_commands(self, now):
+        """The command to run for each problem, in the order next_steps explains them. The board shows
+        these alone on one line, and y copies the first."""
+        out = []
+        for problem in self.problems(now):
+            if problem.startswith("last refresh failed"):
+                out.append("fleetwatch index status %s" % self.name)
+            elif problem.startswith("protection"):
+                out.append("fleetwatch index verify %s" % self.name)
+            elif not self.scheduled:
+                out.append("fleetwatch index schedule install")
+            else:
+                out.append("fleetwatch index schedule status")
+        if self.state == "never" and not self.refresh_state:
+            out.append("fleetwatch index refresh %s" % self.name)
+        return out
+
 
 @dataclass
 class Result:
