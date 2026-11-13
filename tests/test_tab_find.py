@@ -70,6 +70,18 @@ class TabFind(unittest.TestCase):
         names = self.board(script)
         self.assertEqual(len(names), 1)
 
+    def test_an_empty_result_names_the_tab_kind(self):
+        async def script(app, pilot):
+            out = {}
+            for tab in ("1", "2", "3", "5"):
+                screen = await self.search(app, pilot, tab, "zzqqxx")
+                out[tab] = str(screen.query_one("#results").get_option_at_index(0).prompt)
+                await pilot.press("escape")
+                await pilot.pause(0.2)
+            return out
+        self.assertEqual(self.board(script), {"1": "no matching row", "2": "no matching to-do",
+                                              "3": "no matching session", "5": "no matching index"})
+
     def test_sessions_finds_an_active_session(self):
         kind, names = self.results("3", "docs")
         self.assertEqual(kind, "TabFindScreen")

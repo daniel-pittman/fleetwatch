@@ -741,6 +741,7 @@ class FindScreen(ModalScreen):
     ]
 
     PLACEHOLDER = "Jump to session: type part of a name or persona"
+    NO_MATCH = "no matching session"
 
     def __init__(self, entries):
         super().__init__()
@@ -772,7 +773,7 @@ class FindScreen(ModalScreen):
         if self.shown:
             lst.highlighted = 0
         else:
-            lst.add_option(Option(Text("no matching session", style="dim"), disabled=True))
+            lst.add_option(Option(Text(self.NO_MATCH, style="dim"), disabled=True))
 
     def on_input_changed(self, event):
         event.stop()
@@ -806,6 +807,8 @@ class TabFindScreen(FindScreen):
     def __init__(self, entries, noun):
         super().__init__(entries)
         self.PLACEHOLDER = "Find %s: type part of its text, name or group" % noun
+        kind = noun.split(" ", 1)[1].split(" on ")[0]
+        self.NO_MATCH = "no matching %s" % kind
 
     def submit(self, entry):
         self.dismiss(entry)
