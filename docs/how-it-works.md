@@ -14,8 +14,10 @@ fleetwatch has three layers. Each one reads less than the one above it needs to 
 
 1. **The board** reads Claude Code's own records (the session registry, `claude agents --json`,
    and the transcripts) and the status file each session writes. It decides which sessions are
-   alive, which are stuck on a prompt, and what each one needs from you. It reads only; the one
-   folder it ever writes to is the status folder, through `write-status` and `prune`.
+   alive, which are stuck on a prompt, and what each one needs from you. It never changes Claude
+   Code's records. What it writes is the status folder (through `write-status` and `prune`) and
+   its own two files in the config folder: `state.json`, where it remembers folds, sorts and holds,
+   and `groups.toml`, when you move a session to another group.
 2. **Session memory** reads transcripts and reference folders, scrubs them, and writes a corpus
    of Markdown files for the engine. It owns the index registry and the trust groups.
 3. **The search engine** (`fleetwatch.search.engine`) is a plain library over SQLite FTS5,

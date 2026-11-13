@@ -17,7 +17,11 @@ You will get an acknowledgement, a fix, and a disclosure timeline agreed with yo
 
 fleetwatch is a local terminal tool with no network service. It reads Claude
 session metadata and transcripts under your home directory, indexes them
-locally, and can open a terminal window to resume a session. The realistic
+locally, and can open a terminal window to resume a session. Its only network
+use is the read-only `gh api` calls that `fleetwatch watch run` makes for the
+watches you declare, and the first download of the embedding models. It starts
+background jobs (launchd or systemd) only when you run a `schedule install`
+command, and it posts desktop notifications only when you run `fleetwatch notify`. The realistic
 surface is path handling, parsing of untrusted transcript or document content,
 the privacy scanner that scrubs indexed text, and the commands it launches.
 Reports in any of those areas are welcome.

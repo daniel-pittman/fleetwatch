@@ -117,6 +117,7 @@ The board loads the memory layers only for the `search` and `index` commands, so
 ## The board
 
     fleetwatch [--once] [--interval N] [--window 6h|3d|90m] [--all] [--json] [--horizon 30d|90d] [--groups]
+               [--sessions-dir D] [--jobs-dir D] [--status-dir D] [--command CMD]
     fleetwatch resume [name] [--here]
     fleetwatch park [name] --note "what it is waiting on"
     fleetwatch unpark [name]
@@ -372,7 +373,7 @@ The board reads four inputs. Only the status folder is ever written, by `write-s
 
 1. `claude agents --json` (override with `--command` or `FLEETWATCH_AGENTS_CMD`). Interactive entries carry `status`, background entries carry `state`; both are read. On failure or an unexpected shape, one warning prints and the registry carries on alone.
 2. `~/.claude/sessions/*.json` (`--sessions-dir`, `FLEETWATCH_SESSIONS_DIR`). Only `.json` files are opened, never `.key`. Registry status `waiting` and `blocked` both mean a prompt is waiting.
-3. `~/.claude/jobs/<id>/state.json` for background entries with no live pid. Only `state` and `updatedAt` are read.
+3. `~/.claude/jobs/<id>/state.json` for background entries with no live pid. Only `state` and `updatedAt` are read (`--jobs-dir`, `FLEETWATCH_JOBS_DIR`).
 4. `~/.claude/state/fleetwatch/*.json` (`--status-dir`, `FLEETWATCH_STATUS_DIR`), written by each session:
 
 ```json
@@ -451,12 +452,13 @@ documents), scrubbed, tagged and searchable. Config (registry, tags, allowlist, 
 `<config>/indexes/`, corpus and search data in `<data>/indexes/<name>/`.
 
 ```
-fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--around N] [--limit N] [--json] [--index NAME]
+fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--path SUBSTR] [--around N] [--limit N]
+                             [--json] [--no-rerank] [--expand | --no-expand] [--exact] [--index NAME]
 fleetwatch search show ID [ID ...] [--around N] [--full]
 fleetwatch search eval | stats [--index NAME]
 
 fleetwatch index list | status [NAME]
-fleetwatch index add [--session NAME] --group G [--docs PATH --include GLOB ...]
+fleetwatch index add [--session NAME] [--session-id ID] [--name INDEX] --group G [--docs PATH --include GLOB ... --label L]
 fleetwatch index refresh [NAME | --all] [--full] [--no-tag] [--tag-budget N] [--build]
 fleetwatch index build NAME                     rebuild the search engine's index only
 fleetwatch index file PATH [--index NAME]       index a just-filed document now
@@ -475,6 +477,8 @@ there. In a command, `{python}` stands for the Python running the refresh, and
 `{python} -P -m fleetwatch index build NAME` rebuilds the search index. `index migrate` rewrites an
 old entry to that form and warns, by file and line, about any script that imports from the old
 shared engine folder, which is not copied.
+
+`--path` keeps only results whose file path contains the text. `--no-rerank` skips the reranking stage. `--expand` also searches the synonyms in `synonyms.yaml` at lower weight, and `--no-expand` turns off an `expand_by_default` setting. `--exact` stops fleetwatch correcting a word that appears nowhere in the corpus. `search eval --typos` misspells every probe to measure typo tolerance. `index add` names the index `<session>-session` unless `--name` says otherwise, and `--label` names the `--docs` folder (default `docs`).
 
 Without `--index`, `search` and `index refresh|file` use the calling session's own index, found from
 process ancestry the way `write-status` finds the session. `index add` registers the calling session
@@ -535,6 +539,8 @@ owner_name = "Your Name"      # optional
 `timezone` sets the zone every date is shown in. A date-only `due` (`2026-10-28`) means midnight at the start of that day in this zone. A bad value falls back to the system zone.
 
 The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
+
+**Other environment variables.** `FLEETWATCH_GH_CMD` replaces the `gh` command that watches run (it is split like a shell command line), and the scheduled watch job carries it along with `GH_CONFIG_DIR`. `FLEETWATCH_LAUNCH_AGENTS_DIR` and `FLEETWATCH_SYSTEMD_USER_DIR` move where `schedule install` writes its launchd and systemd files, which is useful for trying an install without touching your own. A scheduled job carries the folder overrides that are set when you install it (`FLEETWATCH_CONFIG_DIR`, `FLEETWATCH_STATUS_DIR`, `FLEETWATCH_SESSIONS_DIR`, `FLEETWATCH_PROJECTS_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`), so install it from the shell whose settings you want it to use.
 
 ## Upgrading from the earlier name
 
