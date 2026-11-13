@@ -240,6 +240,9 @@ def run(argv, stdin, out, err, paths=None, ppids=None, start_pid=None, now=None)
         if args.dry_run:
             print(json.dumps(doc, indent=1, ensure_ascii=False), file=out)
             return 0
+        if "cadence_min" in payload and "working_on" not in payload:
+            print("fleetwatch write-status: note: a looping session should write working_on every firing",
+                  file=err)
         dropped = dropped_watches(target, doc)
         target, _ = write_document(paths["status"], doc)
         print("wrote %s" % target, file=out)

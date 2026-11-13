@@ -73,7 +73,8 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
      with the day to look again.
 
    Write it whenever your questions change, and at the end of any turn that leaves
-   work running. Only named sessions report: subagents, worktree lanes and
+   work running. A session on a loop or schedule writes its status on every
+   firing, not only when something changes. Only named sessions report: subagents, worktree lanes and
    headless `claude -p` runs do not write it (their session does), and an
    unnamed session names itself first with `/rename`.
 
@@ -383,6 +384,8 @@ The board reads four inputs and never changes any of them except the status fold
 ```
 
 `kind` is one of `deadline`, `deploy`, `meeting`, `milestone`, `todo` and `checkin`; anything else counts as `milestone`. `checkin` is a date to look at a task again when its real date is unknown. It behaves like `todo` everywhere (the timeline, Your to-dos) and reads `Check-in overdue` and `Check in today` on Needs you. Undated tasks need a date, so give every task of yours a `due`, or a `checkin` date when the real one is unknown.
+
+**`cadence_min` is a promise.** A session that declares it commits to writing its status at least that often. A session on a loop or a schedule writes on every firing, even when nothing changed, with a current `working_on` and its open questions and to-dos carried forward. Put the write at the end of each firing, and at the start too when a firing runs long. When the newest `updated` is older than 1.5 times `cadence_min`, the board shows the session as quiet: its row reads `quiet, expected every 30 min` in yellow (for a cadence of 30), it moves to the Gone quiet group on the Sessions tab, and the header counts it under `quiet`. A write brings it back at once. A session with no `cadence_min` is never marked quiet. The same window decides when a watch's owner counts as away (see Watches). `write-status` prints a note, and still writes, when a payload sets `cadence_min` without `working_on`.
 
 Only `session` and `updated` are required. `sessionId` is optional and stamped by `fleetwatch write-status`.
 

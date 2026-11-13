@@ -65,6 +65,16 @@ class RefusalReachesTheCaller(Tree):
         self.assertIn("did you mean due?", err)
         self.assertEqual(os.listdir(self.paths["status"]), [])
 
+    def test_cadence_without_working_on_notes_but_still_writes(self):
+        self.reg("My Session", "sid-9", pid=300)
+        code, _out, err = self.run_ws([], '{"cadence_min": 30}')
+        self.assertEqual(code, 0)
+        self.assertIn("a looping session should write working_on every firing", err)
+        self.assertEqual(len(os.listdir(self.paths["status"])), 1)
+        code, _out, err = self.run_ws([], '{"cadence_min": 30, "working_on": "x"}')
+        self.assertEqual(code, 0)
+        self.assertNotIn("looping", err)
+
 
 class HelperSessionsAreRefused(Tree):
     """Helper sessions (worktree lanes, headless runs, unnamed sessions) do not write status."""
