@@ -106,9 +106,13 @@ class HelperSessionsAreRefused(Tree):
         code, out, err = self.run_ws([])
         self.assertEqual(code, 0, err)
 
-    def test_print_path_and_dry_run_are_not_refused(self):
+    def test_print_path_is_not_refused(self):
         self.reg("wt-x", "sid-h", pid=300)
         self.assertEqual(self.run_ws(["--print-path"])[0], 0)
+
+    def test_dry_run_is_refused_for_a_helper(self):
+        self.reg("wt-x", "sid-h", pid=300)
+        self.assertEqual(self.run_ws(["--dry-run"])[0], 3)
 
 
 if __name__ == "__main__":
