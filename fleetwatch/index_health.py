@@ -49,9 +49,14 @@ class Health:
     owner: str = ""                # the registry's owner_session name ("" when none is recorded)
     owner_id: str = ""             # the registry's owner_session_id
     refresh_state: str = ""        # "refreshing" (its lock is fresh) or "waiting" (stale, a run is in progress)
+    covered: float = None          # epoch seconds the last completed `refresh --all` run ended, when it finished this index
 
     def age(self, now):
-        return None if self.finished is None else max(now - self.finished, 0)
+        """Seconds since the index was last known current: its own last refresh, or the end of the last
+        completed `refresh --all` run that finished it, whichever is later."""
+        if self.finished is None:
+            return None
+        return max(now - max(self.finished, self.covered or 0), 0)
 
     def is_stale(self, now):
         age = self.age(now)
@@ -210,7 +215,32 @@ def _lock_age(root, name):
     return None if mtime is None else max(time.time() - mtime / 1e9, 0)
 
 
-def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False):
+RUN_MARKER = os.path.join("logs", "refresh_run.json")
+
+
+@dataclass(frozen=True)
+class Run:
+    """The last `refresh --all` run, from the marker the refresh writes: times and names only."""
+    started: float
+    ended: float = None            # None while the run is going (or when it died)
+    finished: tuple = ()           # the index names the run finished
+    live: bool = False             # still going: no end yet and the marker was written within the lock window
+
+
+def _run_marker(root, lock_stale_s):
+    path = os.path.join(root, RUN_MARKER)
+    try:
+        info = json.loads(Path(path).read_text(encoding="utf-8"))
+        started = float(info["started"])
+        ended = None if info.get("ended") is None else float(info["ended"])
+        names = tuple(n for n in (info.get("finished") or ()) if isinstance(n, str))
+        touched = os.stat(path).st_mtime
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return Run(started, ended, names, ended is None and time.time() - touched < lock_stale_s)
+
+
+def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False, run=None):
     protection, refusal = _protection(mod, name, entry, cache)
     path = os.path.join(root, name, "state", "last_run.json")
     state, reason, finished, exchanges = "never", "", None, None
@@ -232,13 +262,16 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False)
     lock = _lock_age(root, name)
     refresh_state = "refreshing" if lock is not None and lock < mod.LOCK_STALE_S else ""
     stale_after = interval_s * STALE_FACTOR if scheduled else NO_SCHEDULE_STALE_S
-    if not refresh_state and run_active and state != "never" and finished is not None \
-            and time.time() - finished > stale_after:
+    # A run that finished this index vouches for it until it ended; a run that skipped it does not.
+    covered = run.ended if run is not None and run.ended is not None and name in run.finished else None
+    current = max(finished or 0, covered or 0) or None
+    if not refresh_state and run_active and state != "never" and current is not None \
+            and time.time() - current > stale_after:
         refresh_state = "waiting"
     return Health(data.clean(name), data.clean(entry.get("group") or "?"), kind, state, reason, finished,
                   stale_after, protection, refusal, exchanges, files, scheduled,
                   data.clean(str(entry.get("owner_session") or "")), data.clean(str(entry.get("owner_session_id") or "")),
-                  refresh_state)
+                  refresh_state, covered)
 
 
 def load(reg=None, root=None, scheduled=None, cache=None):
@@ -271,8 +304,9 @@ def load(reg=None, root=None, scheduled=None, cache=None):
     # A scheduled `refresh --all` holds one index's lock at a time, so a fresh lock anywhere means a run is
     # in progress and an index it has not reached yet is waiting, not stale.
     ages = [_lock_age(str(root), n) for n in names]
-    run_active = any(a is not None and a < mod.LOCK_STALE_S for a in ages)
-    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache, run_active)
+    run = _run_marker(str(root), mod.LOCK_STALE_S)
+    run_active = any(a is not None and a < mod.LOCK_STALE_S for a in ages) or (run is not None and run.live)
+    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache, run_active, run)
             for name, entry in sorted((reg.get("indexes") or {}).items())]
     return Result(rows, "" if rows else NO_INDEXES)
 

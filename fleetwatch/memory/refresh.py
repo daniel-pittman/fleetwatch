@@ -916,16 +916,49 @@ def _main(argv):
     names = selected(reg, opts.index)
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
     failed = []
+    t0, done = time.time(), []
+    mark = not opts.index
+    if mark:
+        write_run_marker(t0, None, done)
     for name in names:
         if run_one(reg, name, opts):
             record_streak(name, None)
+            if refreshed_since(name, t0):
+                done.append(name)
         else:
             failed.append(name)
             record_streak(name, last_error(name))
+        if mark:
+            write_run_marker(t0, None, done)
+    if mark:
+        write_run_marker(t0, time.time(), done)
     print("=== run finished %s: %d ok, %d failed%s" % (
         now_iso(), len(names) - len(failed), len(failed),
         " (%s)" % ", ".join(failed) if failed else ""), flush=True)
     sys.exit(0 if not failed else 1)
+
+
+def refreshed_since(name, t0):
+    """Whether the index's last run succeeded at or after t0 (a refresh skipped for a held lock did not)."""
+    try:
+        info = json.loads((ROOT / name / "state" / "last_run.json").read_text())
+        return bool(info.get("ok")) and datetime.fromisoformat(str(info["finished"])).timestamp() >= int(t0)
+    except (OSError, ValueError, KeyError, AttributeError):
+        return False
+
+
+def write_run_marker(started, ended, finished):
+    """logs/refresh_run.json: when the last `refresh --all` run started and ended (None while it runs)
+    and the index names it finished. Times and names only. The board reads it to tell a long run
+    in progress from a stopped schedule. Written atomically, so a reader never sees half a file."""
+    path = ROOT / "logs" / "refresh_run.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(dict(started=started, ended=ended, finished=list(finished)), indent=1))
+        os.replace(tmp, path)
+    except OSError:
+        pass
 
 
 # Failures are appended to logs/failures.log, one line each with the index's
