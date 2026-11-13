@@ -196,6 +196,18 @@ class Limits(unittest.TestCase):
         n.tick([item("stuck", "S%d" % i) for i in range(8)], T0 + 20)
         self.assertEqual(len(b.sent), 5)          # the summarised ones are not announced again
 
+    def test_due_today_and_overdue_are_announced_apart(self):
+        n, b = seeded(show_text=True)
+        n.tick([item("due", "A", key=("today", "h1", "d"), text="ship it", variant="today"),
+                item("due", "A", key=("overdue", "h2"), text="late one", variant="overdue")], T0)
+        self.assertEqual(sorted(texts(b)), ["A has an item due today: ship it",
+                                            "A has an overdue item: late one"])
+
+    def test_overflow_summary_does_not_call_indexes_sessions(self):
+        n, b = seeded()
+        n.tick([item("stuck", "S%d" % i) for i in range(5)] + [item("index", "I%d" % i) for i in range(3)], T0)
+        self.assertEqual(texts(b)[-1], "4 more need you (1 session, 3 indexes)")
+
     def test_a_full_minute_holds_new_items_until_it_clears(self):
         n, b = seeded()
         n.tick([item("stuck", "S%d" % i) for i in range(5)], T0)
@@ -625,7 +637,7 @@ class Process(unittest.TestCase):
         self.assertIn("Billing API is stuck on a prompt", out.stdout)
         self.assertIn("Checkout Flow has 2 new questions", out.stdout)
         self.assertNotIn("second approver", out.stdout)
-        self.assertIn("more sessions need you", out.stdout)
+        self.assertIn("6 more need you (3 sessions, 3 indexes)", out.stdout)
 
     def test_test_flag_uses_the_picked_backend(self):
         calls = []

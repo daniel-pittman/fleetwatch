@@ -136,6 +136,11 @@ class Item:
     variant: str = ""       # a due item's "today" or "overdue"
 
 
+def _gkind(item):
+    """The announcement group of an item: a due item is grouped by whether it is due today or overdue."""
+    return "due:" + item.variant if item.kind == "due" and item.variant else item.kind
+
+
 def _hash(text):
     return hashlib.sha1(str(text).encode("utf-8", "replace")).hexdigest()[:12]
 
@@ -339,9 +344,9 @@ class Notifier:
         sent = [t for t in st.get("sent", []) if now - t < 60]
         groups = {}
         for i in fresh:
-            groups.setdefault((i.name, i.kind), []).append(i)
+            groups.setdefault((i.name, _gkind(i)), []).append(i)
         groups = {k: v for k, v in groups.items() if now - last.get(k, -1e12) >= SESSION_LIMIT_S}
-        order = sorted(groups.items(), key=lambda kv: KINDS.index(kv[0][1]))
+        order = sorted(groups.items(), key=lambda kv: KINDS.index(kv[0][1].split(":")[0]))
         if in_quiet(cfg.quiet_hours, now, self.tz):
             if order:
                 st["held"] = True
@@ -408,14 +413,17 @@ class Notifier:
         return Message(TITLE, text, click_command(first))
 
     def _summary(self, groups, more):
-        names = {name for (name, _kind), _m in groups}
-        indexes_only = all(kind == "index" for (_n, kind), _m in groups)
-        n = len(names)
-        subject = ("indexes need" if n != 1 else "index needs") if indexes_only else None
-        if subject:
-            return Message(TITLE, "%d %s%s you" % (n, "more " if more else "", subject))
-        word = "session needs" if n == 1 else "sessions need"
-        return Message(TITLE, "%d %s%s you" % (n, "more " if more else "", word))
+        indexes = {name for (name, kind), _m in groups if kind == "index"}
+        sessions = {name for (name, kind), _m in groups if kind != "index"}
+        total = len(indexes) + len(sessions)
+        lead = "%d %s" % (total, "more " if more else "")
+        if not sessions:
+            return Message(TITLE, "%s%s you" % (lead, "index needs" if total == 1 else "indexes need"))
+        if not indexes:
+            return Message(TITLE, "%s%s you" % (lead, "session needs" if total == 1 else "sessions need"))
+        return Message(TITLE, "%sneed you (%d session%s, %d index%s)" % (
+            lead, len(sessions), "" if len(sessions) == 1 else "s",
+            len(indexes), "" if len(indexes) == 1 else "es"))
 
 
 # ---------------------------------------------------------------- state file and the loop
