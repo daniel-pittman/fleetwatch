@@ -20,11 +20,14 @@ def command():
     return [sys.executable, "-P", "-m", "fleetwatch", "notify"]
 
 
+def _carried():
+    """The folder overrides set at install time, the same set the watch job carries."""
+    return {k: os.environ[k] for k in schedule.PASSED if os.environ.get(k)}
+
+
 def plist_dict(log_dir):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
-    for key in ("FLEETWATCH_CONFIG_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "FLEETWATCH_PROJECTS_DIR", "PYTHONPATH"):
-        if os.environ.get(key):
-            env[key] = os.environ[key]
+    env.update(_carried())
     return {
         "Label": LABEL,
         "ProgramArguments": command(),
@@ -60,12 +63,14 @@ def install(out=None):
         print("to start it: launchctl bootstrap gui/$(id -u) %s" % shlex.quote(str(path)), file=out)
         return 0
     path = _unit_path()
+    env_lines = "".join('Environment="%s=%s"\n' % (k, v.replace("%", "%%").replace('"', '\\"'))
+                        for k, v in _carried().items())
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            "[Unit]\nDescription=fleetwatch desktop notifications\n\n[Service]\nExecStart=%s\n"
+            "[Unit]\nDescription=fleetwatch desktop notifications\n\n[Service]\n%sExecStart=%s\n"
             "Restart=on-failure\nRestartSec=30\nNice=5\n\n[Install]\nWantedBy=default.target\n"
-            % " ".join(shlex.quote(a) for a in command()))
+            % (env_lines, " ".join(shlex.quote(a) for a in command())))
     except OSError as e:
         print("could not write a systemd service (%s)" % e, file=out)
         return 1

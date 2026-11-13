@@ -674,6 +674,19 @@ class Schedule(unittest.TestCase):
         self.assertIn("ThrottleInterval", d)
         self.assertTrue(d["StandardErrorPath"].startswith(self.tmp.name))
 
+    def test_job_carries_the_folder_overrides(self):
+        over = {"FLEETWATCH_STATUS_DIR": "/x/status", "FLEETWATCH_SESSIONS_DIR": "/x/sessions"}
+        with mock.patch.dict(os.environ, over):
+            env = notify_schedule.plist_dict(self.tmp.name)["EnvironmentVariables"]
+            for k, v in over.items():
+                self.assertEqual(env[k], v)
+            out = io.StringIO()
+            with mock.patch.object(sys, "platform", "linux"):
+                notify_schedule.main(["install"], out)
+            unit = (Path(self.tmp.name) / "systemd" / "fleetwatch-notify.service").read_text()
+            for k, v in over.items():
+                self.assertIn("Environment=%s=%s" % (k, v), unit.replace('"', ""))
+
     def test_install_writes_the_plist_and_prints_the_start_command(self):
         out = io.StringIO()
         with mock.patch.object(sys, "platform", "darwin"):
