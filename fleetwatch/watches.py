@@ -777,7 +777,10 @@ def _error_of(ws):
     err = ws.get("error")
     if not err:
         return None
-    return err if isinstance(err, str) and ERROR_TEXT.fullmatch(err) else "lookup failed"
+    if not (isinstance(err, str) and ERROR_TEXT.fullmatch(err)):
+        return "lookup failed"
+    # a lookup with no answer is kept under "retrying"; one under "error" is from an older run, not news
+    return None if GhError(err[len("lookup failed ("):-1]).scope == "retry" else err
 
 
 RUN_KEY = "watch-run"

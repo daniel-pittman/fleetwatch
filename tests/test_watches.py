@@ -1032,6 +1032,18 @@ class RunLimitTests(unittest.TestCase):
         self.assertEqual([r.key for r in watches.board_rows(NOW + 5400)], ["watch:%s:%s" % (SID, REPO)])
         self.assertNotIn("retrying", self.w.watch())
 
+    def test_a_stored_timeout_from_an_older_run_is_not_a_row(self):
+        self.w.session(watch_list=[{"kind": "external_activity", "repo": REPO}])
+        self.w.routes(self.good_routes())
+        self.w.run()
+        doc = self.w.state()
+        doc["watches"]["external_activity:" + REPO]["error"] = "lookup failed (timed out)"
+        watches.save_state(doc)
+        self.assertEqual([r.error for r in watches.board_rows(NOW) if r.error], [])
+        doc["watches"]["external_activity:" + REPO]["error"] = "lookup failed (HTTP 404)"
+        watches.save_state(doc)
+        self.assertEqual([r.error for r in watches.board_rows(NOW) if r.error], ["lookup failed (HTTP 404)"])
+
     def test_a_connection_error_is_named_without_gh_s_words(self):
         self.w.session(watch_list=[{"kind": "external_activity", "repo": REPO}])
         self.w.routes({API + "/issues": {"__neterr__": 1}})
