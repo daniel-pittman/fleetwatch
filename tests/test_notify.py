@@ -445,6 +445,15 @@ class Observe(unittest.TestCase):
                 items = notify.watch_items({}, T0)
         self.assertEqual([(i.kind, i.name, i.text) for i in items], [("watch", "Search Tuning", "CI red")])
 
+    def test_a_problem_with_the_watch_runs_has_no_session_to_click_to(self):
+        fake = mock.Mock()
+        fake.flags.return_value = [("watch-run:x", "", "watches could not reach GitHub (timed out) for 2 h")]
+        with mock.patch.dict(sys.modules, {"fleetwatch.watches": fake}):
+            with mock.patch("fleetwatch.watches", fake, create=True):
+                items = notify.watch_items({}, T0)
+        self.assertEqual([(i.name, i.variant) for i in items], [("Watches", "run")])
+        self.assertIsNone(notify.click_command(items[0]))
+
     def test_watch_hook_survives_a_broken_module(self):
         fake = mock.Mock()
         fake.flags.side_effect = RuntimeError("x")

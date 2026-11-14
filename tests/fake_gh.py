@@ -3,7 +3,8 @@ line per call (the endpoint as asked for, query included).
 
 The fixture maps an endpoint path (no query) to the body to print. A key "PATH page=N" answers page N; any
 other page past the first is an empty list. A body of {"__status__": 403} fails the call the way gh does,
-with an HTTP code on stderr; {"__sleep__": 5} sleeps first; {"__exit__": 4} exits 4 as a logged-out gh does; {"__raw__": "text"} prints text as is.
+with an HTTP code on stderr; {"__sleep__": 5} sleeps first; {"__exit__": 4} exits 4 as a logged-out gh does; {"__neterr__": 1} fails the way gh does when the
+connection drops; {"__raw__": "text"} prints text as is.
 """
 import json
 import os
@@ -37,6 +38,10 @@ def main(argv):
     if isinstance(body, dict) and "__exit__" in body:
         print("CANARY-STDERR to get started with GitHub CLI, please run: gh auth login", file=sys.stderr)
         return body["__exit__"]
+    if isinstance(body, dict) and "__neterr__" in body:
+        print('Get "https://api.github.com/%s": read tcp 10.0.0.2:51629->192.0.2.5:443: read: connection reset '
+              'by peer CANARY-STDERR' % path, file=sys.stderr)
+        return 1
     if isinstance(body, dict) and "__status__" in body:
         print("gh: CANARY-STDERR refused (HTTP %d)" % body["__status__"], file=sys.stderr)
         return 1

@@ -123,9 +123,10 @@ class World:
     def routes(self, routes):
         self.fixture.write_text(json.dumps(routes))
 
-    def run(self, now=NOW):
+    def run(self, now=NOW, clock=None):
         out = io.StringIO()
-        code = watches.run(self.paths, now=now, out=out, parked_path=self.parked)
+        kw = {"clock": clock} if clock else {}
+        code = watches.run(self.paths, now=now, out=out, parked_path=self.parked, **kw)
         return code, out.getvalue()
 
     def state(self, sid=SID):
@@ -608,22 +609,32 @@ class ErrorTests(unittest.TestCase):
             self.w.run()
             self.assertEqual(self.w.watch()["error"], want)
 
-    def test_a_logged_out_gh_says_so(self):
+    def test_a_logged_out_gh_is_one_run_row_not_a_watch_error(self):
         self.w.routes({API + "/issues": {"__exit__": 4}})
         self.w.run()
-        self.assertEqual(self.w.watch()["error"], "lookup failed (gh not logged in)")
-        self.assertIn("gh not logged in", board_text(watches.board_rows(NOW)))
+        self.assertIsNone(self.w.watch()["error"])
+        self.assertEqual(watches.load_run()["outcome"], "gh")
+        rows = watches.board_rows(NOW)
+        self.assertEqual([r.key for r in rows], [watches.RUN_KEY])
+        self.assertIn("Watch runs · watch error: watches cannot run: gh not logged in", board_text(rows))
 
-    def test_a_missing_gh_is_an_error(self):
+    def test_a_missing_gh_is_one_run_row(self):
         with mock.patch.dict(os.environ, {"FLEETWATCH_GH_CMD": "/nonexistent/gh-nowhere"}):
             self.w.run()
-        self.assertEqual(self.w.watch()["error"], "lookup failed (gh not found)")
+        self.assertIsNone(self.w.watch()["error"])
+        self.assertIn("gh not found", board_text(watches.board_rows(NOW)))
 
-    def test_a_slow_call_times_out(self):
+    def test_a_slow_call_is_retried_and_shown_only_once_it_lasts_an_hour(self):
         self.w.routes({API + "/issues": {"__sleep__": 3}})
         with mock.patch.object(watches, "GH_TIMEOUT_S", 0.5):
             self.w.run()
-        self.assertEqual(self.w.watch()["error"], "lookup failed (timed out)")
+            st = self.w.watch()
+            self.assertIsNone(st["error"])
+            self.assertEqual(st["retrying"], "lookup failed (timed out)")
+            self.assertEqual(watches.board_rows(NOW), [])
+            self.w.run(now=NOW + 3600)
+        self.assertEqual(watches.load_run()["outcome"], "ok")     # one watch: not enough to call GitHub down
+        self.assertIn("widget · watch error: lookup failed (timed out)", board_text(watches.board_rows(NOW + 3600)))
 
     def test_a_success_clears_the_error(self):
         self.w.routes({API + "/issues": {"__status__": 500}})
@@ -836,8 +847,10 @@ class NotifierTests(unittest.TestCase):
         self.w.run()
         self.assertEqual([t for _k, _n, t in watches.flags(self.w.paths, NOW)],
                          ["widget: watch error: lookup failed (HTTP 403)"])
-        self.assertIn("watch error: not checked for 2 h",
-                      " ".join(t for _k, _n, t in watches.flags(self.w.paths, NOW + 2 * 3600)))
+        later = watches.flags(self.w.paths, NOW + 2 * 3600)
+        self.assertIn(("", "not checked for 2 h; is the schedule running? see fleetwatch watch schedule status"),
+                      [(n, t) for _k, n, t in later])
+        self.assertEqual(sum(1 for k, _n, _t in later if k.startswith("watch-stale")), 0)
 
 
 class BoardCase(unittest.TestCase):
@@ -947,6 +960,12 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(plist["StartInterval"], 900)
         self.assertEqual(plist["ProgramArguments"][-3:], ["fleetwatch", "watch", "run"])
         self.assertTrue(plist["StandardOutPath"].endswith("watch-run.log"))
+        # every lookup is a network call, which macOS throttles hard in a Background job
+        self.assertEqual(plist["ProcessType"], "Standard")
+        self.assertNotIn("LowPriorityIO", plist)
+        self.assertEqual(plist["Nice"], 10)
+        from fleetwatch import schedule
+        self.assertEqual(schedule.plist_dict(self.base, schedule.INDEX)["ProcessType"], "Background")
         self.assertIn("not loaded", out)
         self.assertFalse((self.dir / "local.fleetwatch.index-refresh.plist").exists())
         self.assertIn(": installed", self.run_cli("status", "darwin")[1])
@@ -957,8 +976,100 @@ class ScheduleTests(unittest.TestCase):
         code, out = self.run_cli("install", "linux")
         timer = (self.base / "systemd" / "fleetwatch-watch-run.timer").read_text()
         self.assertIn("OnUnitActiveSec=15min", timer)
-        self.assertIn("watch run", (self.base / "systemd" / "fleetwatch-watch-run.service").read_text())
+        service = (self.base / "systemd" / "fleetwatch-watch-run.service").read_text()
+        self.assertIn("watch run", service)
+        self.assertNotIn("IOSchedulingClass", service)
         self.assertIn("*/15 * * * *", out)
+
+
+class RunLimitTests(unittest.TestCase):
+    """A run that cannot reach GitHub, or runs long, stops early, says so once, and loses nothing."""
+
+    REPOS = [REPO, "example-org/a", "example-org/b", "example-org/c"]
+
+    def setUp(self):
+        self.w = World(self)
+        self.w.session(watch_list=[{"kind": "external_activity", "repo": r} for r in self.REPOS])
+
+    def good_routes(self):
+        r = {}
+        for repo in self.REPOS:
+            r["repos/%s/issues" % repo] = [issue(12, "outsider", 600)] if repo == REPO else []
+            r["repos/%s/issues/comments" % repo] = []
+            r["repos/%s/collaborators/outsider/permission" % repo] = perm("read")
+        return r
+
+    def test_dropped_connections_stop_the_run_and_make_one_row(self):
+        self.w.routes(self.good_routes())
+        self.w.run()
+        self.assertEqual(self.w.flags(), [("issue", 12)])
+        self.w.routes({"repos/%s/issues" % r: {"__neterr__": 1} for r in self.REPOS})
+        self.w.clear_log()
+        _code, out = self.w.run(now=NOW + 900)
+        self.assertEqual(len(self.w.calls()), watches.UNREACHABLE_AFTER)    # the fourth repo is not tried
+        rec = watches.load_run()
+        self.assertEqual((rec["outcome"], rec["reason"], rec["left"]), ("unreachable", "network error", 1))
+        self.assertIn("GitHub unreachable (network error), 1 left", out)
+        self.assertNotIn("CANARY", out + json.dumps(self.w.state()) + json.dumps(rec))
+        self.assertEqual(self.w.flags(), [("issue", 12)])                    # what was found stays
+        rows = watches.board_rows(NOW + 900)
+        self.assertEqual([r.key for r in rows], [watches.RUN_KEY, "watch:%s:%s" % (SID, REPO)])
+        self.assertIn("watches could not reach GitHub (network error) for 0s; retrying every 15 minutes",
+                      board_text(rows))
+        # the notifier hears of it only once it has lasted an hour, and then as one item
+        self.assertEqual([k for k, _n, _t in watches.flags(self.w.paths, NOW + 900)
+                          if k.startswith(watches.RUN_KEY)], [])
+        self.w.run(now=NOW + 1800)
+        self.w.run(now=NOW + 4500)
+        self.assertEqual(watches.load_run()["since"], watches.iso(NOW + 900))
+        later = watches.flags(self.w.paths, NOW + 4500)
+        self.assertEqual([n for k, n, _t in later if k.startswith(watches.RUN_KEY)], [""])
+        self.assertFalse(any(k.startswith(("watch-err", "watch-stale")) for k, _n, _t in later))
+        # GitHub back: the row goes, the flags are as they were
+        self.w.routes(self.good_routes())
+        self.w.run(now=NOW + 5400)
+        self.assertEqual(watches.load_run()["outcome"], "ok")
+        self.assertEqual([r.key for r in watches.board_rows(NOW + 5400)], ["watch:%s:%s" % (SID, REPO)])
+        self.assertNotIn("retrying", self.w.watch())
+
+    def test_a_connection_error_is_named_without_gh_s_words(self):
+        self.w.session(watch_list=[{"kind": "external_activity", "repo": REPO}])
+        self.w.routes({API + "/issues": {"__neterr__": 1}})
+        self.w.run()
+        self.assertEqual(self.w.watch()["retrying"], "lookup failed (network error)")
+
+    def test_the_time_limit_stops_the_run_and_the_next_run_takes_the_rest_first(self):
+        self.w.session("Marlow", SID, watch_list=[{"kind": "external_activity", "repo": REPO}])
+        self.w.session("Tamsin", OTHER_SID, watch_list=[{"kind": "external_activity", "repo": "example-org/a"}])
+        self.w.routes(self.good_routes())
+        self.w.run()
+        before = self.w.state(OTHER_SID)["checked"]
+        ticks = iter([0, 0, watches.RUN_BUDGET_S + 1] + [watches.RUN_BUDGET_S + 2] * 10)
+        _code, out = self.w.run(now=NOW + 900, clock=lambda: next(ticks))
+        self.assertIn("stopped at the time limit, 1 left for the next run", out)
+        # both were checked at NOW; the status-file order put one first, and the other waits
+        first, second = (SID, OTHER_SID) if self.w.state(SID)["checked"] == watches.iso(NOW + 900) \
+            else (OTHER_SID, SID)
+        self.assertEqual(self.w.state(second)["checked"], before)
+        self.w.clear_log()
+        ticks = iter([0, 0] + [watches.RUN_BUDGET_S + 1] * 10)
+        self.w.run(now=NOW + 1800, clock=lambda: next(ticks))
+        self.assertEqual(self.w.state(second)["checked"], watches.iso(NOW + 1800))
+        self.assertEqual(self.w.state(first)["checked"], watches.iso(NOW + 900))
+
+    def test_the_log_brackets_each_run(self):
+        self.w.routes(self.good_routes())
+        _code, out = self.w.run()
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("watch run started "))
+        self.assertRegex(lines[-1], r"^watch run ended \d{4}-\d\d-\d\d \d\d:\d\d:\d\d: 4 watches checked$")
+
+    def test_a_run_that_never_finishes_is_one_row(self):
+        self.w.routes(self.good_routes())
+        self.w.run()
+        rows = watches.board_rows(NOW + 2 * 3600)
+        self.assertEqual([r.key for r in rows if not r.key.startswith("watch:")], [watches.RUN_KEY])
+        self.assertIn("not checked for 2 h", board_text(rows))
 
 
 class PruneTests(unittest.TestCase):

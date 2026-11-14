@@ -662,6 +662,13 @@ def watch_group(rows, now, held=()):
         return None
     kids = []
     for w in rows:
+        if not w.sid:
+            # the runs themselves: no owner session to go to
+            head = [("Watch runs", "bold"), (" · ", DIM), ("watch error: " + (w.error or ""), RED)]
+            body = [(Text("  "), Text("one problem for every session's watches; the log is watch-run.log "
+                                      "in fleetwatch's state folder"))]
+            kids.append(Node(w.key, _row_text(head), body, hang=2))
+            continue
         who = "running" if w.sid in held else "stopped" if w.owner_state == "active" else w.owner_state
         head = [(w.owner, "bold"), (" (%s)" % who, "")]
         if w.repo:

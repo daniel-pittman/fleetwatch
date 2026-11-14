@@ -133,7 +133,7 @@ class Item:
     name: str               # the session, or the index, it concerns
     sid: str = ""           # the session ID, for the click
     text: str = ""
-    variant: str = ""       # a due item's "today" or "overdue"
+    variant: str = ""       # a due item's "today" or "overdue"; "run" on a watch item about the runs
 
 
 def _gkind(item):
@@ -164,7 +164,9 @@ def watch_items(paths, now):
         flags = list(watches.flags(paths, now))
     except Exception:
         return []
-    return [Item("watch", ("watch", _hash(k)), data.clean(n), text=data.clean(t)) for k, n, t in flags]
+    # an item with no owner is about the watch runs themselves (watches.RUN_KEY)
+    return [Item("watch", ("watch", _hash(k)), data.clean(n) or "Watches", text=data.clean(t),
+                 variant="" if n else "run") for k, n, t in flags]
 
 
 def observe(paths, now, ppids=None):
@@ -287,11 +289,11 @@ def pick_backend(platform=None, which=shutil.which, runner=subprocess.run, out=N
 # ---------------------------------------------------------------- the transitions
 
 def click_command(item):
-    """The argv that raises the item's session, or None when it has none (an index)."""
+    """The argv that raises the item's session, or None when it has none (an index, the watch runs)."""
     base = [sys.executable, "-P", "-m", "fleetwatch", "jump"]
     if item.sid:
         return base + ["--session-id", item.sid]
-    if item.kind in ("index",):
+    if item.kind in ("index",) or (item.kind == "watch" and item.variant == "run"):
         return None
     return base + ["--", item.name]
 
@@ -404,6 +406,8 @@ class Notifier:
                 else ("%s has an item due today" if n == 1 else "%s has items due today") % name
         elif first.kind == "index":
             text = "Index %s has a problem" % name
+        elif first.variant == "run":
+            text = "Watches are not running"
         else:
             text = "%s has a watch flag" % name
         if self.settings.show_text:

@@ -60,7 +60,10 @@ fleetwatch has three layers. Each one reads less than the one above it needs to 
   reads every status file, skips the sessions that are active (live, with a status newer than 1.5
   times their cadence), and checks the rest through read-only `gh api` calls. It keeps one state
   file per owner session under fleetwatch's state folder, holding item numbers, states, counts and
-  times, never a title, body, branch, check name or login. The board reads those files for its
+  times, never a title, body, branch, check name or login. A run takes the least recently checked
+  sessions first, stops starting lookups after 10 minutes, and stops at once when gh cannot run or
+  three lookups in a row get no answer; it records the outcome in `watches/run.json`, so a problem
+  that hits every watch is one row on the board. The board reads those files for its
   Watches section on Needs you and never calls GitHub; a session that resumes reads its own flags
   with `fleetwatch watch report` and clears them with `fleetwatch watch ack`.
 - **A search** (`fleetwatch search`) finds the calling session's own index from process ancestry,

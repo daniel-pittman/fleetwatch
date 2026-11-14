@@ -1,6 +1,8 @@
 """`fleetwatch index schedule` and `fleetwatch watch schedule`: install|remove|status for fleetwatch's two
 background jobs. The index job runs `fleetwatch index refresh --all` every 30 minutes; the watch job runs
-`fleetwatch watch run` every 15 minutes. Both run at low priority.
+`fleetwatch watch run` every 15 minutes. Both run niced. The index job is also a macOS background job with
+low-priority I/O; the watch job is not, because macOS throttles a background job's network calls and every
+watch lookup is one.
 
 macOS: a launchd agent in ~/Library/LaunchAgents (local.fleetwatch.index-refresh, local.fleetwatch.watch-run).
 install writes the plist and prints the launchctl command; it never loads it. Elsewhere: a systemd user timer
@@ -25,12 +27,13 @@ class Job:
     interval_s: int
     what: str           # how the timer describes itself
     usage: str
+    background: bool = True   # macOS ProcessType Background and low-priority I/O; idle I/O under systemd
 
 
 INDEX = Job("local.fleetwatch.index-refresh", "fleetwatch-index-refresh", ("index", "refresh", "--all"), 1800,
             "fleetwatch index refresh", "fleetwatch index schedule")
 WATCH = Job("local.fleetwatch.watch-run", "fleetwatch-watch-run", ("watch", "run"), 900,
-            "fleetwatch watch run", "fleetwatch watch schedule")
+            "fleetwatch watch run", "fleetwatch watch schedule", background=False)
 LABEL = INDEX.label
 INTERVAL_S = INDEX.interval_s
 # Carried into the job's environment when set at install time: where fleetwatch's folders are, and for
@@ -65,14 +68,15 @@ def plist_dict(log_dir, job=INDEX):
     for key in PASSED:
         if os.environ.get(key):
             env[key] = os.environ[key]
+    throttle = {"ProcessType": "Background", "LowPriorityIO": True} if job.background else {
+        "ProcessType": "Standard"}
     return {
         "Label": job.label,
         "ProgramArguments": command(job),
         "StartInterval": job.interval_s,
         "RunAtLoad": False,
-        "ProcessType": "Background",
+        **throttle,
         "Nice": 10,
-        "LowPriorityIO": True,
         "StandardOutPath": str(Path(log_dir) / (_log_name(job) + ".log")),
         "StandardErrorPath": str(Path(log_dir) / (_log_name(job) + ".err")),
         "EnvironmentVariables": env,
@@ -105,7 +109,7 @@ def install(out=None, job=INDEX):
         service.parent.mkdir(parents=True, exist_ok=True)
         service.write_text(
             "[Unit]\nDescription=%s\n\n[Service]\nType=oneshot\n"
-            "Nice=10\nIOSchedulingClass=idle\nExecStart=%s\n" % (job.what, cmd))
+            "Nice=10\n%sExecStart=%s\n" % (job.what, "IOSchedulingClass=idle\n" if job.background else "", cmd))
         timer.write_text(
             "[Unit]\nDescription=%s every %d minutes\n\n[Timer]\n"
             "OnBootSec=5min\nOnUnitActiveSec=%dmin\n\n[Install]\nWantedBy=timers.target\n"

@@ -47,6 +47,8 @@ LOGIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}")
 ISSUE_URL = re.compile(r"/(?:issues|pulls)/(\d+)$")
 
 GH_TIMEOUT_S = 30
+RUN_BUDGET_S = 600         # a run stops starting lookups after this; the next run takes the rest first
+UNREACHABLE_AFTER = 3      # this many lookups in a row failing to connect ends the run: GitHub is unreachable
 PER_PAGE = 100
 MAX_PAGES = 3              # up to 300 items per listing per run
 MAX_PRS = 30               # per-PR lookups stop after the 30 newest open PRs
@@ -54,6 +56,9 @@ ACTIVE_FACTOR = 1.5        # a session is active while its status is newer than 
 DEFAULT_CADENCE_MIN = 30
 LOOKBACK_S = 14 * 86400    # external_activity never looks further back than this
 STALE_RUN_S = 3600         # four missed 15-minute runs: the board says the watches are not running
+# gh's own words for a request that never reached GitHub; matched, never stored
+NETWORK = re.compile(r"connection reset|connection refused|i/o timeout|TLS handshake|no such host|"
+                     r"network is unreachable|dial tcp|unexpected EOF|context deadline exceeded", re.I)
 MAX_SEEN = 2000
 TEAM = {"admin", "maintain", "write"}
 FAILED = {"failure", "cancelled", "timed_out", "startup_failure"}
@@ -213,6 +218,18 @@ class GhError(Exception):
         super().__init__(reason)
         self.reason = reason
 
+    @property
+    def scope(self):
+        """"gh": gh itself cannot run, so no lookup can; "retry": the request did not get an answer (no
+        connection, a timeout, a GitHub-side failure), so the next run tries again; "watch": GitHub answered
+        and refused or garbled this lookup."""
+        r = self.reason
+        if r in ("gh not found", "gh not logged in", "HTTP 401"):
+            return "gh"
+        if r in ("timed out", "network error", "HTTP 429") or r.startswith(("HTTP 5", "gh exited")):
+            return "retry"
+        return "watch"
+
 
 class Gh:
     """Read-only `gh api` GETs, memoised for one run so kinds that share a listing fetch it once."""
@@ -236,6 +253,8 @@ class Gh:
             m = re.search(r"\(HTTP (\d{3})\)", p.stderr or "")
             if m:
                 raise GhError("HTTP %s" % m.group(1))
+            if NETWORK.search(p.stderr or ""):
+                raise GhError("network error")
             # gh exits 4 when it has no login for the host
             raise GhError("gh not logged in" if p.returncode == 4 else "gh exited %d" % p.returncode)
         try:
@@ -488,6 +507,8 @@ def merge(ws, result, now):
     """Fold a successful check into a watch's state: dedupe against what was already raised, clear what no
     longer holds."""
     ws.update(error=None, last_checked=iso(now))
+    ws.pop("retrying", None)
+    ws.pop("failing_since", None)
     if not result.available:
         ws["available"] = False
         return 0
@@ -512,14 +533,14 @@ def merge(ws, result, now):
 
 
 def evaluate(gh, w, ws, sf, now, team):
-    """(Result, None) or (None, error text) for one watch."""
+    """(Result, None) or (None, GhError) for one watch."""
     last = data.to_epoch(ws.get("last_checked")) or 0
     # the session covered its own repos until it last wrote its status
     since = max(last, data.to_epoch(sf.get("updated")) or 0, now - LOOKBACK_S)
     try:
         return CHECKS[w["kind"]](gh, w["repo"], w, Context(now, since, team)), None
     except GhError as e:
-        return None, "lookup failed (%s)" % e.reason
+        return None, e
 
 
 def _status_files(paths, out):
@@ -540,59 +561,134 @@ def _parked(parked_path, out):
         return set()
 
 
-def run(paths=None, now=None, out=None, parked_path=None, gh=None):
-    """Evaluate the watches of every session that is not active. Prints one line per watch: counts only."""
+def run_path():
+    return os.path.join(state_dir(), "run.json")
+
+
+def load_run():
+    """The last run's record, or None before the first run."""
+    try:
+        doc = data.load_json(run_path())
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _save_run(doc):
+    config.atomic_write(run_path(), json.dumps(doc, indent=1, sort_keys=True) + "\n")
+
+
+def _say(out, text):
+    # the scheduled run's output is a file; flush each line so the log shows a run that is still going
+    print(text, file=out, flush=True)
+
+
+def _local(ts):
+    return datetime.fromtimestamp(ts).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def run(paths=None, now=None, out=None, parked_path=None, gh=None, clock=time.time):
+    """Evaluate the watches of every session that is not active, least recently checked first. Prints one
+    line per watch: counts only. Stops starting lookups after RUN_BUDGET_S, at once when gh cannot run, and
+    after UNREACHABLE_AFTER lookups in a row that got no answer; what it did not reach keeps its state and is
+    taken first next time. The outcome goes in run.json, which the board reads."""
     paths = paths or data.default_paths()
     out = out or sys.stdout
     with locked("run", block=False) as got:
         if not got:
-            print("another watch run is in progress", file=out)
+            _say(out, "another watch run is in progress")
             return 0
-        now = time.time() if now is None else now
+        t0 = clock()
+        now = t0 if now is None else now
+        prev = load_run() or {}
+        record = {"version": 1, "started": iso(now), "ended": None, "last_ended": prev.get("ended") or
+                  prev.get("last_ended"), "outcome": prev.get("outcome"), "reason": prev.get("reason"),
+                  "since": prev.get("since")}
+        _save_run(record)
+        _say(out, "watch run started %s" % _local(now))
         live, parked = live_sids(paths["sessions"]), _parked(parked_path, out)
         gh, team, declared = gh or Gh(), {}, set()
+        sessions = []
         for sf in _status_files(paths, out):
-            sid, name = sf["sessionId"], data.clean(sf["session"]).strip()
             try:
                 wl = validate(sf.get("watches") or [])
             except WatchError as e:
-                print("%s: watches ignored, %s" % (name, e), file=out)
+                _say(out, "%s: watches ignored, %s" % (data.clean(sf["session"]).strip(), e))
                 wl = []
-            if not wl:
-                continue
-            declared.add(sid)
+            if wl:
+                declared.add(sf["sessionId"])
+                sessions.append((sf, wl, load_state(sf["sessionId"])))
+        sessions.sort(key=lambda t: data.to_epoch(t[2].get("checked")) or 0)
+        outcome, reason, misses, done, left = "ok", None, 0, 0, 0
+        for sf, wl, before_doc in sessions:
+            sid, name = sf["sessionId"], data.clean(sf["session"]).strip()
             who = owner_state(sf, live, parked, now)
-            before = load_state(sid)["watches"]
-            results = {}
+            before = before_doc["watches"]
+            results, complete = {}, True
             if who == "active":
-                print("%s: active, its watches are its own" % name, file=out)
+                _say(out, "%s: active, its watches are its own" % name)
             else:
                 for w in wl:
-                    results[watch_key(w)] = evaluate(gh, w, before.get(watch_key(w)) or {}, sf, now, team)
+                    if outcome != "ok" or clock() - t0 > RUN_BUDGET_S:
+                        if outcome == "ok":
+                            outcome = "budget"
+                        complete = False
+                        left += 1
+                        continue
+                    result, err = evaluate(gh, w, before.get(watch_key(w)) or {}, sf, now, team)
+                    results[watch_key(w)] = (result, err)
+                    done += 1
+                    if err is None or err.scope == "watch":
+                        misses = 0
+                    elif err.scope == "gh":
+                        outcome, reason = "gh", err.reason
+                    else:
+                        misses += 1
+                        if misses >= UNREACHABLE_AFTER:
+                            outcome, reason = "unreachable", err.reason
             # merged into a fresh read under the lock, so an ack made while the lookups ran is kept
             with locked(sid):
                 doc = load_state(sid)
-                doc.update(session=name, owner_state=who, checked=iso(now))
+                doc.update(session=name, owner_state=who)
+                if complete:
+                    doc["checked"] = iso(now)
                 doc["watches"] = {watch_key(w): doc["watches"].get(watch_key(w)) or new_watch_state(w) for w in wl}
-                for key, (result, error) in results.items():
+                for key, (result, err) in results.items():
                     ws = doc["watches"][key]
-                    if error:
-                        ws["error"] = error
-                        print("%s · %s · watch error: %s" % (name, key, error), file=out)
-                    else:
+                    if err is None:
                         n_new = merge(ws, result, now)
                         state = "not available" if not ws["available"] else "%d open, %d new" % (len(ws["flags"]), n_new)
-                        print("%s · %s · %s" % (name, key, state), file=out)
+                        _say(out, "%s · %s · %s" % (name, key, state))
+                    elif err.scope == "gh":
+                        continue                    # the run's record says it, once
+                    elif err.scope == "watch":
+                        ws["error"] = "lookup failed (%s)" % err.reason
+                        _say(out, "%s · %s · watch error: %s" % (name, key, ws["error"]))
+                    else:
+                        # no answer: the flags stay, and the board shows it only if it lasts (see board_rows)
+                        ws["retrying"] = "lookup failed (%s)" % err.reason
+                        ws.setdefault("failing_since", iso(now))
+                        _say(out, "%s · %s · no answer, will retry: %s" % (name, key, ws["retrying"]))
                 save_state(doc)
         # a session that no longer declares watches keeps no flags on the board
         for path in sorted(glob.glob(os.path.join(glob.escape(state_dir()), "*.json"))):
             sid = os.path.basename(path)[:-5]
-            if sid not in declared and SID.fullmatch(sid):
+            if sid not in declared and SID.fullmatch(sid) and path != run_path():
                 with locked(sid):
                     doc = load_state(sid)
                     if doc["watches"]:
                         doc.update(watches={}, checked=iso(now))
                         save_state(doc)
+        ended = now + (clock() - t0)
+        problem = outcome in ("gh", "unreachable")
+        same = problem and prev.get("outcome") == outcome and prev.get("since")
+        record.update(ended=iso(ended), outcome=outcome, reason=reason, checked=done, left=left,
+                      since=(prev["since"] if same else iso(now)) if problem else None)
+        _save_run(record)
+        tail = {"ok": "", "budget": "; stopped at the time limit, %d left for the next run" % left,
+                "gh": "; stopped, gh cannot run (%s)" % reason,
+                "unreachable": "; stopped, GitHub unreachable (%s), %d left" % (reason, left)}[outcome]
+        _say(out, "watch run ended %s: %s checked%s" % (_local(ended), data.plural(done, "watch", "watches"), tail))
     return 0
 
 
@@ -633,8 +729,9 @@ def _safe_flags(ws):
     return good
 
 
-ERROR_TEXT = re.compile(r"lookup failed \((HTTP \d{3}|timed out|gh not found|gh not logged in|bad response|"
-                        r"gh exited \d+)\)")
+ERROR_TEXT = re.compile(r"lookup failed \((HTTP \d{3}|timed out|network error|gh not found|gh not logged in|"
+                        r"bad response|gh exited \d+)\)")
+REASON_TEXT = re.compile(r"HTTP \d{3}|timed out|network error|gh not found|gh not logged in|gh exited \d+")
 
 
 @dataclass
@@ -643,7 +740,7 @@ class BoardRow:
     sid: str
     owner: str
     owner_state: str
-    repo: str = None           # None on a row about the run itself
+    repo: str = None           # None on a row about a session's run or the whole run
     parts: list = field(default_factory=list)
     error: str = None
     kind: str = None
@@ -683,49 +780,108 @@ def _error_of(ws):
     return err if isinstance(err, str) and ERROR_TEXT.fullmatch(err) else "lookup failed"
 
 
+RUN_KEY = "watch-run"
+
+
+def run_problem(now):
+    """(text, since) when the watch runs as a whole are failing: gh cannot run, GitHub did not answer, or no
+    run has finished for STALE_RUN_S. None when they are fine or there is no run record yet. One problem
+    is one row, never a row per watch or per session."""
+    rec = load_run()
+    if rec is None:
+        return None
+    reason = rec.get("reason") if isinstance(rec.get("reason"), str) and REASON_TEXT.fullmatch(rec["reason"]) \
+        else "no answer"
+    since = data.to_epoch(rec.get("since"))
+    if rec.get("outcome") == "gh":
+        return "watches cannot run: %s; check gh auth status" % reason, since
+    if rec.get("outcome") == "unreachable":
+        at = " for %s" % data.human(now - since) if since is not None else ""
+        return "watches could not reach GitHub (%s)%s; retrying every 15 minutes" % (reason, at), since
+    ended = data.to_epoch(rec.get("ended") or rec.get("last_ended"))
+    started = data.to_epoch(rec.get("started"))
+    last = ended if ended is not None else started
+    if last is not None and now - last > STALE_RUN_S:
+        return ("not checked for %s; is the schedule running? see fleetwatch watch schedule status"
+                % data.human(now - last)), last
+    return None
+
+
+def _lasting_retry(ws, now):
+    """A watch whose lookups have had no answer for STALE_RUN_S while the other lookups worked."""
+    since = data.to_epoch(ws.get("failing_since"))
+    if since is None or now - since < STALE_RUN_S:
+        return None
+    err = ws.get("retrying")
+    return err if isinstance(err, str) and ERROR_TEXT.fullmatch(err) else "lookup failed"
+
+
+def _problems(now):
+    """(run problem or None, [(sid, owner, who, checked, stale, by_repo)]) with the per-session stale text
+    dropped while the whole run has a problem, since that one row already says it."""
+    problem = run_problem(now)
+    states = list(_read_states(now))
+    if problem:
+        states = [(sid, owner, who, checked, None, by_repo) for sid, owner, who, checked, _s, by_repo in states]
+    return problem, states
+
+
 def board_rows(now=None):
-    """The Watches section's rows from the state files: one per session and repo with something flagged, one
-    per watch in error, and one per session whose watches have not run for an hour. Reads only."""
+    """The Watches section's rows from the state files: one for a problem with the runs themselves, one per
+    session and repo with something flagged, one per watch GitHub refused, one per watch with no answer for
+    an hour while the rest worked, and one per session whose watches have not run for an hour. Reads only."""
     now = time.time() if now is None else now
+    problem, states = _problems(now)
     rows = []
-    for sid, owner, who, checked, stale, by_repo in _read_states(now):
+    if problem:
+        rows.append(BoardRow(RUN_KEY, "", "Watch runs", "run", error=problem[0], checked=None))
+    for sid, owner, who, checked, stale, by_repo in states:
         if stale:
             rows.append(BoardRow("watch-stale:" + sid, sid, owner, who, error=stale, checked=checked))
-        for repo, states in by_repo.items():
-            flagged = [f for ws in states for f in _safe_flags(ws)]
+        for repo, ws_list in by_repo.items():
+            flagged = [f for ws in ws_list for f in _safe_flags(ws)]
             if flagged:
                 rows.append(BoardRow("watch:%s:%s" % (sid, repo), sid, owner, who, repo, summary(flagged),
                                      checked=checked))
-            for ws in sorted(states, key=lambda w: w["kind"]):
-                if _error_of(ws):
+            for ws in sorted(ws_list, key=lambda w: w["kind"]):
+                err = _error_of(ws) or (None if problem else _lasting_retry(ws, now))
+                if err:
                     rows.append(BoardRow("watch-err:%s:%s:%s" % (sid, repo, ws["kind"]), sid, owner, who, repo,
-                                         error=_error_of(ws), kind=ws["kind"], checked=checked))
+                                         error=err, kind=ws["kind"], checked=checked))
     return rows
 
 
 def flags(paths=None, now=None):
     """(key, owner name, text) for the desktop notifier: one per owner, repo and kind of flag, one per watch
-    in error, one per session whose watches have stalled. The key holds the session id, repo, kind and the
-    numbers, so a new number is a new key and an unchanged flag keeps its key. The text is counts and
-    numbers only. paths is accepted for the notifier's interface; the state folder comes from settings."""
+    in error, one per session whose watches have stalled, and one for a problem with the runs themselves
+    (owner "", key RUN_KEY...) once GitHub has been unreachable for STALE_RUN_S, at once when gh cannot run.
+    The key holds the session id, repo, kind and the numbers, so a new number is a new key and an unchanged
+    flag keeps its key. The text is counts and numbers only. paths is accepted for the notifier's
+    interface; the state folder comes from settings."""
     now = time.time() if now is None else now
+    problem, states = _problems(now)
     out = []
-    for sid, owner, _who, _checked, stale, by_repo in _read_states(now):
+    if problem:
+        text, since = problem
+        if not text.startswith("watches could not reach") or (since is not None and now - since >= STALE_RUN_S):
+            out.append(("%s:%s" % (RUN_KEY, text.split(" (")[0].split(";")[0]), "", text))
+    for sid, owner, _who, _checked, stale, by_repo in states:
         if stale:
             out.append(("watch-stale:%s" % sid, owner, "watch error: " + stale))
-        for repo, states in by_repo.items():
+        for repo, ws_list in by_repo.items():
             short = repo.split("/", 1)[1]
-            flagged = [f for ws in states for f in _safe_flags(ws)]
+            flagged = [f for ws in ws_list for f in _safe_flags(ws)]
             for what in WHAT:
                 mine = [f for f in flagged if f["what"] == what]
                 if mine:
                     refs = sorted({_ref_text(f["ref"]) for f in mine})
                     out.append(("watch:%s:%s:%s:%s" % (sid, repo, what, ",".join(refs)), owner,
                                 "%s: %s" % (short, summary(mine)[0])))
-            for ws in sorted(states, key=lambda w: w["kind"]):
-                if _error_of(ws):
+            for ws in sorted(ws_list, key=lambda w: w["kind"]):
+                err = _error_of(ws) or (None if problem else _lasting_retry(ws, now))
+                if err:
                     out.append(("watch-err:%s:%s:%s" % (sid, repo, ws["kind"]), owner,
-                                "%s: watch error: %s" % (short, _error_of(ws))))
+                                "%s: watch error: %s" % (short, err)))
     return out
 
 
