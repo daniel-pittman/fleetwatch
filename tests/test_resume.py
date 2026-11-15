@@ -894,18 +894,19 @@ class AppTests(AppWorld):
             self.drive(body)
 
     def test_find_box_filters_and_resumes(self):
-        self.transcript("Grant Proposal", slug="-a")
-        want, _ = self.transcript("Docs Site", slug="-b")
+        self.transcript("Grant Proposal", slug="-a", mtime=3000000)
+        want, _ = self.transcript("Docs Site", slug="-b", mtime=1000000)
 
         async def body(app, pilot):
             await pilot.press("slash")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, fapp.ResumeFindScreen)
-            self.assertEqual(len(app.screen.shown), 2)
+            await self.settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen))
+            await self.settle(pilot, lambda: len(app.screen.shown) == 2)
+            self.assertEqual(app.screen.shown[0]["name"], "Grant Proposal")   # newest first, before typing
             for ch in "doc":
                 await pilot.press(ch)
-            await pilot.pause(0.1)
-            self.assertEqual([e["name"] for e in app.screen.shown], ["Docs Site"])
+            # Folders match too, by subsequence, and the random temp folder both sessions live in can
+            # spell d..o..c, so Grant Proposal may stay listed; the name match must rank first.
+            await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown][:1] == ["Docs Site"])
             await pilot.press("enter")
             await self.settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], want)

@@ -38,7 +38,8 @@ class OnNeedsTests(unittest.TestCase):
         from datetime import datetime
         now = datetime.fromtimestamp(NOW, data.LOCAL_TZ)
         past = now.replace(hour=0, minute=0, second=1).isoformat()
-        future = now.replace(hour=23, minute=59, second=0).isoformat()
+        # The last instant of today, so F is still ahead of NOW when the suite starts at 23:59.
+        future = now.replace(hour=23, minute=59, second=59, microsecond=999999).isoformat()
         view = view_of(up_env([{"what": "P", "due": past, "yours": True},
                                {"what": "F", "due": future, "yours": True}]))
         kinds = {t["what"]: t["kind"] for t in view["for_you"][0]["tasks"]}
