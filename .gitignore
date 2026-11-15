@@ -6,3 +6,5 @@ docs/*.log
 docs/*.out
 .idea/
 .claude/
+build/
+dist/

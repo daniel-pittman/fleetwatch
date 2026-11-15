@@ -575,3 +575,5 @@ The logo was generated with Google's Gemini image model (Nano Banana) and its co
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks to run, and the fictional-names-only rule for tests and docs. Report security problems privately, as described in [SECURITY.md](SECURITY.md); do not open a public issue for one.
 
 Licensed under the [MIT License](LICENSE).
+
+fleetwatch is an independent project. It is not affiliated with or endorsed by Anthropic. Claude and Claude Code are trademarks of Anthropic.

@@ -1,13 +1,45 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fleetwatch"
 version = "1.0.0"
-description = "One screen of every Claude session and what it needs from you"
+description = "A terminal dashboard for many Claude Code sessions at once: which ones need you, desktop notifications, and a searchable memory that survives compaction"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Daniel Pittman" }]
+keywords = [
+    "claude-code", "claude", "ai-agents", "agentic-coding", "llm", "dashboard",
+    "tui", "textual", "terminal", "developer-tools", "notifications",
+    "semantic-search", "session-manager", "multi-agent", "iterm2",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
 requires-python = ">=3.11"
 dependencies = ["textual==8.2.8"]
+
+[project.urls]
+Homepage = "https://github.com/daniel-pittman/fleetwatch"
+Documentation = "https://github.com/daniel-pittman/fleetwatch#readme"
+Issues = "https://github.com/daniel-pittman/fleetwatch/issues"
+Changelog = "https://github.com/daniel-pittman/fleetwatch/releases"
 
 [project.scripts]
 fleetwatch = "fleetwatch.__main__:main"
