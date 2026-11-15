@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/daniel-pittman/fleetwatch/actions/workflows/ci.yml"><img src="https://github.com/daniel-pittman/fleetwatch/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/daniel-pittman/fleetwatch/releases"><img src="https://img.shields.io/github/v/release/daniel-pittman/fleetwatch" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/daniel-pittman/fleetwatch" alt="License: MIT"></a>
   <img src="https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Fdaniel-pittman%2Ffleetwatch%2Fmain%2Fpyproject.toml" alt="Python versions">
 </p>
