@@ -899,13 +899,12 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("slash")
-            await pilot.pause(0.1)
-            self.assertIsInstance(app.screen, fapp.ResumeFindScreen)
-            self.assertEqual(len(app.screen.shown), 2)
+            await self.settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen))
+            await self.settle(pilot, lambda: len(app.screen.shown) == 2)
             for ch in "doc":
                 await pilot.press(ch)
-            await pilot.pause(0.1)
-            self.assertEqual([e["name"] for e in app.screen.shown], ["Docs Site"])
+            # The filter applies after the key events drain, which a slow runner takes longer than any fixed pause to do.
+            await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown] == ["Docs Site"])
             await pilot.press("enter")
             await self.settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], want)
