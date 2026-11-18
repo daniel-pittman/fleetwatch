@@ -84,6 +84,8 @@ def triggers(doc):
 
 FETCH_STEP = "Fetch the review comment into ./REVIEW.md"
 GATE_STEP = "Evaluate the verdict"
+DRAFT_STEP = "Fail while the PR is a draft"
+NOT_DRAFT = "!github.event.pull_request.draft && "
 
 
 def gated_job(test, name):
@@ -359,10 +361,31 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertEqual(step["env"].get("PR_AUTHOR"), "${{ github.event.pull_request.user.login }}")
         self.assertIn('[ "$ack_actor" != "$PR_AUTHOR" ]', step["run"])
 
-    def test_a_cancelled_run_posts_no_gate(self):
+    def test_a_canceled_run_posts_no_gate(self):
         cond = gated_job(self, "review-gate")["if"]
         self.assertIn("!cancelled()", cond)
         self.assertNotIn("always()", cond)
+
+    def test_a_draft_gets_no_review(self):
+        # The review costs a metered run; a draft gets one when it is marked
+        # ready (ready_for_review is a trigger, see test_triggers).
+        jobs = load("claude-code-review.yml")["jobs"]
+        for name in ("claude-review", "await-tests"):
+            if name in jobs:
+                self.assertTrue(jobs[name]["if"].startswith("${{ " + NOT_DRAFT), (name, jobs[name]["if"]))
+
+    def test_a_draft_fails_the_gate_rather_than_skipping_it(self):
+        # A skipped required check counts as passing, so a skipped gate on a draft
+        # would stand as a pass after "Ready for review" until the new run's gate
+        # reports. The gate runs on a draft and its first step fails.
+        job = gated_job(self, "review-gate")
+        self.assertNotIn("draft", job["if"])
+        first = job["steps"][0]
+        self.assertEqual(first["name"], DRAFT_STEP)
+        self.assertEqual(first["if"], "${{ github.event.pull_request.draft }}")
+        # With continue-on-error the gate would read the skipped review as
+        # INCONCLUSIVE, which a review-ack turns into a pass with no review.
+        self.assertNotIn("continue-on-error", first)
 
     def test_only_the_workflow_bot_posts_the_scan_and_test_results(self):
         # The prompt names the headings of this workflow's own sticky
@@ -812,6 +835,20 @@ class GateStepTests(unittest.TestCase):
                     "created_at": "2026-01-01T11:00:00Z"}]] if "ack_by" in env else []
         r, _ = self.run_script(step_by_name(job, GATE_STEP)["run"], dict(env, VERDICT_LINE=line), events=events)
         return r
+
+    def test_the_draft_step_fails_and_says_why(self):
+        run = step_by_name(gated_job(self, "review-gate"), DRAFT_STEP)["run"]
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        summary = os.path.join(tmp, "summary")
+        r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", run],
+                           env=dict(os.environ, GITHUB_STEP_SUMMARY=summary), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("::error title=Draft PR::", r.stdout)
+        with open(summary) as fh:
+            text = fh.read()
+        self.assertIn("a red review-gate on a draft is expected", text)
+        self.assertIn("Mark the PR ready for review", text)
 
     def test_the_fetch_takes_this_runs_review_over_a_newer_reply(self):
         review = bot_comment(1234, "## Review\n1. HIGH: SQL injection in db.py")
