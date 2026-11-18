@@ -409,10 +409,14 @@ def _failed_runs(gh, repo, sha):
 
 
 def pr_checks_failed(gh, repo, opts, ctx):
-    """A failed, cancelled or timed-out check run on an open PR's head or the default branch's latest commit."""
+    """A failed, canceled or timed-out check run on an open PR's head or the default branch's latest commit.
+    Drafts are skipped: their checks are the author's work in progress, and a gated review workflow
+    fails review-gate on every draft push by design."""
     branch = _repo_info(gh, repo)["default_branch"]
     found = []
     for p in _open_pulls(gh, repo):
+        if p.get("draft"):
+            continue
         n, sha = _number(p.get("number")), _sha((p.get("head") or {}).get("sha"))
         if _failed_runs(gh, repo, sha):
             found.append(flag("failed_check", n, "check:%d@%s" % (n, sha)))

@@ -436,6 +436,23 @@ class ChecksTests(unittest.TestCase):
         self.w.run()
         self.assertEqual(self.flags(), [("failed_check", 7), ("failed_check", 8)])
 
+    def test_a_draft_pr_is_not_flagged(self):
+        # A draft's checks are its author's work in progress, and a gated review workflow fails
+        # review-gate on every draft push by design.
+        self.w.routes(checks_routes([pull(7, SHA_A, draft=True), pull(8, SHA_B)],
+                                    {SHA_A: runs("failure"), SHA_B: runs("failure")}))
+        self.w.run()
+        self.assertEqual(self.flags(), [("failed_check", 8)])
+        self.assertFalse(any(SHA_A in c for c in self.w.calls()))
+
+    def test_a_pr_marked_ready_is_flagged_on_the_same_commit(self):
+        self.w.routes(checks_routes([pull(7, SHA_A, draft=True)], {SHA_A: runs("failure")}))
+        self.w.run()
+        self.assertEqual(self.flags(), [])
+        self.w.routes(checks_routes([pull(7, SHA_A)], {SHA_A: runs("failure")}))
+        self.w.run(now=NOW + 900)
+        self.assertEqual(self.flags(), [("failed_check", 7)])
+
     def test_the_default_branch_head_is_checked(self):
         self.w.routes(checks_routes([], {}, main_runs=runs("timed_out")))
         self.w.run()

@@ -442,7 +442,7 @@ echo '{"working_on": "triaging the widget backlog",
 | kind | flags | clears by itself when |
 |---|---|---|
 | `external_activity` | issues, PRs and comments opened since the last check by authors without write access (the collaborator permission lookup: admin, maintain or write is the team). Bots, such as dependabot and the workflow bots, are skipped. | the item is closed, or someone on the team replies after it |
-| `pr_checks_failed` | a failed, cancelled or timed-out check run on an open PR's head commit, or on the default branch's latest commit | the check passes, the PR closes, or a new push replaces the commit |
+| `pr_checks_failed` | a failed, canceled or timed-out check run on the head commit of an open PR that is not a draft, or on the default branch's latest commit | the check passes, the PR closes or becomes a draft, or a new push replaces the commit |
 | `pr_stale` | an open PR (not a draft) with no push, review or comment from a person for `days` working days (default 3, Monday to Friday), or an approval that was dismissed with no approval since | the PR gets activity or a new approval, or closes |
 | `security_advisory` | a repository security advisory in draft, or a private vulnerability report waiting in triage | the advisory is published or closed |
 
