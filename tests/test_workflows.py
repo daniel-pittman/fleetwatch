@@ -29,7 +29,7 @@ CREDENTIAL_DENIES = ("Read(//proc/**)", "Read(./.git/**)", TEMP_DENY)
 # The first line of private-checkout-comment.txt, which port.py puts above the
 # two agent checkouts of a private repository.
 PRIVATE_CHECKOUT = "# The checkout keeps its credentials on this private repository"
-ACTION_PIN = "anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed"
+ACTION_PIN = "anthropics/claude-code-action@469588f42e6b1e94cd14ad09dccfeaec772ce0fd"
 
 
 def load(name):
@@ -351,6 +351,17 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertIn('--arg run "$RUN_ID"', step["run"])
         self.assertIn('contains("/actions/runs/" + $run + ")")', step["run"])
 
+    def test_the_extractor_counts_only_the_reviews_own_findings(self):
+        # The review restates the Semgrep and CI summaries, which can carry HIGH
+        # counts for findings already in the repository.
+        job = gated_job(self, "verdict-extract")
+        prompts = [" ".join(s["with"]["prompt"].split()) for s in job["steps"]
+                   if str(s.get("uses", "")).startswith("anthropics/claude-code-action@")]
+        self.assertTrue(prompts)
+        for prompt in prompts:
+            self.assertIn("scanner counts over the whole repository, not findings of the review, so never count them", prompt)
+            self.assertIn("When the review says it has no findings, return PASS with count=0.", prompt)
+
     def test_gate_takes_pass_only_with_no_findings(self):
         run = step_by_name(gated_job(self, "review-gate"), GATE_STEP)["run"]
         self.assertIn('[ "$verdict" = "PASS" ] && [ "$count" -ne 0 ]', run)
@@ -365,6 +376,51 @@ class ClaudeWorkflowTests(unittest.TestCase):
         cond = gated_job(self, "review-gate")["if"]
         self.assertIn("!cancelled()", cond)
         self.assertNotIn("always()", cond)
+
+    def test_every_action_step_pins_the_permission_mode(self):
+        # From claude-code-action v1.0.273 a session without a mode starts in auto
+        # mode, where a safety review can approve a tool no allow rule covers.
+        for name, job_id, step in agent_steps():
+            # The CLI takes the last value of a repeated flag, so exactly one is allowed.
+            toks = shlex.split(step["with"]["claude_args"])
+            modes = [toks[i + 1] for i, tok in enumerate(toks) if tok == "--permission-mode"]
+            self.assertEqual(modes, ["default"], (name, job_id))
+            self.assertFalse([tok for tok in toks if tok.startswith("--permission-mode=")
+                              or tok == "--dangerously-skip-permissions"], (name, job_id))
+
+    @unittest.skipUnless(shutil.which("jq"), "needs jq")
+    def test_semgrep_counts_and_table_share_one_severity_mapping(self):
+        # Semgrep rules report the older names (ERROR, WARNING, INFO) or the newer
+        # ones (CRITICAL, HIGH, MEDIUM, LOW); every count and label goes through `sev`.
+        scripts = [s["run"] for job in load("claude-code-review.yml")["jobs"].values()
+                   for s in job.get("steps", []) if ".extra.severity" in str(s.get("run", ""))]
+        self.assertTrue(scripts)
+        for run in scripts:
+            self.assertNotRegex(run, r'\.extra\.severity *==')
+            self.assertNotIn('if .=="ERROR" then "HIGH"', run.replace("def sev: if", ""))
+            m = re.search(r"SEV='(def sev:[^']*)'", run)
+            self.assertTrue(m, run)
+            uses = re.findall(r"\.extra\.severity\|?(\w*)", run)
+            self.assertEqual(set(uses), {"sev"}, uses)
+            for raw, want in (("ERROR", "HIGH"), ("CRITICAL", "HIGH"), ("HIGH", "HIGH"), ("WARNING", "MEDIUM"),
+                              ("MEDIUM", "MEDIUM"), ("INFO", "LOW"), ("LOW", "LOW")):
+                got = subprocess.run(["jq", "-r", m.group(1) + " .s|sev"], input=json.dumps({"s": raw}),
+                                     capture_output=True, text=True, check=True).stdout.strip()
+                self.assertEqual(got, want, raw)
+
+    def test_every_dependabot_update_waits_out_a_cooldown(self):
+        # A compromised or mistaken release is usually caught within days; the
+        # cooldown keeps it off our branches until then. Security updates skip it.
+        path = os.path.join(WF, "..", "dependabot.yml")
+        if not os.path.exists(path):
+            self.skipTest("no dependabot.yml")
+        with open(path) as fh:
+            updates = yaml.safe_load(fh)["updates"]
+        self.assertTrue(updates)
+        for u in updates:
+            days = (u.get("cooldown") or {}).get("default-days")
+            self.assertIsInstance(days, int, u["package-ecosystem"])
+            self.assertGreaterEqual(days, 7, u["package-ecosystem"])
 
     def test_a_draft_gets_no_review(self):
         # The review costs a metered run; a draft gets one when it is marked
