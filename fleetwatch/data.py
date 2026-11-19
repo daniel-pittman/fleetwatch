@@ -571,9 +571,12 @@ def gone_row(r, name, now):
     """A Needs-you row for a session with no live row, so its due items stay visible."""
     sf = r["status"] or {}
     upd = to_epoch(sf.get("updated"))
+    # A file-only record carries no session id; the status file names it, and a
+    # group pin written while the session ran is keyed by it.
+    sid = r.get("sessionId") or (sf.get("sessionId") if isinstance(sf.get("sessionId"), str) else None)
     return {
         "r": {"name": r["name"], "status": None, "children": [], "live": False, "state": "gone",
-              "cwd": r.get("cwd"), "sessionId": r.get("sessionId"), "last": r.get("last")},
+              "cwd": r.get("cwd"), "sessionId": sid, "last": r.get("last")},
         "name": name, "persona": clean(sf["persona"]) if sf.get("persona") else None,
         "stuck": None, "helper_stuck": [], "qs": [], "working": False, "busy_helpers": 0,
         "quiet": None, "updated": upd if upd is not None else r.get("last"), "renamed_from": None,

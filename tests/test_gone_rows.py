@@ -85,6 +85,49 @@ class EnterTests(AppWorld):
         self.assertEqual(len(calls), 1)
         self.assertIn("resume %s --here" % s, calls[0][0])
 
+    def test_m_moves_a_session_that_is_not_running(self):
+        # Its only row is on Needs you and it has no live record. The move updates
+        # the pins a live move wrote (by name and by session id), the grouped board
+        # shows it in the chosen group, and moving it back to Other removes both.
+        from fleetwatch import config
+        s, _ = self.transcript("Gone Session")
+        self.gone(sessionId=s)
+        path = config.groups_path()
+        config.load_groups()                                   # writes the default file
+        config.set_override(path, "Gone Session", "Work", session_id=s)   # a pin from when it ran
+
+        async def body(app, pilot):
+            await pilot.press("G")
+            await pilot.pause(0.1)
+            app.current.move_to("needs:Gone Session")
+            self.assertNotIn("Gone Session", app.snapshot.records)
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            self.assertEqual(type(app.screen).__name__, "GroupPicker")
+            picker = app.screen.query_one("#choices")
+            picker.highlighted = app.screen.names.index("Personal")
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: "moved Gone Session to Personal" in (app.status_text or ""))
+            groups, _w = config.load_groups(create=False)
+            self.assertEqual(groups.overrides.get("Gone Session"), "Personal")
+            self.assertEqual(groups.override_ids.get(s), "Personal")
+            await self.settle(pilot, lambda: app.snapshot.grouping.of("Gone Session") == "Personal")
+            await self.settle(pilot, lambda: "needs:Gone Session" in app.current._order)
+            order = app.current._order
+            heads = [k for k in order[:order.index("needs:Gone Session")] if k.startswith("grp:")]
+            self.assertTrue(heads and heads[-1].endswith(":Personal"), heads)
+            app.current.move_to("needs:Gone Session")
+            await pilot.press("m")
+            await pilot.pause(0.2)
+            picker = app.screen.query_one("#choices")
+            picker.highlighted = app.screen.names.index("Other")
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: "moved Gone Session to Other" in (app.status_text or ""))
+            groups, _w = config.load_groups(create=False)
+            self.assertNotIn("Gone Session", groups.overrides)
+            self.assertNotIn(s, groups.override_ids)
+        self.drive_needs(body)
+
     def test_escape_calls_nothing(self):
         s, _ = self.transcript("Gone Session")
         self.gone(sessionId=s)
