@@ -59,11 +59,15 @@ def sort_label(tab, current):
 class Grouping:
     """Which group each top-level session is in, and the order groups are shown."""
 
-    def __init__(self, by_name, order):
-        self.by_name, self.order = dict(by_name), list(order)
+    def __init__(self, by_name, order, fallback=None):
+        self.by_name, self.order, self.fallback = dict(by_name), list(order), fallback
 
     def of(self, name):
-        return self.by_name.get(name, OTHER)
+        # A session with no live row (only a status file) has no folder to match;
+        # `fallback` still applies the overrides pinned to its name.
+        if name in self.by_name:
+            return self.by_name[name]
+        return self.fallback(name) if self.fallback else OTHER
 
     def present(self, names):
         seen = {self.of(n) for n in names}

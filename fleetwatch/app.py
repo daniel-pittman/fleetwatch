@@ -185,7 +185,8 @@ class Snapshot:
             self.helpers.setdefault(data.clean(r["name"]), r)
         self.grouping = views.Grouping(
             {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
-            self.groups.names())
+            self.groups.names(), fallback=lambda name: self.groups.of(
+                name, (self.gone.get(name) or {}).get("cwd"), (self.gone.get(name) or {}).get("sessionId")))
         bad = len(index_health.problem_rows(self.indexes.rows, now))
         self.header = views.header_text(self.view, self.counts, now, self.warnings, False, bad, len(self.watches))
         self.header_mid = views.header_text(self.view, self.counts, now, self.warnings, False, bad,
@@ -1482,13 +1483,18 @@ class FleetwatchApp(App):
         names = snap.groups.names()
         current = snap.grouping.of(name)
 
+        # A session that is not running has no live record; its Needs-you row
+        # carries the folder and session id when its status file names them, so
+        # the move updates the same pins a live move wrote. With neither, the
+        # session is pinned by name alone and its paths give no group (Other).
+        rec = snap.records.get(name) or snap.gone.get(name) or {}
+
         def chosen(group):
             if group is None:
                 return
             try:
                 config.set_override(config.groups_path(), name, group,
-                                    snap.groups.by_path(snap.records[name]["cwd"]),
-                                    snap.records[name]["sessionId"])
+                                    snap.groups.by_path(rec.get("cwd")), rec.get("sessionId"))
             except (OSError, ValueError) as exc:
                 self.say("could not save the group: %s" % (data.clean(exc)[:70] or type(exc).__name__))
                 return
