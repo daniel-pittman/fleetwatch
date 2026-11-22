@@ -47,14 +47,18 @@ HEAD = 400
 
 
 class ZstdError(RuntimeError):
-    """zstd is missing, or a compressed rollout could not be decompressed."""
+    """A compressed rollout could not be decompressed."""
+
+
+class ZstdMissing(ZstdError):
+    """The zstd command is not installed, so no compressed rollout can be read."""
 
 
 def zstd_path():
     path = shutil.which("zstd")
     if not path:
-        raise ZstdError("zstd is not installed, and the Codex sessions folder holds .jsonl.zst "
-                        "files that need it (macOS: brew install zstd)")
+        raise ZstdMissing("zstd is not installed, and the Codex sessions folder holds .jsonl.zst "
+                          "files that need it (macOS: brew install zstd)")
     return path
 
 
@@ -263,6 +267,7 @@ class CodexSource:
         self.read = {"plain": 0, "zst": 0}
         self.failed = []
         self.vanished = []
+        self.zst_skipped = 0
         self.counts = {}
 
     def id_stem(self, sid):
@@ -273,7 +278,7 @@ class CodexSource:
 
     def stats(self):
         return dict(files_read=dict(self.read), files_failed=list(self.failed),
-                    files_vanished=list(self.vanished),
+                    files_vanished=list(self.vanished), zst_skipped=self.zst_skipped,
                     lines_skipped=self.counts.get("lines_skipped", 0))
 
     def list(self, project_dir, state_dir, automated_prefixes, sessions, exclude_automated):
@@ -311,7 +316,9 @@ class CodexSource:
         is not trusted for reading, but the stored cursor and records stay in place until the
         new read succeeds. A compressed file already read is not opened. A file that cannot be
         read, or that vanished because Codex compressed it after it was listed, is reported
-        and left for the next refresh, with its stored records untouched."""
+        and left for the next refresh, with its stored records untouched. Without zstd, a
+        compressed file is skipped and counted the same way, and plain files still read; the
+        hint to install it is printed once per refresh."""
         stored = (cursor, old)
         old = list(old)
         kind = "zst" if path.name.endswith(".zst") else "plain"
@@ -331,9 +338,12 @@ class CodexSource:
         except FileNotFoundError:
             self.vanished.append(path.name)
             return [], stored[0], stored[1]
+        except ZstdMissing as e:
+            if not self.zst_skipped:
+                print("codex: skipping compressed rollouts: %s" % e, file=sys.stderr)
+            self.zst_skipped += 1
+            return [], stored[0], stored[1]
         except Exception as e:
-            if isinstance(e, ZstdError) and "not installed" in str(e):
-                raise
             self.failed.append(path.name)
             print("codex: skipped %s: %s: %s" % (path.name, type(e).__name__, e)
                   if not isinstance(e, ZstdError) else "codex: skipped %s: %s" % (path.name, e),

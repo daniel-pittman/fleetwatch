@@ -484,7 +484,8 @@ class Index:
             write_s=round(t_write - t_tag, 1), docs_s=round(t_docs - t_write, 1),
             build_s=build_s, built=built, index_line=idx_line, build_retried=retried,
             sessions=st["sessions"], new_exchanges=st["new"], exchanges=n_live,
-            **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped")
+            **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped",
+                                  "zst_skipped")
                if k in st},
             sessions_removed=st.get("removed", 0), sessions_held=st.get("held", 0),
             corpus_files_changed=sess_changed, tags=tag_stats, tags_cached=len(cache),
@@ -693,6 +694,10 @@ def run_one(reg, name, opts):
               "the run; %d malformed lines skipped"
               % (name, info["files_read"]["plain"], info["files_read"]["zst"],
                  len(info["files_failed"]), len(info["files_vanished"]), info["lines_skipped"]))
+        if info.get("zst_skipped"):
+            print("[%s] codex: %d compressed rollouts skipped because zstd is not installed; "
+                  "install it (macOS: brew install zstd) and refresh again"
+                  % (name, info["zst_skipped"]))
     if info.get("build_retried"):
         print("[%s] build: retried, because the previous build failed" % name)
     print("[%s] build: %s; total %ss (parse %ss, tag %ss, write %ss, docs %ss, build %ss)"
