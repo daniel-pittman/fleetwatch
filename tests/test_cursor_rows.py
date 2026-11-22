@@ -10,6 +10,7 @@ import standin  # noqa: E402
 import test_app  # noqa: E402,F401  (sets FLEETWATCH_CONFIG_DIR before fleetwatch reads it)
 from test_app import TTY, World, boot, refresh  # noqa: E402
 from fleetwatch import app as fapp, iterm  # noqa: E402
+from waiting import settle  # noqa: E402
 
 SHARED = {"what": "Pens down for LA applications", "due": "2026-10-22", "kind": "deadline", "yours": True}
 
@@ -44,14 +45,9 @@ class CursorRows(unittest.TestCase):
         return fapp.FleetwatchApp(self.w.snapshot, interval=3600,
                                   state_path=os.path.join(self.w.tmp.name, "state.json"))
 
-    def settle(self, pilot, n=1):
-        async def inner():
-            for _ in range(60):
-                await pilot.pause(0.05)
-                if len(self.calls) >= n:
-                    break
-            await pilot.pause(0.1)
-        return inner()
+    async def wait_calls(self, pilot, n=1):
+        await settle(pilot, lambda: len(self.calls) >= n, "the osascript call")
+        await pilot.pause()
 
     def test_highlight_moves_item_by_item_even_when_rows_overflow(self):
         async def go():
@@ -89,13 +85,13 @@ class CursorRows(unittest.TestCase):
                 lst.move_to(next(k for k in lst._order if "Write the ITS ticket" in lst._by_key[k].head.plain))
                 self.calls.clear()
                 await pilot.press("enter")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "is not" in (app.status_text or ""), "the toast")
                 self.assertEqual(self.calls, [])   # Quiet One is not in iTerm: toast, no call
                 self.assertIn("is not", app.status_text)
                 lst = app.current
                 lst.move_to(next(k for k in lst._order if "Pens down" in lst._by_key[k].head.plain))
                 await pilot.press("enter")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.SessionPicker), "the session picker")
                 self.assertIsInstance(app.screen, fapp.SessionPicker)
                 await pilot.press("escape")
                 self.assertEqual(self.calls, [])
@@ -110,7 +106,7 @@ class CursorRows(unittest.TestCase):
                 lst = app.current
                 lst.move_to(next(k for k in lst._order if "Solo todo" in lst._by_key[k].head.plain))
                 await pilot.press("enter")
-                await self.settle(pilot)
+                await self.wait_calls(pilot)
                 self.assertEqual(self.calls, [[TTY]])
         asyncio.run(go())
 
@@ -124,11 +120,11 @@ class CursorRows(unittest.TestCase):
                 key = next(k for k in lst._order if "Solo todo" in lst._by_key[k].head.plain)
                 row = next(i for i, (k, _) in enumerate(lst._lines) if k == key) - int(lst.scroll_offset.y)
                 await pilot.click(lst, offset=(4, row))
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: lst.cursor == key, "the cursor to move")
                 self.assertEqual(lst.cursor, key)
                 self.assertEqual(self.calls, [])   # a single click selects and never jumps
                 await pilot.double_click(lst, offset=(4, row))
-                await self.settle(pilot)
+                await self.wait_calls(pilot)
                 self.assertEqual(self.calls, [[TTY]])
         asyncio.run(go())
 
@@ -144,7 +140,7 @@ class CursorRows(unittest.TestCase):
                 before = lst.is_open(lst._by_key[key])
                 row = next(i for i, (k, _) in enumerate(lst._lines) if k == key) - int(lst.scroll_offset.y)
                 await pilot.double_click(lst, offset=(4, row))
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: lst.is_open(lst._by_key[key]) != before, "the section to fold")
                 self.assertEqual(lst.is_open(lst._by_key[key]), not before)
                 self.assertEqual(self.calls, [])
         asyncio.run(go())
@@ -160,23 +156,22 @@ class CursorRows(unittest.TestCase):
                 self.assertEqual(sorted(node.sessions), ["Asker Development", "Stuck Session"])
                 lst.move_to(node.key)
                 await pilot.press("g")
-                await pilot.pause(0.1)
-                self.assertIsInstance(app.screen, fapp.SessionPicker)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.SessionPicker), "the session picker")
                 picker = app.screen
                 opts = picker.query_one("#choices")
                 opts.highlighted = picker.names.index("Stuck Session")
                 await pilot.press("enter")
-                await self.settle(pilot)
+                await self.wait_calls(pilot)
                 self.assertEqual(self.calls, [[TTY]])
-                self.assertEqual(app.status_text, "jumped to Stuck Session")
+                await settle(pilot, lambda: app.status_text == "jumped to Stuck Session", "the jump message")
                 # a session outside iTerm gets the usual toast
                 self.calls.clear()
                 await pilot.press("enter")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.SessionPicker), "the session picker")
                 picker = app.screen
                 picker.query_one("#choices").highlighted = picker.names.index("Asker Development")
                 await pilot.press("enter")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "is not running" in (app.status_text or ""), "the toast")
                 self.assertEqual(self.calls, [])
                 self.assertIn("is not running", app.status_text)
         asyncio.run(go())
