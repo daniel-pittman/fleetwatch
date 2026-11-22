@@ -261,6 +261,8 @@ class CodexSource:
     """The transcript source for `transcripts: {source: codex, path: <sessions folder>}`.
     One instance serves one refresh; its counters report what the refresh read."""
 
+    provider = PROVIDER
+    default_path = "~/.codex/sessions"
     keep_empty = True       # a session with no exchange still gets a cursor, so it is not reread
 
     def __init__(self):
@@ -269,6 +271,23 @@ class CodexSource:
         self.vanished = []
         self.zst_skipped = 0
         self.counts = {}
+
+    def run_meta(self, path):
+        """(working folder, start time) from a rollout's session_meta line, or (None, None)."""
+        try:
+            with Rollout(path, partial=True) as r:
+                line = r.fh.readline()
+            d = json.loads(line)
+        except (OSError, ValueError, ZstdError):
+            return None, None
+        if not isinstance(d, dict) or d.get("type") != "session_meta":
+            return None, None
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else {}
+        raw_cwd = p.get("cwd")
+        cwd = raw_cwd.strip() if isinstance(raw_cwd, str) and raw_cwd.strip() else None
+        ts = p.get("timestamp") if valid_stamp(p.get("timestamp")) else (
+            d.get("timestamp") if valid_stamp(d.get("timestamp")) else None)
+        return cwd, ts
 
     def id_stem(self, sid):
         """Codex session ids are UUIDv7: the first characters are a timestamp, so sessions

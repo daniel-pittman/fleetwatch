@@ -192,7 +192,11 @@ class Located:
 
     @property
     def is_session(self):
-        return bool(self.entry.get("transcripts"))
+        if self.is_plain:
+            return False
+        if self.entry.get("transcripts"):
+            return True
+        return self.name == getattr(refresh().SETTINGS, "catch_all_index", None)
 
     @property
     def is_plain(self):
