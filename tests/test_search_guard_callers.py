@@ -1,8 +1,11 @@
 """Caller classification and the index-content guard with synthetic process ancestry."""
 import io
+import json
+import os
 import tempfile
 import unittest
 from unittest import mock
+from pathlib import Path
 
 from fleetwatch import index_cli, indexes, search_cmd
 from fleetwatch.memory import refresh
@@ -45,13 +48,13 @@ class CallerGuardTests(unittest.TestCase):
         return indexes.read_refusal(REG, caller, target, PROTECTED)
 
     def test_codex_app_server_is_untrusted_even_with_a_tty(self):
-        caller = self.caller(Tree({600: 500, 500: 1}, {500: "codex app-server"}))
+        caller = self.caller(Tree({600: 500, 500: 1}, {500: "/opt/bin/codex"}))
         self.assertEqual(caller.kind, "untrusted")
         self.assertIn("codex process", self.refusal(caller, "private"))
         self.assertIn("not identified as a Claude session or the owner",
                       self.refusal(caller, "private"))
         self.assertIsNone(self.refusal(caller, "public"))
-        detached = self.caller(Tree({600: 500, 500: 1}, {500: "codex app-server"}),
+        detached = self.caller(Tree({600: 500, 500: 1}, {500: "/opt/bin/codex"}),
                                {"CODEX_SANDBOX": "1"}, tty=False)
         self.assertIn("codex process", self.refusal(detached, "private"))
 
@@ -78,15 +81,51 @@ class CallerGuardTests(unittest.TestCase):
         self.assertIn("protected group", self.refusal(other, "private"))
         self.assertIsNone(self.refusal(other, "public"))
 
-    def test_recognized_session_takes_precedence_over_agent_sign(self):
-        import json
-        from pathlib import Path
+    def test_agent_inside_session_is_delegated_and_cannot_read_protected_group(self):
         (Path(self.paths["sessions"]) / "500.json").write_text(json.dumps(
             {"name": "Owner", "sessionId": "owner-id"}))
-        caller = self.caller(Tree({600: 500, 500: 1}, {500: "codex app-server"}),
+        caller = self.caller(Tree({600: 550, 550: 500, 500: 1},
+                                  {550: "/opt/bin/codex", 500: "/opt/bin/claude"}),
                              {"CODEX_SANDBOX": "1"}, tty=False)
-        self.assertEqual(caller, indexes.Caller("session", ("Owner", "owner-id")))
+        self.assertEqual(caller.kind, "delegated")
+        self.assertEqual(caller.session, ("Owner", "owner-id"))
+        self.assertIn("agent started by session Owner", self.refusal(caller, "private"))
+        self.assertIsNone(self.refusal(caller, "public"))
+        invited = {**REG, "indexes": {**REG["indexes"],
+                   "private": {**REG["indexes"]["private"], "extra_readers": ["owner-id"]}}}
+        self.assertIn("agent started by session Owner",
+                      indexes.read_refusal(invited, caller, "private", PROTECTED))
+
+    def test_claude_process_with_session_file_keeps_direct_session_rights(self):
+        (Path(self.paths["sessions"]) / "500.json").write_text(json.dumps(
+            {"name": "Owner", "sessionId": "owner-id"}))
+        caller = self.caller(Tree({600: 500, 500: 1}, {500: "/opt/bin/claude"}))
+        self.assertEqual(caller, indexes.Caller("session", ("Owner", "owner-id"), None))
         self.assertIsNone(self.refusal(caller, "private"))
+        node = Tree({600: 500, 500: 1}, {500: "/usr/bin/node"})
+        node.process_args = lambda pid: "node /opt/claude/cli.js" if pid == 500 else None
+        self.assertEqual(self.caller(node).kind, "session")
+
+    def test_planted_session_file_for_shell_pid_does_not_raise_trust(self):
+        (Path(self.paths["sessions"]) / "600.json").write_text(json.dumps(
+            {"name": "Owner", "sessionId": "owner-id"}))
+        tree = Tree({600: 1}, {600: "/bin/bash"})
+        tree.process_args = lambda pid: "bash -c 'echo claude'" if pid == 600 else None
+        with mock.patch.dict(os.environ, {"FLEETWATCH_SESSIONS_DIR": self.paths["sessions"]}):
+            caller = indexes.classify_caller(ppids=tree, start_pid=600, environ={}, stdin=Terminal(False))
+        self.assertEqual(caller.kind, "untrusted")
+        self.assertIn("not identified", self.refusal(caller, "private"))
+
+    def test_agent_executables_with_spaces_and_node_wrappers(self):
+        for command in ("/Library/Application Support/codex", "/Applications/Antigravity.app/antigravity"):
+            with self.subTest(command=command):
+                caller = self.caller(Tree({600: 500, 500: 1}, {500: command}))
+                self.assertEqual(caller.kind, "untrusted")
+        for agent in ("codex", "agy", "codex-companion", "agy-companion"):
+            with self.subTest(agent=agent):
+                tree = Tree({600: 500, 500: 1}, {500: "/usr/bin/node"})
+                tree.process_args = lambda pid: "node /opt/bin/%s server" % agent if pid == 500 else None
+                self.assertEqual(self.caller(tree).kind, "untrusted")
 
     def test_search_and_index_cli_refuse_untrusted_read(self):
         caller = indexes.Caller("untrusted", sign="agy process in the ancestry")
@@ -112,6 +151,29 @@ class CallerGuardTests(unittest.TestCase):
             shown = indexer.return_value.cmd_status.call_args.args[0]["indexes"]
             self.assertEqual(set(shown), {"public"})
 
+    def test_direct_refresh_status_hides_protected_indexes(self):
+        caller = indexes.Caller("untrusted", sign="stdin has no controlling terminal")
+        with mock.patch.object(indexes, "classify_caller", return_value=caller), \
+                mock.patch.object(refresh, "load_registry", return_value=REG), \
+                mock.patch.object(refresh, "SETTINGS") as settings, \
+                mock.patch.object(refresh, "cmd_status") as status:
+            settings.protected_groups = PROTECTED
+            refresh._main(["status"])
+            self.assertEqual(set(status.call_args.args[0]["indexes"]), {"public"})
+
+    def test_index_add_and_force_migrate_refuse_untrusted_and_delegated(self):
+        for caller in (indexes.Caller("untrusted", sign="no terminal"),
+                       indexes.Caller("delegated", ("Owner", "owner-id"), "codex process")):
+            with self.subTest(caller=caller.kind), \
+                    mock.patch.object(indexes, "classify_caller", return_value=caller):
+                with mock.patch.object(indexes, "refresh", side_effect=AssertionError("unguarded")):
+                    with self.assertRaises(index_cli.Refused):
+                        index_cli.cmd_add(REG, ["--source", "codex", "--group", "public"])
+                with mock.patch.object(index_cli, "_guard", return_value="public"), \
+                        mock.patch("fleetwatch.index_migrate.migrate", side_effect=AssertionError("migrated")):
+                    with self.assertRaises(index_cli.Refused):
+                        index_cli.cmd_migrate(REG, ["public", "--from", "/tmp/old", "--force"])
+
     def test_direct_refresh_guards_triage_and_forget_but_all_refresh_stays_available(self):
         caller = indexes.Caller("untrusted", sign="stdin has no controlling terminal")
         with mock.patch.object(indexes, "classify_caller", return_value=caller), \
@@ -136,6 +198,7 @@ class CallerGuardTests(unittest.TestCase):
                 mock.patch("fleetwatch.search.engine.Index"), \
                 mock.patch("fleetwatch.search.cli.cmd_build") as build:
             indexer.return_value.index_name_problem.return_value = None
+            indexer.return_value.SETTINGS.protected_groups = PROTECTED
             self.assertEqual(index_cli.cmd_build(REG, ["private"]), 0)
             self.assertTrue(locate.called)
             self.assertTrue(build.called)

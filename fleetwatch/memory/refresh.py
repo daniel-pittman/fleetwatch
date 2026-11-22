@@ -822,7 +822,7 @@ def owner_refusal(reg, name):
     if caller.kind == "owner" or (caller.kind == "session" and
                                    name in indexes.owned_by(reg, *caller.session)):
         return None
-    if caller.kind == "untrusted":
+    if caller.kind in ("untrusted", "delegated"):
         return ("refused: index %r cannot be changed because the caller was not identified "
                 "as a Claude session or the owner (%s)" % (name, caller.sign))
     return ("refused: index %r is not owned by this session; only its owner session, or the "
@@ -896,7 +896,11 @@ def _main(argv):
     if argv and argv[0] == "discover":
         return cmd_discover(reg)
     if argv and argv[0] == "status":
-        return cmd_status(reg)
+        from fleetwatch import indexes
+        caller = indexes.classify_caller()
+        visible = {name: entry for name, entry in reg["indexes"].items()
+                   if indexes.read_refusal(reg, caller, name, SETTINGS.protected_groups) is None}
+        return cmd_status(dict(reg, indexes=visible))
     if argv and argv[0] == "triage":
         if len(argv) < 2:
             sys.exit("usage: refresh_all.py triage NAME")

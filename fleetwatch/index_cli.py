@@ -80,20 +80,30 @@ class Refused(IndexesError):
     """The trust guard refused the calling session this index (exit 3, as `search` does)."""
 
 
-def _guard(reg, name):
+def _require_direct_caller(verb):
+    caller = indexes.classify_caller()
+    if caller.kind in ("untrusted", "delegated"):
+        raise Refused("refused: index %s requires a Claude session or the owner at a terminal (%s)"
+                      % (verb, caller.sign))
+
+
+def _guard(reg, name, caller=None):
     """Raise Refused unless the caller may read index `name`. Triage prints raw names."""
     why = indexes.refresh().index_name_problem(name)
     if why:
         raise IndexesError(why)
     if name in reg.get("indexes", {}):
-        why = indexes.read_refusal(reg, indexes.classify_caller(), name)
+        why = indexes.read_refusal(reg, caller if caller is not None else indexes.classify_caller(), name)
         if why:
             raise Refused(why)
     return name
 
 
 def _own_or(name, reg):
-    return _guard(reg, name) if name else indexes.own_index(reg, indexes.calling_session())
+    if name:
+        return _guard(reg, name)
+    caller = indexes.classify_caller()
+    return _guard(reg, indexes.own_index(reg, caller.session), caller)
 
 
 def cmd_list(reg, args):
@@ -183,6 +193,7 @@ def cmd_build(reg, args):
 
 
 def cmd_add(reg, args):
+    _require_direct_caller("add")
     ap = argparse.ArgumentParser(prog="fleetwatch index add")
     ap.add_argument("--session", help="session name (default: the calling session)")
     ap.add_argument("--session-id", help="session id when --session names none that is running")
@@ -313,6 +324,8 @@ def cmd_migrate(reg, args):
     ap.add_argument("--from", dest="old", required=True, metavar="OLD_ROOT")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args(args)
+    if a.force:
+        _require_direct_caller("migrate --force")
     # The live registry's entry first: an index already here is overwritten only by a
     # session the guard lets read it (--force included). The old entry is checked too.
     _guard(reg, a.name)

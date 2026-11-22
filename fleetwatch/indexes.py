@@ -29,7 +29,8 @@ OVERRIDES = "search_overrides.yaml"
 OWNER_KINDS_FIXED = ("heartbeat", "subagent", "peer-session", "other")
 # Codex sets these for sandboxed jobs and companion threads, including detached app-server jobs.
 CODEX_ENV_MARKERS = ("CODEX_SANDBOX", "CODEX_THREAD_ID")
-AGENT_EXECUTABLES = frozenset(("codex", "agy"))
+AGENT_EXECUTABLES = frozenset(("codex", "agy", "antigravity"))
+NODE_AGENT_NAMES = frozenset(("codex", "agy", "codex-companion", "agy-companion"))
 
 
 class IndexesError(Exception):
@@ -75,27 +76,48 @@ class Caller:
 
 
 def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=None):
-    """Identify a Claude session, an interactive owner, or an untrusted caller."""
+    """Identify a Claude session, its delegated agent, an owner, or an untrusted caller."""
     paths = paths or data.default_paths()
     ppids = ppids if ppids is not None else data.Ancestry(paths.get("ps"))
     pid = os.getpid() if start_pid is None else start_pid
-    session = calling_session(paths, ppids, pid)
-    if session is not None:
-        return Caller("session", session)
+    environ = os.environ if environ is None else environ
+    sign = next(("%s environment variable" % marker for marker in CODEX_ENV_MARKERS
+                 if marker in environ), None)
     seen = set()
     while isinstance(pid, int) and pid > 1 and pid not in seen and len(seen) < 512:
         seen.add(pid)
         process_name = getattr(ppids, "process_name", None)
         command = process_name(pid) if process_name is not None else None
+        process_args = getattr(ppids, "process_args", None)
+        args = process_args(pid) if process_args is not None else None
+        executable = os.path.basename(command).lower() if command else ""
         if command:
-            executable = os.path.basename(command.split()[0]).lower()
             if executable in AGENT_EXECUTABLES:
-                return Caller("untrusted", sign="%s process in the ancestry" % executable)
+                sign = "%s process in the ancestry" % executable
+            if executable == "node" and args and any(
+                    re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(agent), args, re.I)
+                    for agent in NODE_AGENT_NAMES):
+                sign = sign or "node agent process in the ancestry"
+        path = os.path.join(paths["sessions"], "%d.json" % pid)
+        claude_process = executable in ("claude", "claude code") or executable.startswith("claude helper")
+        if executable in ("node", "electron") and args:
+            claude_process = claude_process or bool(
+                re.search(r"(?<![\w-])claude(?![\w-])", args, re.I))
+        if os.path.isfile(path) and claude_process:
+            try:
+                record = data.load_json(path)
+            except (OSError, ValueError):
+                record = None
+            if isinstance(record, dict) and isinstance(record.get("name"), str) and \
+                    record["name"].strip() and isinstance(record.get("sessionId"), str) and \
+                    record["sessionId"]:
+                session = (data.clean(record["name"]).strip(), record["sessionId"])
+                return Caller("delegated" if sign else "session", session, sign)
         pid = ppids.get(pid)
-    environ = os.environ if environ is None else environ
-    for marker in CODEX_ENV_MARKERS:
-        if marker in environ:
-            return Caller("untrusted", sign="%s environment variable" % marker)
+    if sign:
+        return Caller("untrusted", sign=sign)
+    if getattr(ppids, "process_unreadable", False) or getattr(ppids, "unreadable", False):
+        return Caller("untrusted", sign="process table unavailable")
     stdin = sys.stdin if stdin is None else stdin
     if not stdin.isatty():
         return Caller("untrusted", sign="stdin has no controlling terminal")
@@ -187,9 +209,16 @@ def read_refusal(reg, caller, target, protected=None):
         caller = classify_caller() if caller is None else Caller("session", caller)
     if caller.kind == "owner":
         return None
+    entry = all_entries(reg).get(target) or {}
+    group = entry.get("group")
+    if caller.kind == "delegated":
+        if protected is None:
+            protected = refresh().SETTINGS.protected_groups
+        if is_protected(group, protected):
+            return ("refused: an agent started by session %s may not read index %r in the "
+                    "protected group %r" % (caller.session[0], target, group))
+        caller = Caller("session", caller.session)
     if caller.kind == "untrusted":
-        entry = all_entries(reg).get(target) or {}
-        group = entry.get("group")
         if protected is None:
             protected = refresh().SETTINGS.protected_groups
         if not is_protected(group, protected) and "*" in (group_readers(reg, group) or []):

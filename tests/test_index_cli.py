@@ -827,6 +827,9 @@ class Verify(unittest.TestCase):
 
 class Add(unittest.TestCase):
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller("owner"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         self.cfg, self.data, self.projects = base / "config", base / "data", base / "projects"
         self.sessions = base / "sessions"
@@ -1008,6 +1011,9 @@ class IndexNames(unittest.TestCase):
     """An index name is one safe path component everywhere it is read or given."""
 
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller("owner"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         self.cfg, self.data, self.old = base / "config", base / "data", base / "old"
         use_layout(self, self.cfg, self.data)
@@ -1180,6 +1186,10 @@ class IndexCommandsGuard(unittest.TestCase):
 
 class Wrappers(unittest.TestCase):
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller",
+                                    return_value=indexes.Caller("session", ("Mine", SID)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         use_layout(self, base / "config", base / "data")
         write_registry(base / "config" / "indexes", entries={
