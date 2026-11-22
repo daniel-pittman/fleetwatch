@@ -90,12 +90,9 @@ jobs:
             echo "::warning::Semgrep reported scan errors; see semgrep.json errors."
           fi
 
-      - name: Post Semgrep findings as a sticky PR comment
+      - name: Render scan findings for the job summary
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
           MARKER: "### Semgrep (OSS)"
         run: |
           COUNT=$(jq '.results | length' semgrep.json)
@@ -117,18 +114,25 @@ jobs:
               printf '\n</details>\n\n_Posted before the Claude review so findings are folded into the review._\n'
             } > semgrep-comment.md
           fi
-          # Only this workflow's own earlier comment is deleted: any user can post
-          # a comment that starts with the marker. --paginate reaches past the
-          # first 30 comments.
+          cat semgrep-comment.md >> "$GITHUB_STEP_SUMMARY"
+
+        # Dependabot has no write token here; the summary still reports findings.
+      - name: Post scan findings as a sticky PR comment
+        if: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MARKER: "### Semgrep (OSS)"
+        run: |
           gh api --paginate "repos/$REPO/issues/$PR/comments" \
             --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" \
-          | while read -r id; do
-              gh api -X DELETE "repos/$REPO/issues/comments/$id" || true
-            done
+          | while read -r id; do gh api -X DELETE "repos/$REPO/issues/comments/$id" || true; done
           gh pr comment "$PR" --repo "$REPO" --body-file semgrep-comment.md
 
   await-tests:
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -159,7 +163,9 @@ jobs:
               printf 'Tests passed: ruff lint and the unittest matrix (Python 3.11 to 3.14, Linux and macOS) are green on %s.\n' "${SHA:0:9}"
             elif [ "$conclusion" = "failure" ]; then
               printf 'Tests failed on %s. Failing output (truncated):\n\n~~~\n' "${SHA:0:9}"
-              gh run view "$runid" --repo "$REPO" --log-failed 2>/dev/null \
+              gh api "repos/$REPO/actions/runs/$runid/jobs?per_page=100" --paginate --slurp 2>/dev/null \
+                | jq -r '.[]?.jobs[]? | select(.conclusion == "failure") | .id' \
+                | while read -r JOB_ID; do curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "${GITHUB_API_URL:-https://api.github.com}/repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' || true; done \
                 | grep -iE 'FAIL:|ERROR:|AssertionError|Error:|Traceback|ruff|^[A-Z][0-9]{3} ' \
                 | head -40 || true
               printf '~~~\n'
@@ -178,7 +184,7 @@ jobs:
           gh pr comment "$PR" --repo "$REPO" --body-file ci-tests-comment.md
 
   claude-review:
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.user.login != 'dependabot[bot]' }}
+    if: ${{ !github.event.pull_request.draft && github.event.pull_request.user.login != 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository }}
     # Both gates post their sticky comments before the review runs:
     #   semgrep -> "Semgrep (OSS)"; await-tests -> "CI Tests".
     needs: [semgrep, await-tests]
@@ -189,11 +195,16 @@ jobs:
       issues: read
       id-token: write
       actions: read
+    outputs:
+      review_attempt: ${{ steps.attempt.outputs.value }}
     steps:
+      - name: Record this review attempt
+        id: attempt
+        run: printf 'value=%s\n' "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       # Everything the review reads from GitHub is fetched here, by fixed
@@ -239,6 +250,7 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           dir="$(dirname "$GITHUB_WORKSPACE")/pr-context"
@@ -246,10 +258,6 @@ jobs:
           mkdir -p "$dir"
           gh pr view "$PR" --repo "$REPO" \
             --json number,title,body,state,isDraft,author,baseRefName,headRefName,headRefOid,url,isCrossRepository > "$dir/pr.json"
-          if [ "$(jq -r .isCrossRepository "$dir/pr.json")" != "false" ]; then
-            echo "::error::PR #$PR comes from a fork; the review does not run on fork code."
-            exit 1
-          fi
           author=$(jq -r '.author.login // empty' "$dir/pr.json")
           perm=none
           if [ -n "$author" ]; then
@@ -266,8 +274,81 @@ jobs:
             echo "::error::PR #$PR moved from $HEAD_SHA to $head after this run started; the newer run reviews it."
             exit 1
           fi
-          gh pr diff "$PR" --repo "$REPO" > "$dir/diff.patch"
-          gh pr diff "$PR" --repo "$REPO" --name-only > "$dir/changed-files.txt"
+          if [ "$(jq -r .isCrossRepository "$dir/pr.json")" != "false" ]; then
+            echo "::error::PR #$PR comes from a fork; the review does not run on fork code."
+            exit 1
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error::Base commit $BASE_SHA is missing; cannot collect the PR diff."
+            exit 1
+          fi
+          if ! git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null; then
+            echo "::error::No merge base exists for $BASE_SHA and $HEAD_SHA; cannot collect the PR diff."
+            exit 1
+          fi
+          git -c core.quotePath=false --literal-pathspecs --attr-source="$BASE_SHA" diff \
+            --no-color --no-textconv --no-ext-diff --no-renames "$BASE_SHA...$HEAD_SHA" > "$dir/diff.patch"
+          git -c core.quotePath=false --literal-pathspecs --attr-source="$BASE_SHA" diff \
+            --no-textconv --no-ext-diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" > "$dir/changed-files.z"
+          changed_files=()
+          while IFS= read -r -d '' file; do changed_files+=("$file"); done < "$dir/changed-files.z"
+          printf '%s\n' "${changed_files[@]}" > "$dir/changed-files.txt"
+          bytes=$(wc -c < "$dir/diff.patch")
+          lines=$(wc -l < "$dir/diff.patch")
+          if [ "$bytes" -gt 200000 ] || [ "$lines" -gt 6000 ]; then
+            mkdir -p "$dir/diff-parts"
+            printf '| Part | Files | Bytes |\n|---|---:|---:|\n' > "$dir/diff-parts/INDEX.md"
+            parts=()
+            for file in "${changed_files[@]}"; do
+              part="${file%%/*}"
+              found=no
+              for existing in "${parts[@]-}"; do
+                [ "$existing" != "$part" ] || found=yes
+              done
+              if [ "$found" = no ]; then
+                parts+=("$part")
+              fi
+            done
+            indexed_files=()
+            index=0
+            for part in "${parts[@]}"; do
+              index=$((index + 1))
+              safe=$(printf '%s' "$part" | tr -c 'A-Za-z0-9._-' '_')
+              printf -v part_name '%03d-%s.patch' "$index" "$safe"
+              git -c core.quotePath=false --literal-pathspecs --attr-source="$BASE_SHA" diff \
+                --no-color --no-textconv --no-ext-diff --no-renames "$BASE_SHA...$HEAD_SHA" -- "$part" > "$dir/diff-parts/$part_name"
+              part_files=()
+              for file in "${changed_files[@]}"; do
+                if [ "$file" = "$part" ] || [[ "$file" == "$part/"* ]]; then
+                  part_files+=("$file")
+                  indexed_files+=("$file")
+                fi
+              done
+              git -c core.quotePath=false --literal-pathspecs --attr-source="$BASE_SHA" diff \
+                --no-textconv --no-ext-diff --no-renames --name-only -z "$BASE_SHA...$HEAD_SHA" -- "$part" > "$dir/actual-part-files.z"
+              printf '%s\0' "${part_files[@]}" | sort -z > "$dir/expected-part-files.z"
+              sort -z "$dir/actual-part-files.z" > "$dir/sorted-part-files.z"
+              if ! cmp -s "$dir/expected-part-files.z" "$dir/sorted-part-files.z"; then
+                echo "::error::Split diff part $part_name omits a changed file."
+                exit 1
+              fi
+              rm "$dir/actual-part-files.z" "$dir/expected-part-files.z" "$dir/sorted-part-files.z"
+              size=$(wc -c < "$dir/diff-parts/$part_name" | tr -d ' ')
+              {
+                printf '| %s | %s | %s |\n' "$part_name" "${#part_files[@]}" "$size"
+                printf '\n### %s\n' "$part_name"
+                # shellcheck disable=SC2016
+                printf -- '- `%s`\n' "${part_files[@]}"
+              } >> "$dir/diff-parts/INDEX.md"
+            done
+            printf '%s\0' "${indexed_files[@]}" | sort -z > "$dir/indexed-files.z"
+            sort -z "$dir/changed-files.z" > "$dir/expected-files.z"
+            if ! cmp -s "$dir/indexed-files.z" "$dir/expected-files.z"; then
+              echo "::error::The split diff index does not list every changed file exactly once."
+              exit 1
+            fi
+            rm "$dir/indexed-files.z" "$dir/expected-files.z"
+          fi
           for kind in "issues/$PR/comments" "pulls/$PR/reviews" "pulls/$PR/comments"; do
             gh api --paginate "repos/$REPO/$kind" | jq -s --arg kind "$kind" 'add // [] | map(. + {kind: $kind})'
           done | jq -s 'add' > "$RUNNER_TEMP/all-comments.json"
@@ -305,7 +386,7 @@ jobs:
           echo "dir=$dir" >> "$GITHUB_OUTPUT"
           echo "actors=$actors" >> "$GITHUB_OUTPUT"
 
-      # SHA-pinned anthropics/claude-code-action v1.0.280 Bump by re-resolving
+      # SHA-pinned anthropics/claude-code-action v1.0.280. Bump by re-resolving
       # the tag's commit (the tag is annotated, so peel it):
       #   gh api repos/anthropics/claude-code-action/git/refs/tags/v1.0.280
       #
@@ -364,7 +445,7 @@ jobs:
             --permission-mode default
             --tools "Read,Grep,Glob,Task,ToolSearch"
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Read,Grep,Glob"
-            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,Read(./.git/**),Read(//proc/**),Read(//home/runner/work/_temp/**)"
+            --disallowedTools "Bash,Monitor,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,Read(./.git/**),Read(//proc/**),Read(//home/runner/work/_temp/**),Read(//home/runner/actions-runner/**),Read(//home/runner/.docker/**),Read(//home/runner/.config/**),Grep(//home/runner/actions-runner/**),Grep(//home/runner/.docker/**),Grep(//home/runner/.config/**),Glob(//home/runner/actions-runner/**),Glob(//home/runner/.docker/**),Glob(//home/runner/.config/**)"
           prompt: >-
             Review pull request ${{ github.repository }}#${{ github.event.pull_request.number }}
             for correctness bugs, security problems and clear CLAUDE.md violations in the changed
@@ -375,6 +456,8 @@ jobs:
             and comments.md (the PR's comments, reviews and review comments, from maintainers and
             this repository's bots only). Read them with the Read tool, and tell every subagent you
             launch to do the same. The checkout is the PR's head, so read any file for context.
+            When ${{ steps.context.outputs.dir }}/diff-parts/INDEX.md exists, read it and every listed part. State in your summary
+            that you reviewed a split diff and give the number of parts.
             Post each finding as an inline comment with the inline-comment tool, and put the whole
             review (a summary, every finding with its severity, and the sections asked for below)
             in your tracking comment. Only github-actions[bot]'s comments under the "Semgrep (OSS)"
