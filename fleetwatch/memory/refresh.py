@@ -49,7 +49,7 @@ import yaml
 
 from fleetwatch import migrate, settings as fleetwatch_settings
 
-from . import codex_parse, doc_corpus, session_parse, session_tagger
+from . import antigravity_parse, codex_parse, doc_corpus, session_parse, session_tagger
 from .privacy_scan import RuleSet, Scanner, protected_ready
 
 LOCK_STALE_S = 3600
@@ -142,12 +142,16 @@ def check_protected(name, group, scanner, settings=None, doc_options=None):
         raise ValueError("%s: %s" % (name, "; ".join(problems)))
 
 
-TRANSCRIPT_SOURCES = {"claude": session_parse.ClaudeSource, "codex": codex_parse.CodexSource}
+TRANSCRIPT_SOURCES = {"claude": session_parse.ClaudeSource, "codex": codex_parse.CodexSource,
+                      "antigravity": antigravity_parse.AntigravitySource}
+# Sources whose `transcripts:` block names one folder in `path` instead of `project_dir`.
+PATH_SOURCES = ("codex", "antigravity")
 
 
 def source_name(t):
     """The `source` of a `transcripts:` block: `claude` (the default; the block names
-    `project_dir`) or `codex` (the block names `path`, the sessions folder)."""
+    `project_dir`), or `codex` or `antigravity` (the block names `path`, the folder that
+    holds every session of that tool)."""
     name = t.get("source", "claude")
     if name not in TRANSCRIPT_SOURCES:
         raise ValueError("transcripts.source must be one of %s, not %r"
@@ -163,10 +167,11 @@ def transcript_source(t):
 def project_dirs(t):
     """An index's transcript folders. For a Claude index `project_dir` is one folder or a
     list of them; a list covers a session whose working directory moved, which starts a new
-    project folder. A Codex index names its sessions folder in `path`."""
-    if source_name(t) == "codex":
+    project folder. A Codex or Antigravity index names its sessions folder in `path`."""
+    name = source_name(t)
+    if name in PATH_SOURCES:
         if not t.get("path"):
-            raise ValueError("transcripts.path is required when transcripts.source is codex")
+            raise ValueError("transcripts.path is required when transcripts.source is %s" % name)
         return [Path(os.path.expanduser(t["path"]))]
     pd = t["project_dir"]
     return [Path(os.path.expanduser(p)) for p in (pd if isinstance(pd, list) else [pd])]
@@ -485,7 +490,8 @@ class Index:
             build_s=build_s, built=built, index_line=idx_line, build_retried=retried,
             sessions=st["sessions"], new_exchanges=st["new"], exchanges=n_live,
             **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped",
-                                  "zst_skipped")
+                                  "zst_skipped", "conversations_read", "conversations_skipped",
+                                  "conversations_vanished", "steps_skipped", "unknown_steps")
                if k in st},
             sessions_removed=st.get("removed", 0), sessions_held=st.get("held", 0),
             corpus_files_changed=sess_changed, tags=tag_stats, tags_cached=len(cache),
@@ -698,6 +704,22 @@ def run_one(reg, name, opts):
             print("[%s] codex: %d compressed rollouts skipped because zstd is not installed; "
                   "install it (macOS: brew install zstd) and refresh again"
                   % (name, info["zst_skipped"]))
+    if "conversations_read" in info:
+        skipped = info["conversations_skipped"]
+        reasons = {}
+        for _, why in skipped:
+            reasons[why] = reasons.get(why, 0) + 1
+        print("[%s] antigravity conversations read: %d; %d skipped%s; %d deleted during the run; "
+              "%d malformed steps skipped"
+              % (name, info["conversations_read"], len(skipped),
+                 " (%s)" % ", ".join("%s %d" % kv for kv in sorted(reasons.items()))
+                 if reasons else "", len(info["conversations_vanished"]), info["steps_skipped"]))
+        for fn, why in skipped:
+            print("[%s]   skipped %s (%s)" % (name, fn, why))
+        if info.get("unknown_steps"):
+            print("[%s] antigravity step types not in the mapping for agy %s, ignored: %s"
+                  % (name, antigravity_parse.MAPPED_VERSION,
+                     ", ".join("%s x%d" % kv for kv in sorted(info["unknown_steps"].items()))))
     if info.get("build_retried"):
         print("[%s] build: retried, because the previous build failed" % name)
     print("[%s] build: %s; total %ss (parse %ss, tag %ss, write %ss, docs %ss, build %ss)"
