@@ -226,7 +226,7 @@ Each session appears once. Child sessions (helpers, worktree and run agents) are
 
 Press Enter (or `g`), or double click, on any row in any tab: a session, a question, a reminder, a to-do row (they jump to their session), or a helper row. A helper jumps to its own tab when it is in iTerm2 and otherwise to its parent's. On a section header (Working, a group, Also noted) Enter folds it instead. iTerm2 selects that session's tab, raises its window and activates; macOS follows to the window's Space. The status line shows `jumped to <name>`.
 
-- A session maps to a tab by its registry pid: `ps -o tty=` gives the terminal, and one `osascript` call per refresh lists every iTerm2 session's tty. Sessions outside iTerm (VS Code, the desktop app, background jobs) show a toast saying so.
+- A session maps to a tab by its registry pid: `ps -axo pid=,tty=` (run once) gives every pid's terminal, and one `osascript` call per refresh lists every iTerm2 session's tty. Sessions outside iTerm (VS Code, the desktop app, background jobs) show a toast saying so.
 - The tty reaches AppleScript as `argv` only, after it matches `^/dev/ttys[0-9]+$`. It is never part of the script text.
 - If iTerm2 is not running or Automation permission is missing, pressing Enter shows `could not reach iTerm2: <reason>`. The first jump may prompt macOS once to let your terminal control iTerm2; click Allow.
 - `FLEETWATCH_OSASCRIPT` and `FLEETWATCH_TTY_CMD` override the two commands (used by the tests).

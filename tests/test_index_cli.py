@@ -1293,6 +1293,30 @@ class Schedule(unittest.TestCase):
         self.assertIn("*/30 * * * *", out)
         self.assertIn("systemctl --user enable", out)
 
+    def test_linux_service_and_cron_line_carry_the_environment_overrides(self):
+        env = {"FLEETWATCH_CONFIG_DIR": "/tmp/fw dir", "FLEETWATCH_GH_CMD": '/opt/my "gh"', "GH_CONFIG_DIR": "/tmp/100%"}
+        with mock.patch.dict(os.environ, env):
+            _code, out = self.run_schedule("install", "linux")
+        base = Path(os.environ["FLEETWATCH_SYSTEMD_USER_DIR"])
+        service = (base / "fleetwatch-index-refresh.service").read_text()
+        self.assertIn('Environment="FLEETWATCH_CONFIG_DIR=/tmp/fw dir"\n', service)
+        self.assertIn('Environment="FLEETWATCH_GH_CMD=/opt/my \\"gh\\""\n', service)
+        self.assertIn('Environment="GH_CONFIG_DIR=/tmp/100%%"\n', service)
+        self.assertLess(service.index("Environment="), service.index("ExecStart="))
+        cron = next(line for line in out.splitlines() if line.startswith("or use cron:"))
+        self.assertIn("FLEETWATCH_CONFIG_DIR='/tmp/fw dir' ", cron)
+        self.assertIn("GH_CONFIG_DIR=/tmp/100\\% ", cron)
+        self.assertLess(cron.index("FLEETWATCH_CONFIG_DIR="), cron.index(" nice "))
+
+    def test_linux_install_without_overrides_writes_no_environment_lines(self):
+        with mock.patch.dict(os.environ, clear=False):
+            for k in schedule.PASSED:
+                os.environ.pop(k, None)
+            _code, out = self.run_schedule("install", "linux")
+        base = Path(os.environ["FLEETWATCH_SYSTEMD_USER_DIR"])
+        self.assertNotIn("Environment=", (base / "fleetwatch-index-refresh.service").read_text())
+        self.assertIn("*/30 * * * * nice ", out)
+
     def test_an_unknown_verb_is_a_usage_error(self):
         self.assertEqual(schedule.main(["nope"]), 2)
 

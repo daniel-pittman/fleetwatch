@@ -904,9 +904,10 @@ class AppTests(AppWorld):
             self.assertEqual(app.screen.shown[0]["name"], "Grant Proposal")   # newest first, before typing
             for ch in "doc":
                 await pilot.press(ch)
-            # Folders match too, by subsequence, and the random temp folder both sessions live in can
-            # spell d..o..c, so Grant Proposal may stay listed; the name match must rank first.
-            await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown][:1] == ["Docs Site"])
+            # Folders match by prefix, word start or substring only, so scattered letters in the
+            # temp folder's path do not list Grant Proposal.
+            await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown] == ["Docs Site"])
+            self.assertEqual([e["name"] for e in app.screen.shown], ["Docs Site"])
             await pilot.press("enter")
             await self.settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], want)

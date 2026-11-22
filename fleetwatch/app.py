@@ -1598,7 +1598,7 @@ class FleetwatchApp(App):
             # A row that wraps would hide the next result, so the folder takes only what is left.
             used = len(e["name"]) + len(date) + len(status) + (len(e["persona"]) + 3 if e["persona"] else 0)
             out.append({"sid": e["sid"], "name": e["name"], "persona": e["persona"], "updated": e["last"],
-                        "fields": [e["name"], e["persona"] or "", resume.short_folder(e["cwd"], 200)],
+                        "fields": [e["name"], e["persona"] or "", find.exact(resume.short_folder(e["cwd"], 200))],
                         "group": "%s  %s" % (date, resume.short_folder(e["cwd"], max(FIND_ROW_ROOM - used, 8))),
                         "status": status})
         return out
@@ -1845,7 +1845,8 @@ class FleetwatchApp(App):
             e = self.resume_rows.get(node.resume)
             return (node.resume, e["name"]) if e else (None, None)
         if node.session and self.snapshot is not None:
-            rec = self.snapshot.records.get(node.session)
+            # A session that is not running has no live row; its status file may still name its id.
+            rec = self.snapshot.records.get(node.session) or self.snapshot.gone.get(node.session)
             if rec is not None and rec.get("sessionId"):
                 return rec["sessionId"], node.session
         return None, None

@@ -4,9 +4,14 @@ import re
 WORD = re.compile(r"[a-z0-9]+")
 
 
-def _tier(tok, field):
-    """0 prefix, 1 word-start or initials prefix, 2 substring, 3 subsequence, else None."""
-    f = field.lower()
+def _tier(tok, field, loosest=3):
+    """0 prefix, 1 word-start or initials prefix, 2 substring, 3 subsequence, else None.
+    A tier looser than `loosest` counts as no match."""
+    t = _raw_tier(tok, field.lower())
+    return t if t is not None and t <= loosest else None
+
+
+def _raw_tier(tok, f):
     if f.startswith(tok):
         return 0
     words = WORD.findall(f)
@@ -20,13 +25,24 @@ def _tier(tok, field):
     return None
 
 
+def exact(text):
+    """Mark a field to match by prefix, word start or substring only. A long path would otherwise match
+    short queries by scattered letters."""
+    return (text, 2)
+
+
 def score(query, fields):
     """Worst token tier, then the sum of tiers (lower is better); None when a token matches nothing.
-    An empty query scores (0, 0) for everything."""
+    A field is text, or `exact(text)`. An empty query scores (0, 0) for everything."""
     toks = query.lower().split()
     tiers = []
     for tok in toks:
-        best = [t for t in (_tier(tok, f) for f in fields if f) if t is not None]
+        best = []
+        for f in fields:
+            text, loosest = (f, 3) if isinstance(f, str) else f
+            t = _tier(tok, text, loosest) if text else None
+            if t is not None:
+                best.append(t)
         if not best:
             return None
         tiers.append(min(best))

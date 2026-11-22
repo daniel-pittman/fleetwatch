@@ -85,6 +85,27 @@ class EnterTests(AppWorld):
         self.assertEqual(len(calls), 1)
         self.assertIn("resume %s --here" % s, calls[0][0])
 
+    def test_p_and_u_park_and_unpark_a_session_that_is_not_running(self):
+        from fleetwatch import park
+        s, _ = self.transcript("Gone Session")
+        self.gone(sessionId=s)
+
+        async def body(app, pilot):
+            await pilot.press("G")
+            await self.settle(pilot, lambda: "needs:Gone Session" in app.current._order)
+            app.current.move_to("needs:Gone Session")
+            self.assertNotIn("Gone Session", app.snapshot.records)
+            await pilot.press("p")
+            await self.settle(pilot, lambda: type(app.screen).__name__ == "ParkScreen")
+            await pilot.press("enter")
+            await self.settle(pilot, lambda: "parked Gone Session" in (app.status_text or ""))
+            self.assertIn(s, park.load())
+            app.current.move_to("needs:Gone Session")
+            await pilot.press("u")
+            await self.settle(pilot, lambda: "unparked Gone Session" in (app.status_text or ""))
+            self.assertNotIn(s, park.load())
+        self.drive_needs(body)
+
     def test_m_moves_a_session_that_is_not_running(self):
         # Its only row is on Needs you and it has no live record. The move updates
         # the pins a live move wrote (by name and by session id), the grouped board
