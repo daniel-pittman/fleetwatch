@@ -855,10 +855,13 @@ class Scanner:
         return out
 
     def scan_records(self, recs, triage=None):
-        """Redact session records in place (user_text, assistant); set r['scan'], r['dropped']."""
+        """Redact session records in place (user_text, assistant, and the sender name and
+        working folder when a record has them); set r['scan'], r['dropped']."""
         res = self.scan_groups([[r["user_text"], r.get("sender_name") or ""] + r["assistant"]
-                                for r in recs], triage)
+                                + ([r["cwd"]] if r.get("cwd") else []) for r in recs], triage)
         for r, (fields, cats, dropped) in zip(recs, res):
+            if r.get("cwd"):
+                r["cwd"] = fields.pop()
             r["user_text"], r["assistant"] = fields[0], fields[2:]
             if r.get("sender_name"):
                 r["sender_name"] = fields[1]

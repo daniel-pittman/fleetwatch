@@ -142,6 +142,7 @@ def withhold_matching(recs, patterns):
     for r in recs:
         if rx.search(r.get("user_text") or "") or any(rx.search(a or "") for a in r.get("assistant") or []):
             r["user_text"], r["assistant"], r["tools"] = WITHHELD_TEXT, [], {}
+            r.pop("cwd", None)
             r["withheld"] = True
             n += 1
     return n
@@ -495,21 +496,66 @@ def hold_records(sess, sid, scanner, sig, full, opts):
     return recs
 
 
+class ClaudeSource:
+    """The transcript source for Claude Code project folders (the default). A source supplies
+    list() (the sessions in the folders), parse() (what a refresh reads of one session file),
+    present(), newest_mtime(), id_stem() and stats(); see codex_parse.CodexSource for the
+    other one.
+    keep_empty: store a cursor for a session that has no exchange yet, so it is not reread."""
+
+    keep_empty = False
+
+    def stats(self):
+        return {}
+
+    def id_stem(self, sid):
+        """The part of a session id that exchange ids are built from (its first six characters)."""
+        return sid
+
+    def list(self, project_dir, state_dir, automated_prefixes, sessions, exclude_automated):
+        return session_list(project_dir, state_dir, automated_prefixes, sessions, exclude_automated)
+
+    def present(self, dirs, sid):
+        return [str(d) for d in dirs if (d / (sid + ".jsonl")).exists()]
+
+    def newest_mtime(self, dirs):
+        return max((f.stat().st_mtime for d in dirs for f in d.glob("*.jsonl")), default=0)
+
+    def parse(self, path, cursor, old, opts, rules):
+        """(new records, cursor, old records kept) for one session file, given its stored
+        cursor and records: nothing when the file has not grown, the open last exchange
+        onward when it has, everything otherwise."""
+        if cursor and cursor["size"] == path.stat().st_size and old:
+            return [], cursor, old
+        if old and cursor:
+            tail = old.pop()
+            nx = 1 + max([r["n"] for r in old if r.get("ex", "EX") == "EX"] or [0])
+            na = 1 + max([r["n"] for r in old if r.get("ex") == "AQ"] or [0])
+            recs, cur = parse(path, tail["start_offset"], tail["start_line"] - 1, nx,
+                              dict(cursor["cron_seen"]), na, opts, rules)
+            return recs, cur, old
+        recs, cur = parse(path, 0, 0, 1, {}, 1, opts, rules)
+        return recs, cur, []
+
+
 def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
                      automated_prefixes=None, sessions="all",
-                     exclude_automated=True, opts=None, rules=DEFAULT_RULES, on_missing="hold"):
+                     exclude_automated=True, opts=None, rules=DEFAULT_RULES, on_missing="hold",
+                     source=None):
     """Parse every grown transcript from its cursor, scrub the new records, persist them, and
     return (records, skipped, stats). Records come back in session order with replays dropped.
     A change of scanner.version reparses everything, because the stored records were scrubbed
-    under the old rules."""
+    under the old rules. `source` supplies the sessions and the per-file reading
+    (ClaudeSource by default)."""
     opts = opts or DEFAULT_OPTS
+    source = source or ClaudeSource()
     sig = "%s|%s" % (scanner.version, opts_sig(opts))
     sess = state_dir / "sessions"
     sess.mkdir(parents=True, exist_ok=True)
     if automated_prefixes is None:
         automated_prefixes = rules.automated_prefixes
-    keep, skipped = session_list(project_dir, state_dir, automated_prefixes, sessions,
-                                 exclude_automated)
+    keep, skipped = source.list(project_dir, state_dir, automated_prefixes, sessions,
+                                exclude_automated)
     sids = {sid for _, sid, _ in keep}
     # A stored session whose transcript is in no registered folder is held from its stored
     # records by default: the index keeps history that transcript retention deletes. With
@@ -550,30 +596,19 @@ def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
                 cursor = None
             else:
                 old = read_records(sp)
-        size = path.stat().st_size
-        cur = cursor
-        if cursor and cursor["size"] == size and old:
-            recs = []
-        elif old and cursor:
-            tail = old.pop()
-            nx = 1 + max([r["n"] for r in old if r.get("ex", "EX") == "EX"] or [0])
-            na = 1 + max([r["n"] for r in old if r.get("ex") == "AQ"] or [0])
-            recs, cur = parse(path, tail["start_offset"], tail["start_line"] - 1, nx,
-                              dict(cursor["cron_seen"]), na, opts, rules)
-        else:
-            old = []
-            recs, cur = parse(path, 0, 0, 1, {}, 1, opts, rules)
+        recs, cur, old = source.parse(path, cursor, old, opts, rules)
         for r in recs:
             r.pop("seen", None)
             r["session"] = sid
-            r["id"] = exchange_id(sid, r.get("ex", "EX"), r["n"], opts)
+            r["id"] = exchange_id(source.id_stem(sid), r.get("ex", "EX"), r["n"], opts)
         withhold_matching(recs, opts.get("withhold_patterns"))
         if recs:
             n_files += 1
             scanner.scan_records(recs, triage)
         n_new += len(recs)
         merged = old + recs
-        if triage is None and recs:
+        if triage is None and (recs or (source.keep_empty and cur is not None
+                                        and cur is not cursor)):
             tmp = sp.with_suffix(".tmp")
             with open(tmp, "w") as fh:
                 for r in merged:
@@ -596,4 +631,4 @@ def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
                     "identical to %s]" % m.group(1),
                     "identical to %s]" % exchange_id(r["session"], "EX", int(m.group(1)), opts), 1)
     return allrecs, skipped, dict(sessions=len(keep), new=n_new, files_reparsed=n_files,
-                                  removed=len(removed), held=len(held))
+                                  removed=len(removed), held=len(held), **source.stats())

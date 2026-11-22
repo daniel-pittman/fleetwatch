@@ -10,6 +10,7 @@ the reader together, and run the round-trip test.
     Exchange <id> | <utc> UTC | <local time> | from <who>
     Previous: <id|none> | Next: <id|none> | Source lines <a>-<b>
     Session: <session id>
+    Source: <provider> | Folder: <working folder>      (only for a record that names its provider)
     Tools used: <tool xN, ...|none>[ | interrupted by the user]
     Tagged by: <model|untagged>
     Summary: <summary|(untagged)>
@@ -51,6 +52,14 @@ def sender_label(r, rules=DEFAULT_RULES):
     return who
 
 
+def source_line(r):
+    """The `Source:` header line of a record from a provider other than Claude Code, as a
+    list of zero or one lines: its provider and, when known, the folder the session ran in."""
+    if not r.get("provider"):
+        return []
+    return ["Source: %s%s" % (r["provider"], " | Folder: %s" % r["cwd"] if r.get("cwd") else "")]
+
+
 def render_exchange(r, prev_id, next_id, t, tags, rules=DEFAULT_RULES):
     """The file text for parser record `r`, its tag record `t` (may be empty) and its
     rendered `tags` (facet:value strings). `rules` gives the owner's label and the zone."""
@@ -63,6 +72,7 @@ def render_exchange(r, prev_id, next_id, t, tags, rules=DEFAULT_RULES):
            "Previous: %s | Next: %s | Source lines %d-%d"
            % (prev_id or "none", next_id or "none", r["start_line"], r["end_line"]),
            "Session: %s" % r["session"],
+           *source_line(r),
            "Tools used: %s%s" % (tools, " | interrupted by the user" if r["interrupted"] else ""),
            "Tagged by: %s" % (t.get("model") or "untagged"),
            "Summary: %s" % (t.get("summary") or "(untagged)"),
@@ -90,8 +100,9 @@ def parse_exchange(text, ex_id):
     """The header fields, incoming text and reply of a rendered exchange.
 
     Keys: id, utc, local (the local time as written), from, previous, next,
-    source_lines, session, tagged_by, tools, summary, tags (list), incoming, reply. The
-    texts come back as written, headings still escaped.
+    source_lines, session, provider and folder (only when the header has a Source line),
+    tagged_by, tools, summary, tags (list), incoming, reply. The texts come back as written,
+    headings still escaped.
     """
     head, _, rest = text.partition("\n\n## ")
     meta = {"id": ex_id}
@@ -105,6 +116,11 @@ def parse_exchange(text, ex_id):
             meta["previous"], meta["next"], meta["source_lines"] = parse_links(line)
         elif line.startswith("Session: "):
             meta["session"] = line[len("Session: "):]
+        elif line.startswith("Source: "):
+            provider, _, folder = line[len("Source: "):].partition(" | Folder: ")
+            meta["provider"] = provider
+            if folder:
+                meta["folder"] = folder
         elif line.startswith("Tagged by: "):
             meta["tagged_by"] = line[len("Tagged by: "):]
         elif line.startswith("Tools used: "):

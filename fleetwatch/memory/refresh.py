@@ -49,7 +49,7 @@ import yaml
 
 from fleetwatch import migrate, settings as fleetwatch_settings
 
-from . import doc_corpus, session_parse, session_tagger
+from . import codex_parse, doc_corpus, session_parse, session_tagger
 from .privacy_scan import RuleSet, Scanner, protected_ready
 
 LOCK_STALE_S = 3600
@@ -142,9 +142,27 @@ def check_protected(name, group, scanner, settings=None, doc_options=None):
         raise ValueError("%s: %s" % (name, "; ".join(problems)))
 
 
+TRANSCRIPT_SOURCES = {"claude": session_parse.ClaudeSource, "codex": codex_parse.CodexSource}
+
+
+def transcript_source(t):
+    """The source object for a `transcripts:` block: `source` is `claude` (the default; the
+    block names `project_dir`) or `codex` (the block names `path`, the sessions folder)."""
+    name = t.get("source", "claude")
+    if name not in TRANSCRIPT_SOURCES:
+        raise ValueError("transcripts.source must be one of %s, not %r"
+                         % (", ".join(TRANSCRIPT_SOURCES), name))
+    return TRANSCRIPT_SOURCES[name]()
+
+
 def project_dirs(t):
-    """An index's transcript folders. `project_dir` is one folder or a list of them; a list
-    covers a session whose working directory moved, which starts a new project folder."""
+    """An index's transcript folders. For a Claude index `project_dir` is one folder or a
+    list of them; a list covers a session whose working directory moved, which starts a new
+    project folder. A Codex index names its sessions folder in `path`."""
+    if t.get("source", "claude") == "codex":
+        if not t.get("path"):
+            raise ValueError("transcripts.path is required when transcripts.source is codex")
+        return [Path(os.path.expanduser(t["path"]))]
     pd = t["project_dir"]
     return [Path(os.path.expanduser(p)) for p in (pd if isinstance(pd, list) else [pd])]
 
@@ -312,7 +330,7 @@ class Index:
             project_dirs(t), self.state, self.scanner,
             sessions=t.get("sessions", "all"),
             exclude_automated=t.get("exclude_automated", True), opts=opts, rules=PARSE_RULES,
-            on_missing=t.get("on_missing", "hold"), **kw)
+            on_missing=t.get("on_missing", "hold"), source=transcript_source(t), **kw)
 
     def build_marker(self):
         """Present from just before an engine build until it succeeds: a failed build leaves
@@ -461,6 +479,8 @@ class Index:
             write_s=round(t_write - t_tag, 1), docs_s=round(t_docs - t_write, 1),
             build_s=build_s, built=built, index_line=idx_line, build_retried=retried,
             sessions=st["sessions"], new_exchanges=st["new"], exchanges=n_live,
+            **({"files_read": st["files_read"], "files_failed": st["files_failed"]}
+               if "files_read" in st else {}),
             sessions_removed=st.get("removed", 0), sessions_held=st.get("held", 0),
             corpus_files_changed=sess_changed, tags=tag_stats, tags_cached=len(cache),
             docs_changed=len(docs["changed"]), docs_removed=len(docs["removed"]),
@@ -663,6 +683,10 @@ def run_one(reg, name, opts):
         print("[%s] tag usage: %d calls, input %d + cache-read %d + cache-creation %d, output %d, $%.4f"
               % (name, t["calls"], u["input_tokens"], u["cache_read_tokens"],
                  u["cache_creation_tokens"], u["output_tokens"], u["cost_usd"]))
+    if "files_read" in info:
+        print("[%s] codex rollouts read: %d plain, %d compressed; %d unreadable"
+              % (name, info["files_read"]["plain"], info["files_read"]["zst"],
+                 len(info["files_failed"])))
     if info.get("build_retried"):
         print("[%s] build: retried, because the previous build failed" % name)
     print("[%s] build: %s; total %ss (parse %ss, tag %ss, write %ss, docs %ss, build %ss)"
@@ -745,8 +769,7 @@ def cmd_status(reg):
             print("   usage to date: %d calls, $%.2f, %s" % (calls, cost, json.dumps(tot)))
         td = e.get("transcripts")
         if td:
-            newest = max((f.stat().st_mtime for d in project_dirs(td) for f in d.glob("*.jsonl")),
-                         default=0)
+            newest = transcript_source(td).newest_mtime(project_dirs(td))
             lag = newest - fin.timestamp()
             print("   staleness: transcript %s the last run by %.0f min"
                   % ("is newer than" if lag > 0 else "is older than", abs(lag) / 60))
@@ -817,7 +840,7 @@ def forget_session(reg, name, sid, force=False):
         sys.exit("[%s] has no transcripts, so there is no session to forget" % name)
     if not SESSION_ID_RE.fullmatch(sid):
         sys.exit("not a session id: %r" % sid)
-    present = [str(d) for d in project_dirs(t) if (d / (sid + ".jsonl")).exists()]
+    present = transcript_source(t).present(project_dirs(t), sid)
     if present and not force:
         sys.exit("[%s] the transcript of session %s is still in a registered folder, so the next "
                  "refresh would index it again; remove it first, or pass --force" % (name, sid))

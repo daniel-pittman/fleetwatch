@@ -46,6 +46,11 @@ kinds:
   finding: something was discovered or diagnosed
 """
 
+CODEX_TAGS_TEMPLATE = TAGS_TEMPLATE.replace(
+    'description: "a Claude Code working session"',
+    'description: "a Codex CLI working session (the transcripts are Codex rollouts, not '
+    'Claude Code)"')
+
 PROBES_TEMPLATE = """\
 # Fixed questions with the document or exchange that should answer each, for `fleetwatch
 # search eval`. Add a probe whenever a real question returns the wrong thing. expect takes
@@ -172,30 +177,45 @@ def cmd_add(reg, args):
     ap = argparse.ArgumentParser(prog="fleetwatch index add")
     ap.add_argument("--session", help="session name (default: the calling session)")
     ap.add_argument("--session-id", help="session id when --session names none that is running")
-    ap.add_argument("--name", help="index name (default: <session>-session)")
+    ap.add_argument("--name", help="index name (default: <session>-session, or codex-sessions)")
     ap.add_argument("--group", required=True)
+    ap.add_argument("--source", choices=("claude", "codex"), default="claude",
+                    help="codex: index the Codex CLI sessions folder; the index has no owner "
+                         "session and one index covers every project, so choose its group "
+                         "for the most private project in it")
+    ap.add_argument("--path", help="the Codex sessions folder (default: ~/.codex/sessions)")
     ap.add_argument("--docs", help="a folder of reference documents to index")
     ap.add_argument("--include", action="append", help="glob under --docs (repeatable; default **/*.md)")
     ap.add_argument("--label", default="docs", help="label of the --docs folder")
     a = ap.parse_args(args)
     r = indexes.refresh()
     paths = data.default_paths()
-    if a.session_id:
-        sname, sid = a.session or a.session_id, a.session_id
-    elif a.session:
-        sname, sid = a.session, _session_id_by_name(paths, a.session)
+    codex = a.source == "codex"
+    if a.path and not codex:
+        return _fail("--path names the Codex sessions folder; use it with --source codex")
+    if codex:
+        sname = sid = None
+        folder = Path(os.path.expanduser(a.path or "~/.codex/sessions"))
+        if not folder.is_dir():
+            return _fail("the Codex sessions folder %s does not exist" % tilde(folder))
+        name = a.name or "codex-sessions"
     else:
-        found = indexes.calling_session(paths)
-        if found is None:
-            return _fail("not inside a Claude session; pass --session NAME")
-        sname, sid = found
-    folders = indexes.session_folders(r.PROJECTS, sid)
-    if not folders:
-        return _fail("no transcript of session %s under %s" % (sid, r.PROJECTS))
-    name = a.name or indexes.slug(sname) + "-session"
+        if a.session_id:
+            sname, sid = a.session or a.session_id, a.session_id
+        elif a.session:
+            sname, sid = a.session, _session_id_by_name(paths, a.session)
+        else:
+            found = indexes.calling_session(paths)
+            if found is None:
+                return _fail("not inside a Claude session; pass --session NAME")
+            sname, sid = found
+        folders = indexes.session_folders(r.PROJECTS, sid)
+        if not folders:
+            return _fail("no transcript of session %s under %s" % (sid, r.PROJECTS))
+        name = a.name or indexes.slug(sname) + "-session"
     if r.index_name_problem(name):
         return _fail(r.index_name_problem(name))
-    owned = indexes.owned_by(reg, sname, sid)
+    owned = [] if codex else indexes.owned_by(reg, sname, sid)
     # Names compare without case: on a case-insensitive file system two names that differ
     # only in case share one config folder, one data folder and one registry.d file.
     rdir = Path(r.REGISTRY_DIR)
@@ -208,9 +228,13 @@ def cmd_add(reg, args):
     if groups and a.group not in groups:
         return _fail("group %r is not declared in the registry (have: %s)"
                      % (a.group, ", ".join(sorted(groups))))
-    entry = {"group": a.group, "owner_session": sname, "owner_session_id": sid,
-             "transcripts": {"project_dir": [tilde(f) for f in folders], "sessions": [sid],
-                             "exclude_automated": True}}
+    if codex:
+        entry = {"group": a.group,
+                 "transcripts": {"source": "codex", "path": tilde(folder)}}
+    else:
+        entry = {"group": a.group, "owner_session": sname, "owner_session_id": sid,
+                 "transcripts": {"project_dir": [tilde(f) for f in folders], "sessions": [sid],
+                                 "exclude_automated": True}}
     if a.docs:
         entry["docs"] = [{"label": a.label, "path": tilde(os.path.abspath(os.path.expanduser(a.docs))),
                           "include": a.include or ["**/*.md"]}]
@@ -226,7 +250,7 @@ def cmd_add(reg, args):
         allow.unlink()
         cfg.rmdir()
         return _fail("a %s index cannot start from the template: %s" % (a.group, "; ".join(problems)))
-    (cfg / "tags.yaml").write_text(TAGS_TEMPLATE)
+    (cfg / "tags.yaml").write_text(CODEX_TAGS_TEMPLATE if codex else TAGS_TEMPLATE)
     (cfg / "probes.yaml").write_text(PROBES_TEMPLATE)
     if not r.REGISTRY.exists():
         # A protected group starts with no readers: the guard ignores readers for it, and a
@@ -239,10 +263,14 @@ def cmd_add(reg, args):
     entry_file = Path(r.REGISTRY_DIR) / (name + ".yaml")
     entry_file.parent.mkdir(parents=True, exist_ok=True)
     with open(entry_file, "x") as fh:
-        fh.write("# Registry entry for the session %s.\n" % sname)
+        fh.write("# Registry entry for the %s.\n"
+                 % ("Codex sessions index" if codex else "session %s" % sname))
         fh.write(yaml.safe_dump({"indexes": {name: entry}}, sort_keys=False))
-    print("added index %s (group %s) for session %s" % (name, a.group, sname))
-    print("transcript folders: %d" % len(folders))
+    if codex:
+        print("added index %s (group %s) over the Codex sessions in %s" % (name, a.group, tilde(folder)))
+    else:
+        print("added index %s (group %s) for session %s" % (name, a.group, sname))
+        print("transcript folders: %d" % len(folders))
     print("registry entry: %s" % tilde(entry_file))
     print("config folder: %s (tags.yaml, probes.yaml, scan_allowlist.yaml are templates to edit)"
           % tilde(cfg))
