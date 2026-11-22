@@ -49,11 +49,16 @@ class RoutingRegressions(unittest.TestCase):
         got = self.place([self.entry("sub-id", sub, 900),
                           self.entry("work-id", self.work, 950)], str(Path(sub) / "child"))
         self.assertEqual((got.index, got.reason), ("sub", routing.REASON_LAUNCH))
+        tie = self.place([self.entry("sub-id", sub, 900),
+                          self.entry("work-id", sub, 950)], str(Path(sub) / "child"))
+        self.assertEqual((tie.index, tie.reason), ("work", routing.REASON_LAUNCH))
 
     def test_parent_launch_cannot_override_protected_folder(self):
         self.assertEqual(self.place([self.entry("work-id", self.work)]).index, "private")
 
     def test_home_folder_index_does_not_absorb_runs(self):
+        self.reg["indexes"]["home"] = {"group": "work", "owner_session_id": "home-id"}
+        self.folders["home"] = ([str(self.root)], set())
         with mock.patch("pathlib.Path.home", return_value=self.root):
             got = self.place([], str(self.root / "unknown"))
             self.assertEqual(got.index, "private")
