@@ -205,7 +205,8 @@ def _merge_session_records(groups_of_records):
 
 
 def load_routed_runs(runs, provider, src_cls, provider_state, scanner, opts, rules,
-                     full=False, triage=None, on_missing="hold", all_present_sids=None):
+                     full=False, triage=None, on_missing="hold", all_present_sids=None,
+                     unreadable_sids=None):
     """Parse and scrub routed agent runs assigned to one index for one provider.
 
     Constraint: a previously stored run that still exists on disk but resolved to a different
@@ -224,14 +225,15 @@ def load_routed_runs(runs, provider, src_cls, provider_state, scanner, opts, rul
                   key=lambda item: (item[0], item[1]))
     keep_sids = {sid for _, sid, _ in keep}
     present_sids = set(all_present_sids or ()) | keep_sids
+    unreadable_sids = set(unreadable_sids or ())
 
     held, removed = [], set()
     for p in sorted(sess.glob("*.jsonl")) + sorted(sess.glob("*.cursor.json")):
         sid = p.name.split(".")[0]
         if sid in keep_sids:
             continue
-        moved_elsewhere = sid in present_sids
-        if not moved_elsewhere and on_missing == "hold":
+        moved_elsewhere = sid in present_sids and sid not in unreadable_sids
+        if sid in unreadable_sids or (not moved_elsewhere and on_missing == "hold"):
             if p.name == sid + ".jsonl" and triage is None:
                 recs = session_parse.hold_records(sess, sid, scanner, sig, full, opts)
                 if recs:
@@ -492,7 +494,8 @@ class Index:
                         runs_by_provider.get(provider, []), provider, src_cls,
                         agents_root / provider, self.scanner, routed_opts, PARSE_RULES,
                         full=kw.get("full", False), triage=kw.get("triage"),
-                        on_missing=on_missing, all_present_sids=plan.all_present.get(provider))
+                        on_missing=on_missing, all_present_sids=plan.all_present.get(provider),
+                        unreadable_sids=plan.unreadable.get(provider))
                     if r_recs:
                         extra_groups.append(r_recs)
                     for key, value in rst.items():

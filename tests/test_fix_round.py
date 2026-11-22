@@ -143,6 +143,27 @@ class LaunchRegressions(unittest.TestCase):
 
 
 class MetadataRecovery(unittest.TestCase):
+    def test_run_meta_exception_is_marked_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "source"
+            source_dir.mkdir()
+            path = source_dir / "run.jsonl"
+            path.write_text("metadata")
+
+            class BrokenSource:
+                def list(self, *args):
+                    return [(0, "run-id", path)], []
+
+                def run_meta(self, _path):
+                    raise OSError("unreadable")
+
+            settings = mock.Mock(source_dirs=lambda provider, default=None: [source_dir])
+            runs, present, unreadable = routing.discover_runs({"codex": BrokenSource}, settings)
+            self.assertEqual(runs, [])
+            self.assertEqual(present["codex"], {"run-id"})
+            self.assertEqual(unreadable["codex"], {"run-id"})
+
     def test_routing_state_is_owner_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -171,10 +192,10 @@ class MetadataRecovery(unittest.TestCase):
             settings = mock.Mock(source_dirs=lambda provider, default=None: [source])
             cache = root / "cache.json"
             with mock.patch.object(codex_parse.shutil, "which", return_value=None):
-                first, _ = routing.discover_runs({"codex": codex_parse.CodexSource},
+                first, _, _ = routing.discover_runs({"codex": codex_parse.CodexSource},
                                                  settings, cache_path=cache)
             self.assertEqual(first, [])
-            recovered, _ = routing.discover_runs({"codex": codex_parse.CodexSource},
+            recovered, _, _ = routing.discover_runs({"codex": codex_parse.CodexSource},
                                                  settings, cache_path=cache)
             self.assertEqual(recovered[0].folder, "/tmp/project")
 

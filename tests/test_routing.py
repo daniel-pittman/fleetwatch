@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -691,6 +692,32 @@ class WiringAndTrust(unittest.TestCase):
         reg, plan = self._refresh_all()
         self.assertEqual(plan.placements[0].index, "alpha-session")
         self.assertTrue(any(CODEX_2 in t for t in self._corpus_by_index(reg)["alpha-session"].values()))
+
+    @unittest.skipUnless(shutil.which("zstd"), "zstd executable required")
+    def test_routed_records_survive_unreadable_compressed_rollout(self):
+        path = write_codex_rollout(self.codex_dir, CODEX_1, self.repo_a,
+                                   ts="2026-04-01T10:03:00Z", prompt="Compressed history")
+        reg, _ = self._refresh_all()
+        stored = (refresh.ROOT / "alpha-session" / "state" / "agents" / "codex" /
+                  "sessions" / (CODEX_1 + ".jsonl"))
+        placement = self.state / "fleetwatch" / "placements.json"
+        self.assertTrue(stored.exists())
+        before = stored.read_text()
+        placed_before = placement.read_text()
+        subprocess.run(["zstd", "-q", "--rm", str(path)], check=True)
+
+        with mock.patch.object(codex_parse.shutil, "which", return_value=None):
+            reg, plan = self._refresh_all()
+        self.assertIn(CODEX_1, plan.unreadable["codex"])
+        self.assertEqual(stored.read_text(), before)
+        self.assertEqual(placement.read_text(), placed_before)
+        self.assertTrue(any(CODEX_1 in t for t in self._corpus_by_index(reg)["alpha-session"].values()))
+
+        reg, plan = self._refresh_all()
+        self.assertEqual(plan.unreadable["codex"], set())
+        self.assertEqual(plan.placements[0].run.path.suffix, ".zst")
+        self.assertEqual(stored.read_text(), before)
+        self.assertTrue(any(CODEX_1 in t for t in self._corpus_by_index(reg)["alpha-session"].values()))
 
     def test_routed_source_counts_reach_last_run(self):
         write_codex_rollout(self.codex_dir, CODEX_1, self.repo_a,

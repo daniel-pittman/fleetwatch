@@ -480,14 +480,14 @@ class Routing(Base):
                                cfg_dir=self.root)
         cache = self.state / "routing.json"
         sources = {"antigravity": ap.AntigravitySource}
-        runs, _ = routing.discover_runs(sources, cfg, cache_path=cache)
+        runs, _, _ = routing.discover_runs(sources, cfg, cache_path=cache)
         self.assertEqual(runs, [])
         with contextlib.closing(sqlite3.connect(str(path))) as writer:
             writer.execute("PRAGMA wal_autocheckpoint=0")
             self.insert(writer, [turn(T0 + 1), prompt("First prompt", T0 + 2)])
             self.assertTrue(ap.wal_path(path).exists())
             before = self.listing()
-            runs, _ = routing.discover_runs(sources, cfg, cache_path=cache)
+            runs, _, _ = routing.discover_runs(sources, cfg, cache_path=cache)
             self.assertEqual((runs[0].folder, runs[0].start_time), ("/example/workspace", T0 + 1.25))
             self.assertEqual(self.listing(), before)
 

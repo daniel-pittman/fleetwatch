@@ -57,6 +57,7 @@ class RoutingPlan:
     counts: dict = field(default_factory=dict)
     unplaced: list = field(default_factory=list)
     all_present: dict = field(default_factory=dict)     # provider -> set of discovered session ids
+    unreadable: dict = field(default_factory=dict)      # provider -> set of unreadable session ids
 
     def counts_for(self, index_name):
         c = self.counts.get(index_name) or {}
@@ -413,23 +414,26 @@ def _file_sig(path):
 def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
     """Discover all agent runs across provider `sources` ({provider_name: source_cls}).
 
-    Returns (runs, all_present_by_provider). Metadata is cached by file signature when
+    Returns (runs, all_present_by_provider, unreadable_by_provider). Metadata is cached by file signature when
     `cache_path` is given. Sources with sidecar files can include them via file_sig(path).
     """
     old_cache = _load_meta_cache(cache_path)
     new_cache = {}
     runs = []
     all_present = {}
+    unreadable = {}
     for provider, src_cls in sorted(sources.items()):
         dirs = [d for d in settings.source_dirs(provider, getattr(src_cls, "default_path", None))
                 if d.is_dir()]
         if not dirs:
             all_present[provider] = set()
+            unreadable[provider] = set()
             continue
         src = src_cls()
         file_sig = getattr(src, "file_sig", _file_sig)
         keep, _skipped = src.list(dirs, None, (), "all", False)
         present = set()
+        failed = set()
         for _sort_key, sid, path in keep:
             present.add(sid)
             if claimed_fn is not None and claimed_fn(provider, sid, path):
@@ -438,23 +442,30 @@ def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
             try:
                 sig = file_sig(path)
             except OSError:
+                failed.add(sid)
                 continue
             cached = old_cache.get(key)
             if isinstance(cached, dict) and cached.get("sig") == sig:
                 folder = cached.get("folder")
                 start_epoch = cached.get("start_time")
             else:
-                folder, raw_ts = src.run_meta(path)
+                try:
+                    folder, raw_ts = src.run_meta(path)
+                except Exception:
+                    failed.add(sid)
+                    continue
                 start_epoch = _to_epoch(raw_ts) if raw_ts is not None else None
             if folder is None or start_epoch is None:
+                failed.add(sid)
                 continue
             new_cache[key] = {"sig": sig, "folder": folder, "start_time": start_epoch}
             runs.append(AgentRun(provider=provider, session_id=sid, path=path,
                                  folder=folder, start_time=start_epoch))
         all_present[provider] = present
+        unreadable[provider] = failed
     if cache_path and new_cache != old_cache:
         _save_meta_cache(cache_path, new_cache)
-    return runs, all_present
+    return runs, all_present, unreadable
 
 
 def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=None,
@@ -464,10 +475,11 @@ def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=N
     catch_all = validate_catch_all(reg, settings)
     if ledger is None:
         ledger = launch.read_ledger(ledger_path)
+    unreadable = {}
     if runs is None:
         claimed_fn = _claimed_by_standalone(reg, sources)
-        runs, all_present = discover_runs(sources, settings, cache_path=cache_path,
-                                          claimed_fn=claimed_fn)
+        runs, all_present, unreadable = discover_runs(sources, settings, cache_path=cache_path,
+                                                      claimed_fn=claimed_fn)
     elif all_present is None:
         all_present = {}
         for r in runs:
@@ -485,7 +497,7 @@ def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=N
             git_cache[folder] = git_main_checkout(folder, git_cmd=git_cmd)
         return git_cache[folder]
 
-    plan = RoutingPlan(all_present=all_present)
+    plan = RoutingPlan(all_present=all_present, unreadable=unreadable)
     placements_file = Path(placement_path) if placement_path else None
     try:
         stored = json.loads(placements_file.read_text()) if placements_file else {}

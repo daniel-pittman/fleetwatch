@@ -119,6 +119,26 @@ class CallerGuardTests(unittest.TestCase):
                 caller = self.caller(tree, {"CODEX_THREAD_ID": "x"}, tty=False)
                 self.assertEqual(caller.kind, "session")
 
+    def test_node_companion_under_claude_plugins_is_delegated(self):
+        (Path(self.paths["sessions"]) / "500.json").write_text(json.dumps(
+            {"name": "Owner", "sessionId": "owner-id"}))
+        tree = Tree({600: 550, 550: 500, 500: 1},
+                    {550: "/usr/bin/node", 500: "/opt/bin/claude"})
+        tree.process_args = lambda pid: (
+            "node /home/alex/.claude/plugins/codex-companion.mjs task" if pid == 550 else None)
+        caller = self.caller(tree)
+        self.assertEqual(caller.kind, "delegated")
+        self.assertIn("JS agent process", caller.sign)
+
+    def test_agent_ancestor_above_matched_session_is_delegated(self):
+        (Path(self.paths["sessions"]) / "550.json").write_text(json.dumps(
+            {"name": "Owner", "sessionId": "owner-id"}))
+        tree = Tree({600: 550, 550: 500, 500: 1},
+                    {550: "/tmp/claude", 500: "/opt/bin/codex"})
+        caller = self.caller(tree)
+        self.assertEqual(caller.kind, "delegated")
+        self.assertEqual(caller.session, ("Owner", "owner-id"))
+
     def test_planted_session_file_for_shell_pid_does_not_raise_trust(self):
         (Path(self.paths["sessions"]) / "600.json").write_text(json.dumps(
             {"name": "Owner", "sessionId": "owner-id"}))
