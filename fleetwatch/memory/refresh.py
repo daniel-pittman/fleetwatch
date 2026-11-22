@@ -168,7 +168,8 @@ def agent_sources():
 
 
 def routing_cache_path():
-    return ROOT / "logs" / "routing-cache.json"
+    # Leading dot keeps the cache out of logs/ and guarantees it can never collide with an index name.
+    return ROOT / ".routing-cache.json"
 
 
 def resolve_routing(reg, ledger_path=None, git_cmd=None):
@@ -814,6 +815,8 @@ def run_plain(name, entry, opts):
 
 
 def run_one(reg, name, opts, plan=None):
+    if plan is None:
+        plan = getattr(opts, "routing_plan", None)
     if reg["indexes"][name].get("kind") == "plain":
         try:
             return run_plain(name, reg["indexes"][name], opts)
@@ -1141,7 +1144,7 @@ def _main(argv):
     opts = ap.parse_args(argv)
     opts.retag_all = False
     names = selected(reg, opts.index)
-    plan = resolve_routing(reg)
+    opts.routing_plan = resolve_routing(reg)
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
     failed = []
     t0, done = time.time(), []
@@ -1149,7 +1152,7 @@ def _main(argv):
     if mark:
         write_run_marker(t0, None, done)
     for name in names:
-        if run_one(reg, name, opts, plan=plan):
+        if run_one(reg, name, opts):
             record_streak(name, None)
             if refreshed_since(name, t0):
                 done.append(name)
