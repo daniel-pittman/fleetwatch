@@ -32,6 +32,7 @@ become one summary), and quiet hours hold everything and send one summary when t
 """
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -160,7 +161,9 @@ def watch_items(paths, now):
     """Watch flags, through lane `watches`' module when it exists: `flags(paths, now)` returns
     (key, session name, text) tuples. Nothing when the module is absent or fails."""
     try:
-        from . import watches
+        # import_module reads sys.modules, so a module that is absent (or masked there) reads
+        # as absent even after an earlier import bound it on the package.
+        watches = importlib.import_module(__package__ + ".watches")
         flags = list(watches.flags(paths, now))
     except Exception:
         return []

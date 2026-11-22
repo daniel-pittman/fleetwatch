@@ -21,6 +21,16 @@ from fleetwatch import index_cli, indexes, launch, search_cmd, settings
 from fleetwatch.memory import codex_parse, privacy_scan, refresh, render, routing
 from fleetwatch.search import engine
 
+
+@contextlib.contextmanager
+def as_caller(session):
+    """Run as the owner at a terminal (None) or as a Claude session (name, id), whatever the
+    real process tree around the test looks like."""
+    caller = indexes.Caller("owner") if session is None else indexes.Caller("session", session)
+    with mock.patch.object(indexes, "calling_session", return_value=session), \
+            mock.patch.object(indexes, "classify_caller", return_value=caller):
+        yield
+
 SID_A = "aa11bb22-0000-4000-8000-000000000001"
 SID_B = "cc33dd44-0000-4000-8000-000000000002"
 SID_C = "ee55ff66-0000-4000-8000-000000000003"
@@ -581,7 +591,7 @@ class WiringAndTrust(unittest.TestCase):
         self.assertIn("[id]", vault_codex)
 
         # `fleetwatch index status` reports per-index launch/folder/catch-all counts and unplaced.
-        with mock.patch.object(indexes, "calling_session", return_value=None):
+        with as_caller(None):
             code, out, err = capture(index_cli.main, ["status"])
         self.assertEqual(code, 0, err)
         self.assertIn("== alpha-session (group work)", out)
@@ -594,7 +604,7 @@ class WiringAndTrust(unittest.TestCase):
         self.assertIn("unplaced agent runs: 0", out)
 
         # Status from inside Beta hides work/ferpa indexes without miscounting them as unplaced.
-        with mock.patch.object(indexes, "calling_session", return_value=("Beta", SID_B)):
+        with as_caller(("Beta", SID_B)):
             code, out_b, err_b = capture(index_cli.main, ["status"])
         self.assertEqual(code, 0, err_b)
         self.assertIn("== beta-session (group oss)", out_b)
@@ -603,7 +613,7 @@ class WiringAndTrust(unittest.TestCase):
 
         # Trust group follows the target index at search time.
         def search_as(session, idx, query):
-            with mock.patch.object(indexes, "calling_session", return_value=session):
+            with as_caller(session):
                 return capture(search_cmd.main, ["--index", idx, query, "--json"])
 
         # Beta (oss) cannot search Alpha's work index where CODEX_2 landed, nor Vault's ferpa index.
@@ -632,7 +642,7 @@ class WiringAndTrust(unittest.TestCase):
         for idx, files in corpora.items():
             for txt in files.values():
                 self.assertNotIn(CODEX_3, txt, idx)
-        with mock.patch.object(indexes, "calling_session", return_value=None):
+        with as_caller(None):
             code, out, err = capture(index_cli.main, ["status"])
         self.assertEqual(code, 0, err)
         self.assertIn("unplaced agent runs: 1", out)
@@ -713,7 +723,7 @@ class WiringAndTrust(unittest.TestCase):
         self.assertEqual(holders, ["alpha-session"])
         agy_doc = next(txt for txt in corpora["alpha-session"].values() if run_sid in txt)
         self.assertIn("Source: antigravity | Folder:", agy_doc)
-        with mock.patch.object(indexes, "calling_session", return_value=None):
+        with as_caller(None):
             code, out, err = capture(index_cli.main, ["status", "alpha-session"])
         self.assertEqual(code, 0, err)
         self.assertIn("exchanges by provider: claude 1, antigravity 1", out)
