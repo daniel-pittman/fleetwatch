@@ -6,7 +6,9 @@ import unittest
 
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
 from fleetwatch import app as fapp, data, demo, views  # noqa: E402
+from waiting import first_scan, settle  # noqa: E402
 
 
 def walk(nodes):
@@ -32,7 +34,7 @@ class BoardTests(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return await script(app, pilot)
         return asyncio.run(go())
 
@@ -91,7 +93,7 @@ class BoardTests(unittest.TestCase):
             fy[1]["working"], fy[1]["quiet"] = True, None
             fy[2]["working"], fy[2]["quiet"] = False, 30
             app.rebuild()
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "  working" in app.lists[0].visible_text(), "the state to show")
             return fy[1]["name"], fy[2]["name"], app.lists[0].visible_text()
         first, second, text = self.board((120, 40), script)
         line = {ln.split("  ")[0].lstrip("▸▾ ").split(" (")[0]: ln for ln in text.split("\n")}
@@ -105,12 +107,13 @@ class BoardTests(unittest.TestCase):
             seen = {}
             for tab in range(5):
                 await pilot.press(str(tab + 1))
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: app.active == tab, "the tab")
                 lst = app.lists[tab]
                 steps = []
                 for _ in range(3):
+                    prior = [lst.is_open(n) for n in self.expandable(lst)]
                     await pilot.press("z")
-                    await pilot.pause(0.2)
+                    await settle(pilot, lambda: [lst.is_open(n) for n in self.expandable(lst)] != prior, "the fold")
                     nodes = self.expandable(lst)
                     steps.append([lst.is_open(n) for n in nodes])
                 seen[tab] = steps
@@ -132,17 +135,17 @@ class BoardTests(unittest.TestCase):
     def test_resume_was_line_folds_with_its_row(self):
         async def script(app, pilot):
             await pilot.press("4")
-            await pilot.pause(0.3)
             lst = app.lists[views.RESUME_TAB]
+            await settle(pilot, lambda: app.active == views.RESUME_TAB and lst.visible_text(), "the Resume tab")
             closed = lst.visible_text()
             await pilot.press("space")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.visible_text() != closed, "the row to open")
             one = lst.visible_text()
             await pilot.press("space")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.visible_text() != one, "the row to close")
             back = lst.visible_text()
             await pilot.press("z")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.visible_text() != back, "the fold")
             return closed, one, back, lst.visible_text()
         closed, one, back, everything = self.board((120, 40), script)
         self.assertNotIn("was:", closed)

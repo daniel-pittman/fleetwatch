@@ -19,3 +19,9 @@ async def settle(pilot, check, what="the awaited condition", bound=BOUND):
         if time.monotonic() > deadline:
             raise AssertionError("timed out after %.0fs waiting for %s" % (bound, what))
         await pilot.pause(POLL)
+
+
+async def first_scan(app, pilot):
+    """Wait for the board's first refresh and the Resume scan, then let queued messages run."""
+    await settle(pilot, lambda: app.refreshes and app.resume_data is not None, "the first scan")
+    await pilot.pause()
