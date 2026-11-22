@@ -530,11 +530,72 @@ on the next refresh, and exchange ids carry ten characters of the session id
 (`Sc0b903b19a-EX-0001`). `index add --source codex` takes no `--session` or `--session-id`, and
 `--path` is stored as an absolute path.
 
-**One Codex index spans every project.** Codex keeps all sessions in one folder, so the index holds
-prompts from every project you used it in, and its trust group is chosen when it is created. Pick the
-group of the most private project in the folder, or index only the sessions you want with
-`transcripts.sessions`. The index has no owner session, so in a protected group nothing reads it but
-a plain terminal and the sessions in its `extra_readers`.
+**One Codex index spans every project.** Codex keeps all sessions in one folder, so a standalone
+Codex index holds prompts from every project you used it in, and its trust group is chosen when it is
+created. Pick the group of the most private project in the folder, or index only the sessions you
+want with `transcripts.sessions`. The index has no owner session, so in a protected group nothing
+reads it but a plain terminal and the sessions in its `extra_readers`.
+
+### Routing Codex and Antigravity runs into session indexes
+
+Instead of putting every Codex or Antigravity run in one shared index, fleetwatch can route each run
+into the index of the Claude Code session that launched it. No new provider-specific indexes or
+groups are created: every routed run is parsed with its provider's source, labeled with its provider
+(`Source: codex | Folder: ...`), scrubbed under the target index's rules, and governed by the target
+index's trust group. Each run is placed in at most one index.
+
+**1. Record launches from Claude Code.** Add a `PreToolUse` hook for `Bash` to your Claude Code
+settings (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fleetwatch launch record"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`fleetwatch launch record` reads the hook payload on stdin and matches commands that start a Codex
+or Antigravity job (`codex exec`, `codex-companion.mjs` with `task`, `review` or
+`adversarial-review`, `codex-task-in-worktree.sh`, `multi-review.sh`, `agy`, and
+`agy-companion.mjs` with `task`, `review`, `plan` or `ask`). On a match it appends one JSON line to
+`launches.jsonl` in fleetwatch's state folder (`$XDG_STATE_HOME/fleetwatch`, else
+`~/.local/state/fleetwatch`) with the session id, session name (when status files supply it), tool,
+working folder (`--worktree` when present, else `cwd`, resolved to an absolute path) and ISO time.
+It always exits 0 and writes nothing to stdout, so it can never block or alter a command.
+
+**2. How each run is resolved on refresh.** For every agent run (provider, working folder, start
+time), fleetwatch picks the target index in this order:
+
+1. **Launch ledger:** the newest ledger entry with the same folder, or a parent folder, recorded
+   within 10 minutes before the run's start places the run in that launching session's index.
+2. **Project folder:** else the unique registered session index whose project folders contain the
+   run's folder, following a git worktree to its main checkout via `git rev-parse --git-common-dir`
+   when the folder still exists.
+3. **Catch-all or unplaced:** else the catch-all index named in `settings.toml` (`[routing]
+   catch_all`), which must belong to a protected group. With no catch-all configured, the run is not
+   indexed and is counted as unplaced.
+
+Optional `settings.toml` entries:
+
+```toml
+[routing]
+catch_all = "unrouted-agents"     # must be a registered index in a protected group
+sources = { codex = "~/.codex/sessions" }   # optional provider -> sessions folder(s)
+```
+
+`fleetwatch index status` reports per index how many runs were placed by launch, by folder and by
+catch-all, followed by the unplaced count.
 
 **Deleted transcripts.** A session index keeps its history when Claude Code deletes an old transcript:
 a session whose transcript is gone is held from its stored records, which are scrubbed again whenever
@@ -590,7 +651,7 @@ owner_name = "Your Name"      # optional
 
 `timezone` sets the zone every date is shown in. A date-only `due` (`2026-10-28`) means midnight at the start of that day in this zone. A bad value falls back to the system zone.
 
-The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
+The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`, `[routing]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
 
 **Other environment variables.** `FLEETWATCH_GH_CMD` replaces the `gh` command that watches run (it is split like a shell command line), and the scheduled watch job carries it along with `GH_CONFIG_DIR`. `FLEETWATCH_LAUNCH_AGENTS_DIR` and `FLEETWATCH_SYSTEMD_USER_DIR` move where `schedule install` writes its launchd and systemd files, which is useful for trying an install without touching your own. A scheduled job carries the folder overrides that are set when you install it (`FLEETWATCH_CONFIG_DIR`, `FLEETWATCH_STATUS_DIR`, `FLEETWATCH_SESSIONS_DIR`, `FLEETWATCH_PROJECTS_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`), so install it from the shell whose settings you want it to use.
 
