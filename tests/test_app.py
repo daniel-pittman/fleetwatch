@@ -154,6 +154,7 @@ class PruneModalTests(unittest.TestCase):
                 await pilot.press("n", "y")
                 status = self.w.paths["status"]
                 await settle(pilot, lambda: not os.path.exists(os.path.join(status, "named.json")), "the prune")
+                await settle(pilot, lambda: "pruned" in (app.status_text or ""), "the prune message")  # the app's refresh must finish before it exits
                 self.assertFalse(os.path.exists(os.path.join(status, "named.json")))
                 self.assertFalse(os.path.exists(self.old))
                 self.assertTrue(os.path.exists(os.path.join(status, "lost.json")))
@@ -170,6 +171,7 @@ class PruneModalTests(unittest.TestCase):
                 await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 await pilot.press("y")
                 await settle(pilot, lambda: not os.path.exists(self.old), "the prune")
+                await settle(pilot, lambda: "pruned" in (app.status_text or ""), "the prune message")  # the app's refresh must finish before it exits
                 self.assertTrue(os.path.exists(os.path.join(self.w.paths["status"], "named.json")))
         run(go())
 
