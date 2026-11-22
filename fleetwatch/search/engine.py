@@ -961,6 +961,11 @@ def prepare_providers(con, cfg):
 
 
 def label_mixed_results(con, results):
+    # An index built before provider labels has no exchange_providers table (unless a
+    # --provider search built a temporary one); without one its hits carry no label.
+    if not con.execute("SELECT 1 FROM sqlite_master WHERE name='exchange_providers' UNION ALL "
+                       "SELECT 1 FROM sqlite_temp_master WHERE name='exchange_providers'").fetchone():
+        return
     if len(con.execute("SELECT DISTINCT provider FROM exchange_providers LIMIT 2").fetchall()) < 2:
         return
     by_path = {}

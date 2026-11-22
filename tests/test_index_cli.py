@@ -331,6 +331,16 @@ class SearchCommand(unittest.TestCase):
         self.assertEqual({hit["provider"] for hit in json.loads(out)}, {"codex"})
         self.assertEqual(path.stat().st_mtime_ns, before)
 
+    def test_plain_search_works_on_an_index_built_before_provider_metadata(self):
+        # Every index built before provider labels lacks exchange_providers; a search with no
+        # --provider must still run on it.
+        path = self.build_mixed_index()
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.execute("DROP TABLE exchange_providers")
+        code, out, err = self.search("telescope", "--index", "demo-session", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out))
+
     def test_output_equals_the_old_cli_and_json_matches(self):
         self.migrate_both()
         from fleetwatch.memory import session_search
