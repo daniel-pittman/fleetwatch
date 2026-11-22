@@ -13,7 +13,8 @@ import time
 import unittest
 from pathlib import Path
 
-from fleetwatch.memory import (antigravity_parse as ap, protowire as pw, refresh, render,
+from fleetwatch import settings
+from fleetwatch.memory import (antigravity_parse as ap, protowire as pw, refresh, render, routing,
                                session_parse as sp, session_search)
 
 HOME = str(Path.home())
@@ -441,10 +442,62 @@ class Antigravity(Base):
         self.assertNotIn("someone@example.org", json.dumps(recs))
 
 
+class Routing(Base):
+    def test_routes_conversations_by_launch_folder_and_catch_all(self):
+        from tests.test_routing import SID_A, SID_B, write_claude_transcript
+
+        base = self.root.parent.resolve()
+        checkout = base / "repo with spaces"
+        project = base / "claude"
+        write_claude_transcript(project, SID_A, cwd=checkout)
+        reg = {"indexes": {
+            "workspace": {"group": "work", "transcripts": {"project_dir": str(project)}},
+            "launcher": {"group": "work", "owner_session_id": SID_B},
+            "vault": {"group": "ferpa"},
+        }}
+        cfg = settings.indexer(raw={"routing": {
+            "sources": {"antigravity": str(self.root), "codex": []}, "catch_all": "vault",
+        }}, cfg_dir=base)
+        other = "5a1c0de0-0000-4000-8000-000000000001"
+        self.db([prompt("Launch", T0 + 30)], meta=blob(folder=str(checkout)))
+        self.db([prompt("Folder", T0 + 900)], cid=CID2, meta=blob(CID2, folder=str(checkout)))
+        self.db([prompt("Catch-all", T0 + 30)], cid=other, meta=blob(other, folder=str(base / "other")))
+        before = self.listing()
+        # The blob's creation time precedes the launch. The first step follows it.
+        ledger = [{"session_id": SID_B, "cwd": str(checkout), "ts_epoch": T0 + 15}]
+        plan = routing.resolve_all(reg, cfg, refresh.agent_sources(), ledger=ledger)
+        self.assertEqual({p.run.session_id: (p.run.provider, p.index, p.reason)
+                          for p in plan.placements}, {
+            CID: ("antigravity", "launcher", routing.REASON_LAUNCH),
+            CID2: ("antigravity", "workspace", routing.REASON_FOLDER),
+            other: ("antigravity", "vault", routing.REASON_CATCH_ALL),
+        })
+        self.assertEqual(self.listing(), before)
+
+    def test_first_step_in_the_wal_invalidates_cached_metadata(self):
+        path = self.db([], meta=blob(folder="/example/workspace"))
+        cfg = settings.indexer(raw={"routing": {"sources": {"antigravity": str(self.root)}}},
+                               cfg_dir=self.root)
+        cache = self.state / "routing.json"
+        sources = {"antigravity": ap.AntigravitySource}
+        runs, _ = routing.discover_runs(sources, cfg, cache_path=cache)
+        self.assertIsNone(runs[0].start_time)
+        with contextlib.closing(sqlite3.connect(str(path))) as writer:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            self.insert(writer, [turn(T0 + 1), prompt("First prompt", T0 + 2)])
+            self.assertTrue(ap.wal_path(path).exists())
+            before = self.listing()
+            runs, _ = routing.discover_runs(sources, cfg, cache_path=cache)
+            self.assertEqual((runs[0].folder, runs[0].start_time), ("/example/workspace", T0 + 1.25))
+            self.assertEqual(self.listing(), before)
+
+
 class Registry(unittest.TestCase):
     def test_antigravity_names_a_path(self):
         t = {"source": "antigravity", "path": "~/.gemini/antigravity-cli/conversations"}
         self.assertIsInstance(refresh.transcript_source(t), ap.AntigravitySource)
+        self.assertIs(refresh.agent_sources()["antigravity"], ap.AntigravitySource)
+        self.assertEqual(ap.AntigravitySource.default_path, t["path"])
         self.assertEqual(refresh.project_dirs(t),
                          [Path.home() / ".gemini" / "antigravity-cli" / "conversations"])
         with self.assertRaisesRegex(ValueError, "transcripts.path is required when "

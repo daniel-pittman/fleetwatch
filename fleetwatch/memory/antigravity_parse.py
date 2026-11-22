@@ -138,10 +138,14 @@ def stamp(t):
 
 def folder(blob):
     """The workspace folder named in the metadata blob, home written as ~; "" when none."""
-    uri = pw.text(blob, 1, 1) or pw.text(blob, 7) or ""
+    uri = workspace_uri(blob)
     if uri.startswith("file://"):
         uri = unquote(urlparse(uri).path)
     return short_home(uri.rstrip("/") or uri) if uri else ""
+
+
+def workspace_uri(blob):
+    return pw.text(blob, 1, 1) or pw.text(blob, 7) or ""
 
 
 def finish_text(args):
@@ -169,7 +173,7 @@ def check_shape(conn):
         raise ShapeError("metadata", "no metadata blob")
     try:
         pw.fields(row[0])
-    except pw.DecodeError as e:
+    except (pw.DecodeError, TypeError) as e:
         raise ShapeError("metadata", str(e))
     return bytes(row[0])
 
@@ -284,6 +288,9 @@ class AntigravitySource:
     """The transcript source for `transcripts: {source: antigravity, path: <folder>}`.
     One instance serves one refresh; its counters report what the refresh read."""
 
+    provider = PROVIDER
+    default_path = "~/.gemini/antigravity-cli/conversations"
+    file_sig = staticmethod(file_sig)
     keep_empty = True       # a conversation with no exchange still gets a cursor
 
     def __init__(self):
@@ -304,6 +311,18 @@ class AntigravitySource:
                     conversations_vanished=list(self.vanished),
                     steps_skipped=self.counts.get("steps_skipped", 0),
                     unknown_steps=dict(self.counts.get("unknown_steps", {})))
+
+    def run_meta(self, path):
+        """Return the workspace and the first step's time for routing."""
+        try:
+            with open_conversation(path) as conn:
+                uri = urlparse(workspace_uri(check_shape(conn)))
+                row = conn.execute("SELECT step_payload FROM steps ORDER BY idx LIMIT 1").fetchone()
+        except (OSError, sqlite3.Error, ValueError):
+            return None, None
+        cwd = unquote(uri.path) if uri.scheme == "file" and uri.netloc in ("", "localhost") else ""
+        ts = stamp(pw.first(row[0], 5, 1)) if row and isinstance(row[0], bytes) else None
+        return cwd if cwd.startswith("/") and "\x00" not in cwd else None, ts
 
     def list(self, project_dir, state_dir, automated_prefixes, sessions, exclude_automated):
         """(keep, skipped): every conversation in the folders as (creation time, id, path),

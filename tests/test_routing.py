@@ -448,7 +448,7 @@ class WiringAndTrust(unittest.TestCase):
         self._write_registry()
 
     def _configure(self, catch_all=None, extra_sources=None):
-        sources = {"codex": str(self.codex_dir)}
+        sources = {"codex": str(self.codex_dir), "antigravity": []}
         if extra_sources:
             sources.update(extra_sources)
         rt = {"sources": sources}

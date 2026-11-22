@@ -31,7 +31,7 @@ REASON_LAUNCH = "launch"
 REASON_FOLDER = "folder"
 REASON_CATCH_ALL = "catch_all"
 REASON_UNPLACED = "unplaced"
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 GIT_TIMEOUT_S = 5
 
 
@@ -384,11 +384,16 @@ def _claimed_by_standalone(reg, sources):
     return is_claimed
 
 
+def _file_sig(path):
+    st = path.stat()
+    return [st.st_size, st.st_mtime_ns]
+
+
 def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
     """Discover all agent runs across provider `sources` ({provider_name: source_cls}).
 
-    Returns (runs, all_present_by_provider). Metadata is cached by (size, mtime_ns) when
-    `cache_path` is given so unchanged rollouts are not reopened on every refresh.
+    Returns (runs, all_present_by_provider). Metadata is cached by file signature when
+    `cache_path` is given. Sources with sidecar files can include them via file_sig(path).
     """
     old_cache = _load_meta_cache(cache_path)
     new_cache = {}
@@ -401,6 +406,7 @@ def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
             all_present[provider] = set()
             continue
         src = src_cls()
+        file_sig = getattr(src, "file_sig", _file_sig)
         keep, _skipped = src.list(dirs, None, (), "all", False)
         present = set()
         for _sort_key, sid, path in keep:
@@ -409,20 +415,17 @@ def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
                 continue
             key = str(path)
             try:
-                st = path.stat()
-                sig = (st.st_size, st.st_mtime_ns)
+                sig = file_sig(path)
             except OSError:
                 continue
             cached = old_cache.get(key)
-            if (isinstance(cached, dict) and cached.get("size") == sig[0]
-                    and cached.get("mtime_ns") == sig[1]):
+            if isinstance(cached, dict) and cached.get("sig") == sig:
                 folder = cached.get("folder")
                 start_epoch = cached.get("start_time")
             else:
                 folder, raw_ts = src.run_meta(path)
                 start_epoch = _to_epoch(raw_ts) if raw_ts is not None else None
-            new_cache[key] = {"size": sig[0], "mtime_ns": sig[1],
-                              "folder": folder, "start_time": start_epoch}
+            new_cache[key] = {"sig": sig, "folder": folder, "start_time": start_epoch}
             runs.append(AgentRun(provider=provider, session_id=sid, path=path,
                                  folder=folder, start_time=start_epoch))
         all_present[provider] = present
