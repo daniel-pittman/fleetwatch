@@ -35,6 +35,10 @@ CACHE_VERSION = 1
 GIT_TIMEOUT_S = 5
 
 
+class RoutingError(ValueError):
+    """A routing configuration problem (for example a catch-all index outside a protected group)."""
+
+
 @dataclass(frozen=True)
 class AgentRun:
     provider: str
@@ -254,23 +258,23 @@ def _folder_match_len(candidate_norm, candidate_abs, real_folders, slug_names):
 
 
 def validate_catch_all(reg, settings):
-    """Return the configured catch-all index name (or None). Raises ValueError when settings
+    """Return the configured catch-all index name (or None). Raises RoutingError when settings
     name an index that is missing, plain, or not in a protected group."""
     name = getattr(settings, "catch_all_index", None)
     if not name:
         return None
     active = reg.get("indexes") or {}
     if name not in active:
-        raise ValueError("routing.catch_all index %r is not in the registry" % name)
+        raise RoutingError("routing.catch_all index %r is not in the registry" % name)
     entry = active[name]
     if entry.get("kind") == "plain":
-        raise ValueError("routing.catch_all index %r cannot be a plain index" % name)
+        raise RoutingError("routing.catch_all index %r cannot be a plain index" % name)
     t = entry.get("transcripts")
     if isinstance(t, dict) and t.get("source", "claude") != "claude":
-        raise ValueError("routing.catch_all index %r cannot be a provider-specific index" % name)
+        raise RoutingError("routing.catch_all index %r cannot be a provider-specific index" % name)
     group = entry.get("group")
     if not fleetwatch_settings.is_protected(group, settings.protected_groups):
-        raise ValueError(
+        raise RoutingError(
             "routing.catch_all index %r is in group %r, which is not a protected group "
             "(protected: %s)" % (name, group, ", ".join(sorted(settings.protected_groups)) or "none"))
     return name

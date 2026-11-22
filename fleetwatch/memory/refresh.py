@@ -49,7 +49,7 @@ import yaml
 
 from fleetwatch import migrate, settings as fleetwatch_settings
 
-from . import codex_parse, doc_corpus, session_parse, session_tagger
+from . import codex_parse, doc_corpus, routing, session_parse, session_tagger
 from .privacy_scan import RuleSet, Scanner, protected_ready
 
 LOCK_STALE_S = 3600
@@ -158,6 +158,127 @@ def source_name(t):
 def transcript_source(t):
     """The source object for a `transcripts:` block."""
     return TRANSCRIPT_SOURCES[source_name(t)]()
+
+
+def agent_sources():
+    """Provider-agnostic map of routable external agent sources ({provider_name: source_cls}).
+    Any source registered in TRANSCRIPT_SOURCES that implements run_meta() participates."""
+    return {name: cls for name, cls in TRANSCRIPT_SOURCES.items()
+            if cls is not session_parse.ClaudeSource and callable(getattr(cls, "run_meta", None))}
+
+
+def routing_cache_path():
+    return ROOT / "logs" / "routing-cache.json"
+
+
+def resolve_routing(reg, ledger_path=None, git_cmd=None):
+    return routing.resolve_all(
+        reg, SETTINGS, agent_sources(), ledger_path=ledger_path,
+        git_cmd=git_cmd, cache_path=routing_cache_path(), project_dirs_fn=project_dirs)
+
+
+def _merge_session_records(groups_of_records):
+    """Merge records from Claude and routed agent sources while keeping each session's exchanges
+    contiguous in chronological order by session start time."""
+    by_session = {}
+    order = []
+    for recs in groups_of_records:
+        for r in recs:
+            key = (r.get("provider") or "", r["session"])
+            if key not in by_session:
+                by_session[key] = []
+                order.append(key)
+            by_session[key].append(r)
+    by_key = sorted(order, key=lambda k: (by_session[k][0].get("ts") or "", k[1], k[0]))
+    out = []
+    for k in by_key:
+        out.extend(by_session[k])
+    return out
+
+
+def load_routed_runs(runs, provider, src_cls, provider_state, scanner, opts, rules,
+                     full=False, triage=None, on_missing="hold", all_present_sids=None):
+    """Parse and scrub routed agent runs assigned to one index for one provider.
+
+    Constraint: a previously stored run that still exists on disk but resolved to a different
+    index (or unplaced) is always removed here, so no run stays indexed in two indexes.
+    """
+    if on_missing not in session_parse.ON_MISSING:
+        raise ValueError("transcripts.on_missing must be one of %s, not %r"
+                         % (", ".join(session_parse.ON_MISSING), on_missing))
+    sess = provider_state / "sessions"
+    if not runs and not sess.is_dir():
+        return [], dict(sessions=0, new=0, files_reparsed=0, removed=0, held=0)
+    sess.mkdir(parents=True, exist_ok=True)
+    source = src_cls()
+    sig = "%s|%s" % (scanner.version, session_parse.opts_sig(opts))
+    keep = sorted(((r.start_time or 0.0, r.session_id, r.path) for r in runs),
+                  key=lambda item: (item[0], item[1]))
+    keep_sids = {sid for _, sid, _ in keep}
+    present_sids = set(all_present_sids or ()) | keep_sids
+
+    held, removed = [], set()
+    for p in sorted(sess.glob("*.jsonl")) + sorted(sess.glob("*.cursor.json")):
+        sid = p.name.split(".")[0]
+        if sid in keep_sids:
+            continue
+        moved_elsewhere = sid in present_sids
+        if not moved_elsewhere and on_missing == "hold":
+            if p.name == sid + ".jsonl" and triage is None:
+                recs = session_parse.hold_records(sess, sid, scanner, sig, full, opts)
+                if recs:
+                    held.append((recs[0]["ts"], sid, recs))
+            continue
+        removed.add(sid)
+        if triage is None:
+            p.unlink()
+
+    allrecs, n_new, n_files = [], 0, 0
+    for _ts0, sid, path in sorted(keep + held, key=lambda k: (str(k[0]), k[1])):
+        sp = sess / (sid + ".jsonl")
+        curp = sess / (sid + ".cursor.json")
+        if isinstance(path, list):
+            allrecs += session_parse.drop_replays(path)
+            continue
+        old, cursor = [], None
+        if sp.exists() and curp.exists() and not full and triage is None:
+            cursor = json.loads(curp.read_text())
+            if cursor.get("scan_version") != sig:
+                cursor = None
+            else:
+                old = session_parse.read_records(sp)
+        recs, cur, old = source.parse(path, cursor, old, opts, rules)
+        for r in recs:
+            r.pop("seen", None)
+            r["session"] = sid
+            r["id"] = session_parse.exchange_id(sid, r.get("ex", "EX"), r["n"], opts,
+                                                source.id_stem(sid))
+            r.setdefault("provider", provider)
+        session_parse.withhold_matching(recs, opts.get("withhold_patterns"))
+        if recs:
+            n_files += 1
+            scanner.scan_records(recs, triage)
+        n_new += len(recs)
+        merged = old + recs
+        if triage is None and (recs or (getattr(source, "keep_empty", False)
+                                        and cur is not None and cur is not cursor)):
+            tmp = sp.with_suffix(".tmp")
+            with open(tmp, "w") as fh:
+                for r in merged:
+                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            os.replace(tmp, sp)
+            cur["scan_version"] = sig
+            curp.write_text(json.dumps(cur))
+        part = session_parse.drop_replays(merged)
+        try:
+            recent = path.stat().st_mtime > time.time() - 900
+        except OSError:
+            recent = False
+        if part and recent:
+            part[-1]["open"] = True
+        allrecs += part
+    return allrecs, dict(sessions=len(keep), new=n_new, files_reparsed=n_files,
+                         removed=len(removed), held=len(held), **source.stats())
 
 
 def project_dirs(t):
@@ -324,18 +445,55 @@ class Index:
         """The index's doc_options over the column denylist the settings compose."""
         return dict(dict(column_denylist=COLUMN_DENYLIST), **(self.entry.get("doc_options") or {}))
 
-    def transcripts(self, **kw):
+    def transcripts(self, plan=None, **kw):
         t = self.entry.get("transcripts")
-        if not t:
-            return [], {}, dict(sessions=0, new=0, files_reparsed=0, removed=0, held=0)
-        opts = session_parse.parse_opts(t)
-        self.state.mkdir(parents=True, exist_ok=True)
-        (self.state / "parse_options.json").write_text(json.dumps(opts, sort_keys=True))
-        return session_parse.load_transcripts(
-            project_dirs(t), self.state, self.scanner,
-            sessions=t.get("sessions", "all"),
-            exclude_automated=t.get("exclude_automated", True), opts=opts, rules=PARSE_RULES,
-            on_missing=t.get("on_missing", "hold"), source=transcript_source(t), **kw)
+        if t:
+            opts = session_parse.parse_opts(t)
+            self.state.mkdir(parents=True, exist_ok=True)
+            (self.state / "parse_options.json").write_text(json.dumps(opts, sort_keys=True))
+            records, skipped, st = session_parse.load_transcripts(
+                project_dirs(t), self.state, self.scanner,
+                sessions=t.get("sessions", "all"),
+                exclude_automated=t.get("exclude_automated", True), opts=opts, rules=PARSE_RULES,
+                on_missing=t.get("on_missing", "hold"), source=transcript_source(t), **kw)
+        else:
+            records, skipped = [], {}
+            st = dict(sessions=0, new=0, files_reparsed=0, removed=0, held=0)
+        if self.entry.get("kind") != "plain" and (not t or source_name(t) == "claude"):
+            if plan is None and (REGISTRY.exists() or REGISTRY_DIR.is_dir()):
+                reg = load_registry()
+                if self.name in reg["indexes"]:
+                    plan = resolve_routing(reg)
+            if plan is not None:
+                agent_counts = plan.counts_for(self.name)
+                runs_by_provider = plan.runs_for(self.name)
+                agents_root = self.state / "agents"
+                existing = ({p.name for p in agents_root.iterdir() if p.is_dir()}
+                            if agents_root.is_dir() else set())
+                routed_opts = dict(session_parse.parse_opts(t), bare_exchange_ids=False)
+                on_missing = (t or {}).get("on_missing", "hold")
+                sources = agent_sources()
+                extra_groups = []
+                for provider in sorted(set(runs_by_provider) | existing):
+                    src_cls = sources.get(provider)
+                    if src_cls is None:
+                        continue
+                    r_recs, rst = load_routed_runs(
+                        runs_by_provider.get(provider, []), provider, src_cls,
+                        agents_root / provider, self.scanner, routed_opts, PARSE_RULES,
+                        full=kw.get("full", False), triage=kw.get("triage"),
+                        on_missing=on_missing, all_present_sids=plan.all_present.get(provider))
+                    if r_recs:
+                        extra_groups.append(r_recs)
+                    for key in ("sessions", "new", "files_reparsed", "removed", "held"):
+                        st[key] = st.get(key, 0) + rst.get(key, 0)
+                if extra_groups:
+                    records = _merge_session_records([records] + extra_groups)
+                st["agent_runs"] = agent_counts
+            else:
+                st.setdefault("agent_runs", {routing.REASON_LAUNCH: 0, routing.REASON_FOLDER: 0,
+                                             routing.REASON_CATCH_ALL: 0})
+        return records, skipped, st
 
     def build_marker(self):
         """Present from just before an engine build until it succeeds: a failed build leaves
@@ -408,13 +566,13 @@ class Index:
 
     # ------------------------------------------------------------------- refresh
 
-    def refresh(self, opts, beat=lambda: None):
+    def refresh(self, opts, beat=lambda: None, plan=None):
         t0 = time.time()
         private_dirs(ROOT, self.dir)
         self.state.mkdir(parents=True, exist_ok=True)
         info = dict(index=self.name, started=now_iso())
         cfgd = self.defaults
-        records, skipped, st = self.transcripts(full=opts.full)
+        records, skipped, st = self.transcripts(full=opts.full, plan=plan)
         beat()
         t_parse = time.time()
         for r in records:
@@ -433,7 +591,7 @@ class Index:
             self.scanner.scrub_tag(rec)
             rec["topics"] = session_tagger.normalize_topics(rec.get("topics"))
         tag_stats = dict(attempted=0, tagged=0, failed=0, deferred=0)
-        do_tag = cfgd.get("tag", True) and not opts.no_tag and self.entry.get("transcripts")
+        do_tag = cfgd.get("tag", True) and not opts.no_tag and bool(self.entry.get("transcripts") or live)
         if do_tag:
             budget = opts.tag_budget if opts.tag_budget is not None else (
                 self.entry.get("first_run_tag_budget", cfgd["tag_budget_per_run"]) if first_run
@@ -476,8 +634,14 @@ class Index:
 
         changed = sess_changed + len(docs["changed"]) + len(docs["removed"])
         beat()
-        built, build_s, idx_line, retried = self.build_if(
-            changed or opts.build or not self.index_file.exists())
+        has_corpus = n_live > 0 or bool(docs["changed"]) or docs["unchanged"] > 0
+        if has_corpus:
+            built, build_s, idx_line, retried = self.build_if(
+                changed or opts.build or not self.index_file.exists())
+        else:
+            if self.index_file.exists():
+                self.index_file.unlink()
+            built, build_s, idx_line, retried = False, 0, "", False
         info.update(
             finished=now_iso(), wall_s=round(time.time() - t0, 1),
             parse_s=round(t_parse - t0, 1), tag_s=round(t_tag - t_parse, 1),
@@ -487,6 +651,8 @@ class Index:
             **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped")
                if k in st},
             sessions_removed=st.get("removed", 0), sessions_held=st.get("held", 0),
+            agent_runs=st.get("agent_runs", {routing.REASON_LAUNCH: 0, routing.REASON_FOLDER: 0,
+                                             routing.REASON_CATCH_ALL: 0}),
             corpus_files_changed=sess_changed, tags=tag_stats, tags_cached=len(cache),
             docs_changed=len(docs["changed"]), docs_removed=len(docs["removed"]),
             docs_unchanged=docs["unchanged"], doc_errors=docs["errors"],
@@ -503,13 +669,20 @@ class Index:
         records, its automated-run note, and every corpus file whose header names it; then
         rebuild. Returns counts only."""
         sess = self.state / "sessions"
-        sp = sess / (sid + ".jsonl")
-        ids = {r["id"] for r in session_parse.read_records(sp)} if sp.exists() else set()
+        sess_dirs = [sess]
+        agents_root = self.state / "agents"
+        if agents_root.is_dir():
+            sess_dirs += [p / "sessions" for p in sorted(agents_root.iterdir()) if (p / "sessions").is_dir()]
+        ids = set()
         stored = 0
-        for f in (sp, sess / (sid + ".cursor.json")):
-            if f.exists():
-                f.unlink()
-                stored += 1
+        for sd in sess_dirs:
+            sp = sd / (sid + ".jsonl")
+            if sp.exists():
+                ids.update(r["id"] for r in session_parse.read_records(sp))
+            for f in (sp, sd / (sid + ".cursor.json")):
+                if f.exists():
+                    f.unlink()
+                    stored += 1
         skip_path = self.state / "skipped-sessions.json"
         if skip_path.exists():
             skipped = json.loads(skip_path.read_text())
@@ -640,7 +813,7 @@ def run_plain(name, entry, opts):
     return True
 
 
-def run_one(reg, name, opts):
+def run_one(reg, name, opts, plan=None):
     if reg["indexes"][name].get("kind") == "plain":
         try:
             return run_plain(name, reg["indexes"][name], opts)
@@ -657,7 +830,7 @@ def run_one(reg, name, opts):
             print("[%s] refresh already running; skipping" % name)
             return True
         try:
-            info = ix.refresh(opts, lock.touch)
+            info = ix.refresh(opts, lock.touch, plan=plan)
         except Exception as e:
             ix.state.mkdir(parents=True, exist_ok=True)
             (ix.state / "last_error.log").write_text("%s\n%s" % (now_iso(), traceback.format_exc()))
@@ -671,6 +844,11 @@ def run_one(reg, name, opts):
     print("[%s] %d exchanges (%d new) over %d sessions; docs %d changed, %d removed, %d unchanged"
           % (name, info["exchanges"], info["new_exchanges"], info["sessions"],
              info["docs_changed"], info["docs_removed"], info["docs_unchanged"]))
+    ar = info.get("agent_runs") or {}
+    if any(ar.values()):
+        print("[%s] agent runs: %d by launch, %d by folder, %d by catch-all"
+              % (name, ar.get(routing.REASON_LAUNCH, 0), ar.get(routing.REASON_FOLDER, 0),
+                 ar.get(routing.REASON_CATCH_ALL, 0)))
     if info.get("sessions_removed") or info.get("sessions_held"):
         print("[%s] sessions without a transcript: %d held from stored records, %d removed "
               "from the index" % (name, info.get("sessions_held", 0), info.get("sessions_removed", 0)))
@@ -732,15 +910,25 @@ def cmd_discover(reg):
         print("... %d smaller folders not shown" % (len(rows) - 40))
 
 
-def cmd_status(reg):
+def cmd_status(reg, full_reg=None):
+    plan, routing_err = None, None
+    try:
+        plan = resolve_routing(full_reg if full_reg is not None else reg)
+    except ValueError as exc:
+        routing_err = str(exc)
     for name, e in reg["indexes"].items():
         d = ROOT / name
         lr = d / "state" / "last_run.json"
         print("== %s (group %s)" % (name, e["group"]))
         if (d / "state" / "build-pending").exists():
             print("   build pending: the last engine build did not finish; the next refresh rebuilds")
+        is_plain = e.get("kind") == "plain"
         if not lr.exists():
             print("   never run")
+            if not is_plain and plan is not None:
+                ar = plan.counts_for(name)
+                print("   agent runs: %d by launch, %d by folder, %d by catch-all"
+                      % (ar[routing.REASON_LAUNCH], ar[routing.REASON_FOLDER], ar[routing.REASON_CATCH_ALL]))
             continue
         j = json.loads(lr.read_text())
         if not j.get("ok"):
@@ -757,6 +945,12 @@ def cmd_status(reg):
               % (j["finished"], age, j["wall_s"], "ran %ss" % j["build_s"] if j["built"] else "skipped"))
         print("   %d exchanges (%d new last run), docs: %d changed / %d removed / %d unchanged"
               % (j["exchanges"], j["new_exchanges"], j["docs_changed"], j["docs_removed"], j["docs_unchanged"]))
+        ar = j.get("agent_runs") if isinstance(j.get("agent_runs"), dict) else (
+            plan.counts_for(name) if plan is not None else None)
+        if ar is not None:
+            print("   agent runs: %d by launch, %d by folder, %d by catch-all"
+                  % (ar.get(routing.REASON_LAUNCH, 0), ar.get(routing.REASON_FOLDER, 0),
+                     ar.get(routing.REASON_CATCH_ALL, 0)))
         print("   tags last run: %d tagged, %d failed, %d deferred; %d cached"
               % (t["tagged"], t["failed"], t["deferred"], j["tags_cached"]))
         up = d / "state" / "usage.jsonl"
@@ -779,6 +973,10 @@ def cmd_status(reg):
             lag = newest - fin.timestamp()
             print("   staleness: transcript %s the last run by %.0f min"
                   % ("is newer than" if lag > 0 else "is older than", abs(lag) / 60))
+    if routing_err:
+        print("agent routing error: %s" % routing_err)
+    elif plan is not None:
+        print("unplaced agent runs: %d" % len(plan.unplaced))
 
 
 def cmd_triage(reg, name):
@@ -883,7 +1081,7 @@ def main(argv=None):
         sys.exit("settings: %s" % SETTINGS_ERROR)
     try:
         return _main(sys.argv[1:] if argv is None else list(argv))
-    except (UnknownIndex, doc_corpus.NotSelected) as e:
+    except (UnknownIndex, doc_corpus.NotSelected, routing.RoutingError) as e:
         sys.exit(str(e))
 
 
@@ -943,6 +1141,7 @@ def _main(argv):
     opts = ap.parse_args(argv)
     opts.retag_all = False
     names = selected(reg, opts.index)
+    plan = resolve_routing(reg)
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
     failed = []
     t0, done = time.time(), []
@@ -950,7 +1149,7 @@ def _main(argv):
     if mark:
         write_run_marker(t0, None, done)
     for name in names:
-        if run_one(reg, name, opts):
+        if run_one(reg, name, opts, plan=plan):
             record_streak(name, None)
             if refreshed_since(name, t0):
                 done.append(name)

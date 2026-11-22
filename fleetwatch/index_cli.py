@@ -112,6 +112,7 @@ def cmd_list(reg, args):
 
 def cmd_status(reg, args):
     r = indexes.refresh()
+    full_reg = reg
     name = args[0] if args else None
     if name:
         _guard(reg, name)
@@ -127,7 +128,7 @@ def cmd_status(reg, args):
         reg = dict(reg, indexes=shown)
         if hidden:
             print("(%d index%s this session may not read not shown)" % (hidden, "" if hidden == 1 else "es"))
-    r.cmd_status(reg)
+    r.cmd_status(reg, full_reg=full_reg)
     return 0
 
 
