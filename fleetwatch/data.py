@@ -212,6 +212,15 @@ class Ancestry:
             p = self._table().get(pid)
         return default if p is None else p
 
+    def process_name(self, pid):
+        """Executable name for one process in this ancestry, or None when unavailable."""
+        try:
+            out = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], capture_output=True,
+                                 text=True, timeout=5)
+            return out.stdout.strip() if out.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
     @property
     def unreadable(self):
         return self.table == {} and bool(self.warnings)

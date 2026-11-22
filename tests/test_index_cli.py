@@ -172,9 +172,9 @@ class TrustGuard(unittest.TestCase):
     def refusal(self, target, session=("Mine", SID)):
         return indexes.read_refusal(REG, session, target)
 
-    def test_outside_a_session_everything_is_allowed(self):
+    def test_interactive_owner_reads_everything(self):
         for t in REG["indexes"]:
-            self.assertIsNone(self.refusal(t, None))
+            self.assertIsNone(self.refusal(t, indexes.Caller("owner")))
 
     def test_own_index_and_a_group_that_lists_the_callers_group(self):
         self.assertIsNone(self.refusal("mine-session"))
@@ -271,7 +271,8 @@ class SearchCommand(unittest.TestCase):
             self.assertEqual(code, 0, err)
 
     def search(self, *argv, session=None):
-        with mock.patch.object(indexes, "calling_session", return_value=session):
+        caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
+        with mock.patch.object(indexes, "classify_caller", return_value=caller):
             return capture(search_cmd.main, list(argv))
 
     def test_output_equals_the_old_cli_and_json_matches(self):
@@ -1093,11 +1094,12 @@ class IndexCommandsGuard(unittest.TestCase):
             "student": {"group": "ferpa", "owner_session": "Grading", "owner_session_id": SID2}})
 
     def run_as(self, session, argv):
+        caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
         with mock.patch.object(refresh, "main") as drv, \
                 mock.patch.object(refresh, "cmd_triage") as tri, \
                 mock.patch.object(index_migrate, "verify", return_value=0) as ver, \
                 mock.patch.object(index_migrate, "migrate", return_value=0) as mig, \
-                mock.patch.object(indexes, "calling_session", return_value=session):
+                mock.patch.object(indexes, "classify_caller", return_value=caller):
             code, out, err = capture(index_cli.main, argv)
         return code, err, drv.called or tri.called or ver.called or mig.called
 
@@ -1123,7 +1125,8 @@ class IndexCommandsGuard(unittest.TestCase):
 
     def test_status_without_a_name_lists_only_readable_indexes(self):
         def status(session):
-            with mock.patch.object(indexes, "calling_session", return_value=session):
+            caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
+            with mock.patch.object(indexes, "classify_caller", return_value=caller):
                 return capture(index_cli.main, ["status"])
         code, out, err = status(("Lab", SID))
         self.assertEqual(code, 0, err)
@@ -1151,7 +1154,8 @@ class IndexCommandsGuard(unittest.TestCase):
         # the driver run as a script checks ownership too
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
                 mock.patch.object(refresh, "forget_session") as fs, \
-                mock.patch.object(indexes, "calling_session", return_value=("Peer", SID2)):
+                mock.patch.object(indexes, "classify_caller",
+                                  return_value=indexes.Caller("session", ("Peer", SID2))):
             code, out, err = capture(refresh._main, ["forget", "lab", SID])
         self.assertEqual(code, 3)
         self.assertFalse(fs.called)
@@ -1165,7 +1169,8 @@ class IndexCommandsGuard(unittest.TestCase):
         reg = indexes.load_registry()
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
                 mock.patch.object(refresh, "cmd_triage") as tri, \
-                mock.patch.object(indexes, "calling_session", return_value=("Lab", SID)):
+                mock.patch.object(indexes, "classify_caller",
+                                  return_value=indexes.Caller("session", ("Lab", SID))):
             code, out, err = capture(refresh._main, ["triage", "student"])
         self.assertEqual(code, 3)
         self.assertFalse(tri.called)

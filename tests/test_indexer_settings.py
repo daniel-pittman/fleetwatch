@@ -621,6 +621,8 @@ class EndToEndWithNoSettings(unittest.TestCase):
         ix.mkdir(parents=True)
         (root / "registry.yaml").write_text(textwrap.dedent("""\
             defaults: {tag: true, tag_budget_per_run: 0}
+            groups:
+              research: {readers: ['*']}
             indexes:
               demo-session:
                 group: research

@@ -15,6 +15,7 @@ by anyone who can read the disk.
 import copy
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,9 @@ from .settings import is_protected
 DATA_ITEMS = ("corpus", "index", "state", "scan-report.md", "logs")
 OVERRIDES = "search_overrides.yaml"
 OWNER_KINDS_FIXED = ("heartbeat", "subagent", "peer-session", "other")
+# Codex sets these for sandboxed jobs and companion threads, including detached app-server jobs.
+CODEX_ENV_MARKERS = ("CODEX_SANDBOX", "CODEX_THREAD_ID")
+AGENT_EXECUTABLES = frozenset(("codex", "agy"))
 
 
 class IndexesError(Exception):
@@ -50,8 +54,8 @@ def load_registry():
 # ------------------------------------------------------------------ the calling session
 
 def calling_session(paths=None, ppids=None, start_pid=None):
-    """(name, sessionId) of the Claude session this process runs inside, or None in a plain
-    terminal. Found from process ancestry exactly as `write-status` finds it."""
+    """(name, sessionId) of the Claude session this process runs inside, or None otherwise.
+    Found from process ancestry exactly as `write-status` finds it."""
     paths = paths or data.default_paths()
     ppids = ppids if ppids is not None else data.Ancestry(paths.get("ps"))
     try:
@@ -61,6 +65,41 @@ def calling_session(paths=None, ppids=None, start_pid=None):
         if getattr(ppids, "unreadable", False):
             raise IndexesError(str(e))
         return None
+
+
+@dataclass(frozen=True)
+class Caller:
+    kind: str
+    session: tuple | None = None
+    sign: str | None = None
+
+
+def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=None):
+    """Identify a Claude session, an interactive owner, or an untrusted caller."""
+    paths = paths or data.default_paths()
+    ppids = ppids if ppids is not None else data.Ancestry(paths.get("ps"))
+    pid = os.getpid() if start_pid is None else start_pid
+    session = calling_session(paths, ppids, pid)
+    if session is not None:
+        return Caller("session", session)
+    seen = set()
+    while isinstance(pid, int) and pid > 1 and pid not in seen and len(seen) < 512:
+        seen.add(pid)
+        process_name = getattr(ppids, "process_name", None)
+        command = process_name(pid) if process_name is not None else None
+        if command:
+            executable = os.path.basename(command.split()[0]).lower()
+            if executable in AGENT_EXECUTABLES:
+                return Caller("untrusted", sign="%s process in the ancestry" % executable)
+        pid = ppids.get(pid)
+    environ = os.environ if environ is None else environ
+    for marker in CODEX_ENV_MARKERS:
+        if marker in environ:
+            return Caller("untrusted", sign="%s environment variable" % marker)
+    stdin = sys.stdin if stdin is None else stdin
+    if not stdin.isatty():
+        return Caller("untrusted", sign="stdin has no controlling terminal")
+    return Caller("owner")
 
 
 def listed_session_ids(entry):
@@ -139,14 +178,26 @@ def group_readers(reg, group):
     return [str(x) for x in (g.get("readers") or [])]
 
 
-def read_refusal(reg, session, target, protected=None):
-    """Why the calling session may not read index `target`, or None when it may. A plain
-    terminal (session None) is the owner at a shell and may read anything. An index in a
+def read_refusal(reg, caller, target, protected=None):
+    """Why the caller may not read index `target`, or None when it may. An index in a
     protected group is readable only by its owner session and the sessions its entry names
     in extra_readers; the group's `readers` list never opens it. `protected` defaults to the
     indexer settings' protected groups."""
-    if session is None:
+    if not isinstance(caller, Caller):
+        caller = classify_caller() if caller is None else Caller("session", caller)
+    if caller.kind == "owner":
         return None
+    if caller.kind == "untrusted":
+        entry = all_entries(reg).get(target) or {}
+        group = entry.get("group")
+        if protected is None:
+            protected = refresh().SETTINGS.protected_groups
+        if not is_protected(group, protected) and "*" in (group_readers(reg, group) or []):
+            return None
+        return ("refused: index %r is in group %r; caller was not identified as a Claude "
+                "session or the owner (%s). Only an unprotected group with '*' in its "
+                "readers list permits this read." % (target, group, caller.sign))
+    session = caller.session
     name, sid = session
     mine = owned_by(reg, name, sid)
     if target in mine:

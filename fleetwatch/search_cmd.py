@@ -53,12 +53,12 @@ def main(argv):
     try:
         name, rest = take_index(argv)
         reg = indexes.load_registry()
-        session = indexes.calling_session()
+        caller = indexes.classify_caller()
         if name is None:
-            name = indexes.own_index(reg, session)
+            name = indexes.own_index(reg, caller.session)
         if name not in reg["indexes"]:
             raise IndexesError("no index %r in the registry (see `fleetwatch index list`)" % name)
-        why = indexes.read_refusal(reg, session, name)
+        why = indexes.read_refusal(reg, caller, name)
         if why:
             print("fleetwatch search: " + why, file=sys.stderr)
             return 3
