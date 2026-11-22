@@ -41,6 +41,11 @@ it, because a guess could scrub less than you asked for or rename every stored e
     default_guidance_file = "x.txt"   # replaces the built-in summary guidance (or
                                       # default_guidance = "text"); relative to the config folder
 
+    [routing]
+    catch_all = "unrouted-agents"     # optional index for unrouted agent runs (must be in a
+                                      # protected group); with none set, unrouted runs are skipped
+    sources = { codex = "~/.codex/sessions" }  # optional provider -> sessions folder(s)
+
 Changing owner_kind, owner_name, timezone, heartbeat_patterns or automated_prefixes does not
 reparse stored transcripts by itself: refresh an index with --full to apply them to it.
 
@@ -221,10 +226,22 @@ class IndexerSettings:
     default_guidance: str = None    # None: the tagger's built-in guidance
     config_root: Path = None        # where registry.yaml, registry.d and per-index config live;
                                     # None: same as index_root
+    catch_all_index: str = None     # optional index name for unrouted agent runs (protected group)
+    routing_sources: tuple = None   # None: provider defaults; else ((provider, (Path, ...)), ...)
 
     @property
     def owner_display(self):
         return self.owner_name or "User"
+
+    def source_dirs(self, provider, default_path=None):
+        """Session directories to scan for agent `provider`."""
+        if self.routing_sources is not None:
+            by_name = dict(self.routing_sources)
+            if provider in by_name:
+                return list(by_name[provider])
+        if default_path:
+            return [Path(os.path.expanduser(default_path))]
+        return []
 
 
 def _table(raw, key):
@@ -325,9 +342,33 @@ def indexer(raw=None, cfg_dir=None):
         except OSError as e:
             raise SettingsError("settings.toml: tagger.default_guidance_file: %s" % e)
 
+    rt = _table(raw, "routing")
+    unknown_rt = sorted(set(rt) - {"catch_all", "sources"})
+    if unknown_rt:
+        raise SettingsError("settings.toml: routing.%s is not a setting" % unknown_rt[0])
+    catch_all = _str(rt, "catch_all", "routing.")
+    rsources = None
+    if "sources" in rt:
+        src_tbl = rt["sources"]
+        if not isinstance(src_tbl, dict):
+            raise SettingsError("settings.toml: routing.sources must be a table mapping provider names to path(s)")
+        parsed = []
+        for prov, val in sorted(src_tbl.items()):
+            if not isinstance(prov, str) or not prov.strip():
+                raise SettingsError("settings.toml: routing.sources provider name must be a non-empty string")
+            if isinstance(val, str):
+                if not val.strip():
+                    raise SettingsError("settings.toml: routing.sources.%s must be a non-empty path" % prov)
+                parsed.append((prov.strip(), (_path(val.strip()),)))
+            elif isinstance(val, list) and all(isinstance(x, str) and x.strip() for x in val):
+                parsed.append((prov.strip(), tuple(_path(x.strip()) for x in val)))
+            else:
+                raise SettingsError("settings.toml: routing.sources.%s must be a path or list of paths" % prov)
+        rsources = tuple(parsed)
+
     return IndexerSettings(
         tz=tz, owner_name=name.strip(), owner_kind=kind, data_dir=ddir, index_root=root,
         projects_dir=projects, build_python=build_py, heartbeat_patterns=beats,
         automated_prefixes=prefixes, protected_groups=protected, group_guess=tuple(guess.items()),
         rule_packs=tuple(packs), column_denylist=cols, default_guidance=guidance,
-        config_root=cfg_root)
+        config_root=cfg_root, catch_all_index=catch_all, routing_sources=rsources)

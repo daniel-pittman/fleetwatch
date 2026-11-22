@@ -77,11 +77,21 @@ def compile_rule(r):
     return re.compile(r["pattern"]), res
 
 
+# How the prompt names the session for each source other than Claude Code. The prompt text is
+# the tag-cache version (TagConfig.version), so a Claude index's prompt must stay byte-identical:
+# any change to it re-tags every exchange of every Claude index.
+PROVIDER_SESSIONS = {"codex": "a Codex CLI session", "antigravity": "an Antigravity CLI conversation"}
+
+
 class TagConfig:
-    def __init__(self, spec, default_guidance=None):
+    def __init__(self, spec, default_guidance=None, source="claude"):
         """`spec` is a parsed tags.yaml; `default_guidance` replaces DEFAULT_GUIDANCE when the
         spec has no `prompt` (settings.toml [tagger]). The guidance text is part of the
-        system prompt, so it is part of `version`."""
+        system prompt, so it is part of `version`. `source` is the index's transcript source;
+        the prompt names it unless it is claude."""
+        if source != "claude" and source not in PROVIDER_SESSIONS:
+            raise ValueError("unknown transcript source %r" % (source,))
+        self.source = source
         self.description = spec["description"].strip()
         self.model = spec.get("model", "haiku")
         self.batch_size = int(spec.get("batch_size", 25))
@@ -108,7 +118,7 @@ class TagConfig:
     def _system(self):
         areas = "\n".join("- %s: %s" % kv for kv in self.areas.items())
         kinds = "\n".join("- %s: %s" % kv for kv in self.kinds.items())
-        return (
+        text = (
             "You tag exchanges from the transcript of a Claude Code session. %s\n\n"
             "Each exchange is one incoming message (from the user, a heartbeat cron prompt, a "
             "subagent or teammate hand-back, or a peer Claude session) plus the session's text "
@@ -121,6 +131,10 @@ class TagConfig:
             "kinds (one to three %s):\n%s\n%s\n\n%s\n"
             % (self.description, self.facets["area"], self.facets["kind"], self.facets["area"],
                areas, self.facets["kind"], kinds, self.kind_notes, self.guidance))
+        if self.source == "claude":
+            return text
+        return text.replace("of a Claude Code session.", "of %s." % PROVIDER_SESSIONS[self.source],
+                            1).replace("or a peer Claude session)", "or a peer session)", 1)
 
 
 def tag_hash(r):

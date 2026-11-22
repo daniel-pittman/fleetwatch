@@ -570,6 +570,30 @@ class TextutilPlatform(unittest.TestCase):
             doc_corpus.textutil_txt(Path("x.doc"), doc_corpus.Ctx())
 
 
+class TaggerPrompt(unittest.TestCase):
+    """The prompt text is the tag-cache version: a Claude index's must never change, or every
+    Claude index re-tags."""
+
+    def test_the_claude_prompt_hash_is_unchanged(self):
+        self.assertEqual(session_tagger.TagConfig(TAGS).version, "ab5e0b2866")
+        self.assertEqual(session_tagger.TagConfig(TAGS, "summary: say what changed.").version,
+                         "0c0f96a194")
+        self.assertEqual(session_tagger.TagConfig(TAGS, source="claude").version, "ab5e0b2866")
+
+    def test_other_sources_name_their_provider(self):
+        claude = session_tagger.TagConfig(TAGS).system
+        for source, words in (("codex", "a Codex CLI session."),
+                              ("antigravity", "an Antigravity CLI conversation.")):
+            tc = session_tagger.TagConfig(TAGS, source=source)
+            self.assertIn("You tag exchanges from the transcript of %s" % words, tc.system)
+            self.assertNotIn("Claude", tc.system)
+            self.assertNotEqual(tc.version, "ab5e0b2866")
+            self.assertEqual(tc.system.replace(words, "a Claude Code session.").replace(
+                "a peer session)", "a peer Claude session)"), claude)
+        with self.assertRaises(ValueError):
+            session_tagger.TagConfig(TAGS, source="gemini")
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -621,6 +645,8 @@ class EndToEndWithNoSettings(unittest.TestCase):
         ix.mkdir(parents=True)
         (root / "registry.yaml").write_text(textwrap.dedent("""\
             defaults: {tag: true, tag_budget_per_run: 0}
+            groups:
+              research: {readers: ['*']}
             indexes:
               demo-session:
                 group: research
@@ -633,8 +659,12 @@ class EndToEndWithNoSettings(unittest.TestCase):
         (ix / "search_config.yaml").write_text(E2E_CONFIG.format(root=dix))
         sessions = base / "sessions"
         sessions.mkdir()
+        home = base / "home"
+        home.mkdir()
         env = {k: v for k, v in os.environ.items() if k not in ("FLEETWATCH_PROJECTS_DIR", "TZ")}
-        env.update(FLEETWATCH_CONFIG_DIR=str(cfg), XDG_DATA_HOME=str(data), TZ="UTC",
+        env.update(HOME=str(home), FLEETWATCH_CONFIG_DIR=str(cfg), XDG_DATA_HOME=str(data),
+                   XDG_STATE_HOME=str(base / "state"),
+                   FLEETWATCH_LAUNCH_LEDGER=str(base / "state" / "launches.jsonl"), TZ="UTC",
                    FLEETWATCH_SESSIONS_DIR=str(sessions), FLEETWATCH_NO_MIGRATE="1",
                    PYTHONPATH=str(REPO) + os.pathsep + env.get("PYTHONPATH", ""))
         run = lambda *argv: subprocess.run([sys.executable, *argv], capture_output=True, text=True,

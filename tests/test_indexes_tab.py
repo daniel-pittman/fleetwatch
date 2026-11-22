@@ -12,7 +12,20 @@ from unittest import mock
 
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.dirname(__file__))
 from fleetwatch import app as fapp, data, demo, index_health, views  # noqa: E402
+from waiting import first_scan, settle  # noqa: E402
+
+
+def all_open(lst):
+    """True once the list has expandable rows and every one of them is open."""
+    stack, rows = list(lst.nodes), []
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children)
+        if n.expandable:
+            rows.append(n)
+    return bool(rows) and all(lst.is_open(n) for n in rows)
 
 CANARIES = ("CANARY-CORPUS-TEXT", "CANARY-PROBE-TEXT", "CANARY-TAG", "CANARY-ERROR-TEXT", "canary-secret-dir")
 
@@ -37,6 +50,9 @@ class CanaryTree:
         state = self.root / name / "state"
         state.mkdir(parents=True)
         info = {"ok": ok, "finished": iso(ago), "exchanges": 12, "tags": {"tagged": 1, "x": "CANARY-TAG"}}
+        if name == "alpha":
+            info["exchanges_by_provider"] = {"claude": 7, "codex": 3, "antigravity": 2, "CANARY-TAG": 12}
+            info["agent_runs"] = {"launch": 2, "folder": 1, "catch_all": 3, "CANARY-TAG": 12}
         if error:
             info["error"] = error
         (state / "last_run.json").write_text(json.dumps(info))
@@ -74,6 +90,8 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((rows["alpha"].state, rows["alpha"].exchanges, rows["alpha"].files), ("ok", 12, 3))
         self.assertEqual((rows["beta"].state, rows["beta"].reason), ("failed", "build"))
         self.assertEqual(rows["alpha"].kind, "session")
+        self.assertEqual(rows["alpha"].exchanges_by_provider, {"claude": 7, "codex": 3, "antigravity": 2})
+        self.assertEqual(rows["alpha"].agent_runs, {"launch": 2, "folder": 1, "catch_all": 3})
 
     def test_stale_is_twice_the_schedule_or_two_days_without_one(self):
         now = time.time()
@@ -140,7 +158,7 @@ class BoardCase(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return await script(app, pilot)
         if loader is None:
             return asyncio.run(go())
@@ -149,10 +167,31 @@ class BoardCase(unittest.TestCase):
 
 
 class TabTests(BoardCase):
+    def test_expanded_index_shows_provider_and_placement_counts(self):
+        tree = CanaryTree()
+        self.addCleanup(tree.close)
+        real = index_health.load
+
+        def loader():
+            with mock.patch.dict(os.environ, FLEETWATCH_DEMO=""):
+                return real(tree.reg, tree.root, False, index_health.Cache())
+
+        async def script(app, pilot):
+            await pilot.press("5", "z")
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB and
+                         all_open(app.lists[views.INDEXES_TAB]), "the Indexes tab to open")
+            return app.lists[views.INDEXES_TAB].visible_text()
+
+        text = self.board((140, 40), script, loader)
+        self.assertIn("exchanges by provider: claude 7, codex 3, antigravity 2", text)
+        self.assertIn("agent runs: 2 by launch, 1 by folder, 3 by catch-all", text)
+        self.assertNotIn("CANARY-TAG", text)
+
     def test_tab_five_lists_each_index_by_group_with_its_state_in_words(self):
         async def script(app, pilot):
             await pilot.press("5", "z")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB and all_open(app.lists[views.INDEXES_TAB]),
+                         "the Indexes tab to open every row")
             return app.lists[views.INDEXES_TAB].visible_text(), app.query_one(fapp.TabBar).plain
         text, bar = self.board((140, 40), script)
         for want in ("team", "archive", "ferpa", "storefront-sessions", "refreshed 14m ago", "1842 exchanges",
@@ -183,7 +222,7 @@ class TabTests(BoardCase):
             await pilot.press("y")
             lst.move_to("idx:release-history")
             await pilot.press("y")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: len(copied) == 2, "the copies")
             return copied, app.status_text, app.footer_plain
         copied, status, footer = self.board((140, 40), script)
         self.assertEqual(copied, ['fleetwatch search --index storefront-sessions "',
@@ -195,7 +234,8 @@ class TabTests(BoardCase):
     def test_missing_extra_shows_one_line(self):
         async def script(app, pilot):
             await pilot.press("5")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB
+                         and index_health.MISSING_EXTRA in app.lists[views.INDEXES_TAB].visible_text(), "the one-line note")
             return app.lists[views.INDEXES_TAB].visible_text(), app.lists[0].visible_text()
         loader = lambda: index_health.Result(note=index_health.MISSING_EXTRA)  # noqa: E731
         tab, needs = self.board((140, 40), script, loader)
@@ -215,7 +255,8 @@ class TabTests(BoardCase):
             seen = []
             for key in "5", "1":
                 await pilot.press(key, "z")
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: app.active == int(key) - 1 and all_open(app.lists[app.active]),
+                             "the tab to open every row")
                 seen.append(app.lists[app.active].visible_text())
             await pilot.press("5", "y")
             seen.append(app.status_text or "")
@@ -323,10 +364,11 @@ class OwnerBoardTests(BoardCase):
     def test_rows_say_who_owns_them_and_the_next_step(self):
         async def script(app, pilot):
             await pilot.press("5", "z")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB and all_open(app.lists[views.INDEXES_TAB]),
+                         "the Indexes tab to open every row")
             tab = app.lists[views.INDEXES_TAB].visible_text()
             await pilot.press("1")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: app.active == 0 and app.lists[0].visible_text(), "the Needs you tab")
             return tab, app.lists[0].visible_text()
         tab, needs = self.board((140, 60), script)
         for want in ("owner: Billing API", "owner: Pricing Page", "no owner session", "refreshing now",
@@ -349,9 +391,12 @@ class OwnerBoardTests(BoardCase):
             app._do_jump = lambda name, tty, close_find=False: calls["jump"].append((name, tty))
             app.start_resume = lambda sid, here: calls["resume"].append(sid)
             await pilot.press("5", "z")
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB and all_open(app.lists[views.INDEXES_TAB]),
+                         "the Indexes tab to open every row")
             app.lists[views.INDEXES_TAB].move_to(key)
+            before = app.status_text
             await pilot.press("enter")
-            await pilot.pause(0.4)
+            await settle(pilot, lambda: calls["jump"] or calls["resume"] or app.status_text != before, "the Enter action")
             return app.status_text
         status = self.board((140, 60), script)
         return calls, status
@@ -394,7 +439,7 @@ class OwnerBoardTests(BoardCase):
             await pilot.press("1")
             app.lists[0].move_to("needs-idx:release-history")
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: calls["resume"], "the resume")
         self.board((140, 60), script)
         self.assertEqual(calls["resume"], [demo.RESUME_SIDS[0]])
 

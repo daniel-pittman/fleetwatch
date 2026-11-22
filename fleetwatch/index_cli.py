@@ -7,14 +7,15 @@
     retag NAME [--all] | discover | triage NAME
     forget NAME SESSION_ID [--force]  remove one session from an index (records, tags, corpus)
     add [--session NAME] --group G [--docs PATH --include GLOB ...]
+    add --source codex|antigravity --group G [--path DIR] [--name INDEX]
     migrate NAME --from OLD_ROOT [--force]
     verify NAME [--baseline FILE] [--compare-old OLD_ROOT]
     schedule install | remove | status
 
 The refresh, file, retag, discover, triage, forget and status commands are thin wrappers over
 fleetwatch.memory.refresh. With no NAME, refresh and file act on the calling session's own
-index (found from process ancestry, as `write-status` finds the session). A command that names
-an index runs the same trust guard as `search` first and exits 3 when it refuses.
+index (found from process ancestry, as `write-status` finds the session). Commands that read a
+named index run the same trust guard as `search` first and exit 3 when it refuses.
 """
 import argparse
 import json
@@ -50,6 +51,18 @@ CODEX_TAGS_TEMPLATE = TAGS_TEMPLATE.replace(
     'description: "a Claude Code working session"',
     'description: "a Codex CLI working session (the transcripts are Codex rollouts, not '
     'Claude Code)"')
+ANTIGRAVITY_TAGS_TEMPLATE = TAGS_TEMPLATE.replace(
+    'description: "a Claude Code working session"',
+    'description: "an Antigravity CLI working session (the transcripts are Antigravity '
+    'conversations, not Claude Code)"')
+
+# The sources one index covers whole: the tool keeps every session in one folder, so the
+# index has no owner session. source -> (label, default folder, default index name, tags).
+FOLDER_SOURCES = {
+    "codex": ("Codex", "~/.codex/sessions", "codex-sessions", CODEX_TAGS_TEMPLATE),
+    "antigravity": ("Antigravity", "~/.gemini/antigravity-cli/conversations",
+                    "antigravity-sessions", ANTIGRAVITY_TAGS_TEMPLATE),
+}
 
 PROBES_TEMPLATE = """\
 # Fixed questions with the document or exchange that should answer each, for `fleetwatch
@@ -80,21 +93,30 @@ class Refused(IndexesError):
     """The trust guard refused the calling session this index (exit 3, as `search` does)."""
 
 
-def _guard(reg, name):
-    """Raise Refused unless the calling session may read index `name`. Every command that
-    names an index runs this first: each one reads its content, and triage prints names."""
+def _require_direct_caller(verb):
+    caller = indexes.classify_caller()
+    if caller.kind in ("untrusted", "delegated"):
+        raise Refused("refused: index %s requires a Claude session or the owner at a terminal (%s)"
+                      % (verb, caller.sign))
+
+
+def _guard(reg, name, caller=None):
+    """Raise Refused unless the caller may read index `name`. Triage prints raw names."""
     why = indexes.refresh().index_name_problem(name)
     if why:
         raise IndexesError(why)
     if name in reg.get("indexes", {}):
-        why = indexes.read_refusal(reg, indexes.calling_session(), name)
+        why = indexes.read_refusal(reg, caller if caller is not None else indexes.classify_caller(), name)
         if why:
             raise Refused(why)
     return name
 
 
 def _own_or(name, reg):
-    return _guard(reg, name) if name else indexes.own_index(reg, indexes.calling_session())
+    if name:
+        return _guard(reg, name)
+    caller = indexes.classify_caller()
+    return _guard(reg, indexes.own_index(reg, caller.session), caller)
 
 
 def cmd_list(reg, args):
@@ -112,6 +134,7 @@ def cmd_list(reg, args):
 
 def cmd_status(reg, args):
     r = indexes.refresh()
+    full_reg = reg
     name = args[0] if args else None
     if name:
         _guard(reg, name)
@@ -119,15 +142,15 @@ def cmd_status(reg, args):
             raise IndexesError("no index %r in the registry (see `fleetwatch index list`)" % name)
         reg = dict(reg, indexes={name: reg["indexes"][name]})
     else:
-        # Every index the calling session may read; outside a session, every index.
-        session = indexes.calling_session()
+        # Show only indexes the caller may read.
+        caller = indexes.classify_caller()
         shown = {n: e for n, e in reg["indexes"].items()
-                 if indexes.read_refusal(reg, session, n) is None}
+                 if indexes.read_refusal(reg, caller, n) is None}
         hidden = len(reg["indexes"]) - len(shown)
         reg = dict(reg, indexes=shown)
         if hidden:
             print("(%d index%s this session may not read not shown)" % (hidden, "" if hidden == 1 else "es"))
-    r.cmd_status(reg)
+    r.cmd_status(reg, full_reg=full_reg)
     return 0
 
 
@@ -166,7 +189,20 @@ def cmd_build(reg, args):
         return _fail("usage: fleetwatch index build NAME")
     from .search import cli, engine
     os.umask(indexes.refresh().PRIVATE_UMASK)
-    loc = indexes.locate(reg, _guard(reg, args[0]))
+    # A refresh launches this writer without a terminal. It emits build counts, not index
+    # content. Recognized Claude sessions still use their existing named-index guard.
+    caller = indexes.classify_caller()
+    name = args[0]
+    protected = indexes.refresh().SETTINGS.protected_groups
+    target_group = (reg.get("indexes", {}).get(name) or {}).get("group")
+    if caller.kind != "untrusted" or (indexes.is_agent_caller(caller) and
+                                      indexes.is_protected(target_group, protected)):
+        name = _guard(reg, name, caller)
+    else:
+        why = indexes.refresh().index_name_problem(name)
+        if why:
+            raise IndexesError(why)
+    loc = indexes.locate(reg, name)
     ix = engine.Index(loc.cfg_dir, indexes.search_config(loc))
     cli.set_env_defaults()
     cli.cmd_build(ix, None)
@@ -174,34 +210,39 @@ def cmd_build(reg, args):
 
 
 def cmd_add(reg, args):
+    _require_direct_caller("add")
     ap = argparse.ArgumentParser(prog="fleetwatch index add")
     ap.add_argument("--session", help="session name (default: the calling session)")
     ap.add_argument("--session-id", help="session id when --session names none that is running")
-    ap.add_argument("--name", help="index name (default: <session>-session, or codex-sessions)")
+    ap.add_argument("--name", help="index name (default: <session>-session, codex-sessions or "
+                                   "antigravity-sessions)")
     ap.add_argument("--group", required=True)
-    ap.add_argument("--source", choices=("claude", "codex"), default="claude",
-                    help="codex: index the Codex CLI sessions folder; the index has no owner "
-                         "session and one index covers every project, so choose its group "
-                         "for the most private project in it")
-    ap.add_argument("--path", help="the Codex sessions folder (default: ~/.codex/sessions)")
+    ap.add_argument("--source", choices=("claude",) + tuple(FOLDER_SOURCES), default="claude",
+                    help="codex or antigravity: index that CLI's sessions folder; the index has "
+                         "no owner session and one index covers every project, so choose its "
+                         "group for the most private project in it")
+    ap.add_argument("--path", help="the sessions folder of --source codex (default "
+                                   "~/.codex/sessions) or antigravity (default "
+                                   "~/.gemini/antigravity-cli/conversations)")
     ap.add_argument("--docs", help="a folder of reference documents to index")
     ap.add_argument("--include", action="append", help="glob under --docs (repeatable; default **/*.md)")
     ap.add_argument("--label", default="docs", help="label of the --docs folder")
     a = ap.parse_args(args)
     r = indexes.refresh()
     paths = data.default_paths()
-    codex = a.source == "codex"
-    if a.path and not codex:
-        return _fail("--path names the Codex sessions folder; use it with --source codex")
-    if codex:
+    whole = FOLDER_SOURCES.get(a.source)
+    if a.path and not whole:
+        return _fail("--path names a sessions folder; use it with --source codex or antigravity")
+    if whole:
+        label, default_path, default_name, tags_template = whole
         if a.session or a.session_id:
-            return _fail("--session and --session-id name a Claude session; a Codex index has "
-                         "no owner session (drop them with --source codex)")
+            return _fail("--session and --session-id name a Claude session; a %s index has "
+                         "no owner session (drop them with --source %s)" % (label, a.source))
         sname = sid = None
-        folder = Path(os.path.abspath(os.path.expanduser(a.path or "~/.codex/sessions")))
+        folder = Path(os.path.abspath(os.path.expanduser(a.path or default_path)))
         if not folder.is_dir():
-            return _fail("the Codex sessions folder %s does not exist" % tilde(folder))
-        name = a.name or "codex-sessions"
+            return _fail("the %s sessions folder %s does not exist" % (label, tilde(folder)))
+        name = a.name or default_name
     else:
         if a.session_id:
             sname, sid = a.session or a.session_id, a.session_id
@@ -218,7 +259,7 @@ def cmd_add(reg, args):
         name = a.name or indexes.slug(sname) + "-session"
     if r.index_name_problem(name):
         return _fail(r.index_name_problem(name))
-    owned = [] if codex else indexes.owned_by(reg, sname, sid)
+    owned = [] if whole else indexes.owned_by(reg, sname, sid)
     # Names compare without case: on a case-insensitive file system two names that differ
     # only in case share one config folder, one data folder and one registry.d file.
     rdir = Path(r.REGISTRY_DIR)
@@ -231,9 +272,9 @@ def cmd_add(reg, args):
     if groups and a.group not in groups:
         return _fail("group %r is not declared in the registry (have: %s)"
                      % (a.group, ", ".join(sorted(groups))))
-    if codex:
+    if whole:
         entry = {"group": a.group,
-                 "transcripts": {"source": "codex", "path": tilde(folder)}}
+                 "transcripts": {"source": a.source, "path": tilde(folder)}}
     else:
         entry = {"group": a.group, "owner_session": sname, "owner_session_id": sid,
                  "transcripts": {"project_dir": [tilde(f) for f in folders], "sessions": [sid],
@@ -253,7 +294,7 @@ def cmd_add(reg, args):
         allow.unlink()
         cfg.rmdir()
         return _fail("a %s index cannot start from the template: %s" % (a.group, "; ".join(problems)))
-    (cfg / "tags.yaml").write_text(CODEX_TAGS_TEMPLATE if codex else TAGS_TEMPLATE)
+    (cfg / "tags.yaml").write_text(tags_template if whole else TAGS_TEMPLATE)
     (cfg / "probes.yaml").write_text(PROBES_TEMPLATE)
     if not r.REGISTRY.exists():
         # A protected group starts with no readers: the guard ignores readers for it, and a
@@ -267,10 +308,11 @@ def cmd_add(reg, args):
     entry_file.parent.mkdir(parents=True, exist_ok=True)
     with open(entry_file, "x") as fh:
         fh.write("# Registry entry for the %s.\n"
-                 % ("Codex sessions index" if codex else "session %s" % sname))
+                 % ("%s sessions index" % label if whole else "session %s" % sname))
         fh.write(yaml.safe_dump({"indexes": {name: entry}}, sort_keys=False))
-    if codex:
-        print("added index %s (group %s) over the Codex sessions in %s" % (name, a.group, tilde(folder)))
+    if whole:
+        print("added index %s (group %s) over the %s sessions in %s"
+              % (name, a.group, label, tilde(folder)))
     else:
         print("added index %s (group %s) for session %s" % (name, a.group, sname))
         print("transcript folders: %d" % len(folders))
@@ -304,6 +346,8 @@ def cmd_migrate(reg, args):
     ap.add_argument("--from", dest="old", required=True, metavar="OLD_ROOT")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args(args)
+    if a.force:
+        _require_direct_caller("migrate --force")
     # The live registry's entry first: an index already here is overwritten only by a
     # session the guard lets read it (--force included). The old entry is checked too.
     _guard(reg, a.name)

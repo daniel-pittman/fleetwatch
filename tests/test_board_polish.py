@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from test_fleetwatch import NOW, dstr, iso, up_env  # noqa: E402
 from fleetwatch import app as fapp, data, demo, index_health, views  # noqa: E402
+from waiting import first_scan, settle  # noqa: E402
 
 
 def view_of(e):
@@ -163,7 +164,7 @@ class BoardCase(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return await script(app, pilot)
         return asyncio.run(go())
 
@@ -228,22 +229,22 @@ class HelpAt80ColumnsTests(BoardCase):
     def test_help_at_80x24_scrolls_to_the_last_line_without_sideways_overflow(self):
         async def script(app, pilot):
             await pilot.press("question_mark")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: type(app.screen).__name__ == "HelpScreen", "the help screen")
             screen = app.screen
             box = screen.query_one("#helpbox")
             top = (box.scroll_y, box.max_scroll_y, box.virtual_size.width, box.size.width, box.max_scroll_x)
             seen = [list(screen.lines)]
             await pilot.press("end")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: box.scroll_y == box.max_scroll_y, "the scroll to the end")
             bottom = box.scroll_y
             await pilot.press("home")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: box.scroll_y == 0, "the scroll to the top")
             home = box.scroll_y
             await pilot.press("pagedown")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: box.scroll_y > 0, "the page down")
             paged = box.scroll_y
             await pilot.press("escape")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ != "HelpScreen", "the help screen to close")
             return top, seen[0], bottom, home, paged, type(app.screen).__name__
         top, lines, bottom, home, paged, after = self.board((80, 24), script)
         scroll_y, max_y, vwidth, width, max_x = top
@@ -259,9 +260,9 @@ class HelpAt80ColumnsTests(BoardCase):
     def test_question_mark_closes_it_too(self):
         async def script(app, pilot):
             await pilot.press("question_mark")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "HelpScreen", "the help screen")
             await pilot.press("question_mark")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ != "HelpScreen", "the help screen to close")
             return type(app.screen).__name__
         self.assertNotEqual(self.board((80, 24), script), "HelpScreen")
 
@@ -279,7 +280,7 @@ class MouseTests(BoardCase):
             y = lst._spans[second][0]
             was_open = lst.is_open(lst._by_key[second])
             await pilot.click("#tab0", offset=(20, y))
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.cursor == second, "the cursor to move")
             return lst.cursor, second, was_open, lst.is_open(lst._by_key[second])
         cursor, second, was_open, now_open = self.board((140, 40), script)
         self.assertEqual(cursor, second)
@@ -292,11 +293,11 @@ class MouseTests(BoardCase):
             y = lst._spans[key][0]
             before = lst.is_open(lst._by_key[key])
             await pilot.click("#tab0", offset=(0, y))
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.is_open(lst._by_key[key]) != before, "the row to fold")
             mid = lst.is_open(lst._by_key[key])
             y = lst._spans[key][0]
             await pilot.click("#tab0", offset=(1, y))
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.is_open(lst._by_key[key]) != mid, "the row to unfold")
             return before, mid, lst.is_open(lst._by_key[key])
         before, mid, end = self.board((140, 40), script)
         self.assertNotEqual(before, mid)
@@ -310,7 +311,7 @@ class MouseTests(BoardCase):
             key = [k for k in lst._order if not lst._by_key[k].section][0]
             y = lst._spans[key][0]
             await pilot.click("#tab0", offset=(20, y), times=2)
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: calls, "the double click")
             return calls, key, lst.is_open(lst._by_key[key])
         calls, key, opened = self.board((140, 40), script)
         self.assertEqual(calls, [key])
@@ -324,7 +325,7 @@ class MouseTests(BoardCase):
             y = lst._spans[key][0]
             before = lst.is_open(lst._by_key[key])
             await pilot.click("#tab1", offset=(20, y), times=2)
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: lst.is_open(lst._by_key[key]) != before, "the section to fold")
             return before, lst.is_open(lst._by_key[key])
         before, after = self.board((140, 40), script)
         self.assertNotEqual(before, after)
@@ -334,7 +335,7 @@ class MouseTests(BoardCase):
             bar = app.query_one(fapp.TabBar)
             a, b = bar._spans[2]
             await pilot.click("#tabs", offset=((a + b) // 2 + 1, 0))
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: app.active == 2, "the tab to switch")
             return app.active
         self.assertEqual(self.board((140, 40), script), 2)
 
@@ -399,14 +400,14 @@ class ResumeDetailsKeyTests(BoardCase):
     def test_i_shows_the_session_id_folder_and_transcript(self):
         async def script(app, pilot):
             await pilot.press("4")
-            await pilot.pause(0.5)
+            await settle(pilot, lambda: app.active == views.RESUME_TAB and app.lists[3].visible_text(), "the Resume tab")
             rows = app.lists[3].visible_text()
             await pilot.press("i")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: type(app.screen).__name__ == "DetailScreen", "the details view")
             shown = type(app.screen).__name__, str(app.screen.query_one("#detailtext").render())
             footer = app.footer_plain
             await pilot.press("escape")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ != "DetailScreen", "the details view to close")
             return rows, shown, footer, type(app.screen).__name__
         rows, (screen, text), footer, after = self.board((140, 40), script)
         self.assertNotIn("session d3a0", rows)
@@ -420,9 +421,9 @@ class ResumeDetailsKeyTests(BoardCase):
     def test_the_opened_row_keeps_was_and_the_folder(self):
         async def script(app, pilot):
             await pilot.press("4")
-            await pilot.pause(0.5)
+            await settle(pilot, lambda: app.active == views.RESUME_TAB and app.lists[3].visible_text(), "the Resume tab")
             await pilot.press("e")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "was: " in app.lists[3].visible_text(), "the rows to open")
             return app.lists[3].visible_text()
         text = self.board((140, 60), script)
         self.assertIn("was: ", text)
@@ -437,7 +438,7 @@ class YCopiesTheNextCommandTests(BoardCase):
             await pilot.press("5")
             app.lists[4].move_to(key)
             await pilot.press("y")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: got, "the copy")
             return got
         return self.board((140, 40), script)
 

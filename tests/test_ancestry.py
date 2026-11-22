@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from fleetwatch import data, write_status  # noqa: E402
+from fleetwatch import data, indexes, write_status  # noqa: E402
 from fleetwatch.write_status import StatusError, find_session  # noqa: E402
 
 
@@ -31,6 +31,14 @@ class AncestryTests(unittest.TestCase):
         with mock.patch.object(data, "kernel_ppid", return_value=7), \
                 mock.patch.object(data, "read_ps", side_effect=AssertionError("ps ran")):
             self.assertEqual(data.Ancestry().get(100), 7)
+
+    def test_snapshot_columns_keep_full_paths_and_node_arguments(self):
+        self.assertEqual(data.split_ps_command(
+            "/Library/Application Support/codex /Library/Application Support/codex exec"),
+            ("/Library/Application Support/codex",
+             "/Library/Application Support/codex exec"))
+        self.assertEqual(data.split_ps_command("/usr/bin/node node /opt/agy-companion"),
+                         ("/usr/bin/node", "node /opt/agy-companion"))
 
     def test_falls_back_to_the_ps_table_with_a_long_timeout(self):
         calls = []
@@ -72,6 +80,30 @@ class AncestryTests(unittest.TestCase):
             with mock.patch.object(data, "kernel_ppid", side_effect=tree.get), \
                     mock.patch.object(data, "read_ps", side_effect=AssertionError("ps ran")):
                 self.assertEqual(find_session(sessions, data.Ancestry(), 300), ("Billing API", "abc"))
+
+    def test_caller_reads_structured_process_snapshots(self):
+        names = mock.Mock(returncode=0, stdout="600 500 /usr/bin/python\n"
+                          "500 1 /Library/Application Support/antigravity\n")
+        args = mock.Mock(returncode=0, stdout="600 python task.py\n"
+                         "500 /Library/Application Support/antigravity --server\n")
+        with tempfile.TemporaryDirectory() as sessions, \
+                mock.patch.object(data.subprocess, "run", side_effect=[names, args]) as run:
+            caller = indexes.classify_caller({"sessions": sessions}, data.Ancestry(), 600,
+                                             {}, mock.Mock(isatty=lambda: True))
+        self.assertEqual(caller.kind, "untrusted")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], ["ps", "-axo", "pid=,ppid=,comm="])
+        self.assertEqual(run.call_args_list[1].args[0], ["ps", "-axww", "-o", "pid=,args="])
+
+    def test_unreadable_process_names_fail_closed(self):
+        for result in (FileNotFoundError(), data.subprocess.TimeoutExpired("ps", 5),
+                       mock.Mock(returncode=1, stdout="")):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as sessions, \
+                    mock.patch.object(data.subprocess, "run", side_effect=result if isinstance(result, Exception) else None,
+                                      return_value=None if isinstance(result, Exception) else result):
+                caller = indexes.classify_caller({"sessions": sessions}, data.Ancestry(), 600,
+                                                 {}, mock.Mock(isatty=lambda: True))
+            self.assertEqual(caller.kind, "untrusted")
 
 
 if __name__ == "__main__":

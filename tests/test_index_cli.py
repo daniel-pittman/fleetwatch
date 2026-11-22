@@ -8,6 +8,7 @@ import json
 import os
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import yaml
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 
 from fleetwatch import index_cli, index_migrate, indexes, schedule, search_cmd, settings
-from fleetwatch.memory import refresh
+from fleetwatch.memory import refresh, render
 from fleetwatch.search import engine
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,11 +64,13 @@ def tmp(test):
 
 
 def use_layout(test, cfg, data_dir, projects=None, packs=("education",), protected=("ferpa",)):
-    """Point the refresh module at a synthetic config and data folder for one test."""
+    """Use a synthetic config, data folder and terminal caller for one test."""
     raw = {"paths": {"data_dir": str(data_dir), "projects_dir": str(projects or cfg / "projects")},
-           "scanner": {"rule_packs": list(packs)}, "groups": {"protected": list(protected)}}
+           "scanner": {"rule_packs": list(packs)}, "groups": {"protected": list(protected)},
+           "routing": {"sources": {"codex": [], "antigravity": []}}}
     old = refresh.SETTINGS
     test.addCleanup(refresh.configure, old)
+    test.enterContext(mock.patch.object(indexes, "calling_session", return_value=None))
     refresh.configure(settings.indexer(raw=raw, cfg_dir=cfg))
 
 
@@ -172,9 +175,9 @@ class TrustGuard(unittest.TestCase):
     def refusal(self, target, session=("Mine", SID)):
         return indexes.read_refusal(REG, session, target)
 
-    def test_outside_a_session_everything_is_allowed(self):
+    def test_interactive_owner_reads_everything(self):
         for t in REG["indexes"]:
-            self.assertIsNone(self.refusal(t, None))
+            self.assertIsNone(self.refusal(t, indexes.Caller("owner")))
 
     def test_own_index_and_a_group_that_lists_the_callers_group(self):
         self.assertIsNone(self.refusal("mine-session"))
@@ -271,8 +274,72 @@ class SearchCommand(unittest.TestCase):
             self.assertEqual(code, 0, err)
 
     def search(self, *argv, session=None):
-        with mock.patch.object(indexes, "calling_session", return_value=session):
+        caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
+        with mock.patch.object(indexes, "classify_caller", return_value=caller):
             return capture(search_cmd.main, list(argv))
+
+    def build_mixed_index(self):
+        self.migrate_both()
+        loc = indexes.locate(indexes.load_registry(), "demo-session")
+        day = loc.data_dir / "corpus" / "session" / "2026-04" / "20260401"
+        for n, provider in enumerate(("claude", "codex", "antigravity"), start=3):
+            record = dict(id="Saa11bb-EX-%04d" % n, ts="2026-04-01T10:00:00Z", session=SID,
+                          sender_kind="owner", sender_name="", interrupted=False, tools={},
+                          start_line=n, end_line=n, user_text="Telescope alignment for a test.",
+                          assistant=[], provider=provider if provider != "claude" else None)
+            (day / (record["id"] + ".owner.md")).write_text(render.render_exchange(record, None, None, {}, []))
+        docs = loc.data_dir / "corpus" / "docs"
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / "alignment.md").write_text("# Telescope alignment\n\nReference instructions for a test.\n")
+        return engine.build(engine.Index(loc.cfg_dir, indexes.search_config(loc)))["index_path"]
+
+    def test_mixed_search_labels_hit_headings_even_when_filtered_to_one_provider(self):
+        self.build_mixed_index()
+        code, out, err = self.search("telescope", "--index", "demo-session")
+        self.assertEqual(code, 0, err)
+        headings = [line for line in out.splitlines() if line.lstrip()[:1].isdigit()]
+        for provider in ("claude", "codex", "antigravity"):
+            self.assertTrue(any(line.endswith("[%s]" % provider) for line in headings), out)
+        self.assertTrue(any(line.endswith("alignment.md") for line in headings), out)
+
+        code, out, err = self.search("telescope", "--index", "demo-session",
+                                     "--provider", "codex", "--around", "0")
+        self.assertEqual(code, 0, err)
+        self.assertIn("#1 hit in Saa11bb-EX-0004 [codex]", out)
+        self.assertNotIn("alignment.md", out)
+
+    def test_provider_filter_works_on_own_index_and_with_index_and_similarity(self):
+        self.build_mixed_index()
+        code, out, err = self.search("telescope", "--provider", "antigravity", "--limit", "1", "--json",
+                                     session=("Demo Session", SID))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([hit["provider"] for hit in json.loads(out)], ["antigravity"])
+
+        code, out, err = self.search("telescope", "--index", "demo-session", "--similar", "--no-rerank",
+                                     "--provider", "claude", "--provider=codex", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({hit["provider"] for hit in json.loads(out)}, {"claude", "codex"})
+
+    def test_provider_filter_reads_exchanges_from_an_index_built_without_provider_metadata(self):
+        path = self.build_mixed_index()
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.execute("DROP TABLE exchange_providers")
+        before = path.stat().st_mtime_ns
+        code, out, err = self.search("telescope", "--index", "demo-session",
+                                     "--provider", "codex", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({hit["provider"] for hit in json.loads(out)}, {"codex"})
+        self.assertEqual(path.stat().st_mtime_ns, before)
+
+    def test_plain_search_works_on_an_index_built_before_provider_metadata(self):
+        # Every index built before provider labels lacks exchange_providers; a search with no
+        # --provider must still run on it.
+        path = self.build_mixed_index()
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.execute("DROP TABLE exchange_providers")
+        code, out, err = self.search("telescope", "--index", "demo-session", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out))
 
     def test_output_equals_the_old_cli_and_json_matches(self):
         self.migrate_both()
@@ -290,6 +357,7 @@ class SearchCommand(unittest.TestCase):
                 self.assertEqual(strip(new_out), strip(old_out))
             else:
                 self.assertEqual(new_out, old_out)
+                self.assertNotIn("[claude]", new_out)
 
     def test_an_unknown_index_is_named_as_missing(self):
         self.migrate_both()
@@ -826,6 +894,9 @@ class Verify(unittest.TestCase):
 
 class Add(unittest.TestCase):
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller("owner"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         self.cfg, self.data, self.projects = base / "config", base / "data", base / "projects"
         self.sessions = base / "sessions"
@@ -970,6 +1041,28 @@ class Add(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("already exists", err)
 
+    def test_an_antigravity_index_names_its_folder_and_has_no_owner_session(self):
+        convs = self.cfg.parent / "conversations"
+        convs.mkdir()
+        code, out, err = self.add("--source", "antigravity", "--path", str(convs), "--group",
+                                  "research")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Antigravity sessions", out)
+        entry = yaml.safe_load((self.cfg / "indexes" / "registry.d" / "antigravity-sessions.yaml")
+                               .read_text())["indexes"]["antigravity-sessions"]
+        self.assertEqual(entry["transcripts"], {"source": "antigravity", "path": str(convs)})
+        self.assertNotIn("owner_session", entry)
+        self.assertIn("Antigravity CLI",
+                      (self.cfg / "indexes" / "antigravity-sessions" / "tags.yaml").read_text())
+        reg = indexes.load_registry()
+        ix = refresh.Index("antigravity-sessions", reg["indexes"]["antigravity-sessions"],
+                           reg["defaults"])
+        self.assertTrue(ix.tc.version)
+        code, out, err = self.add("--source", "antigravity", "--path", str(convs), "--group",
+                                  "research", "--session", "Fleet Dev")
+        self.assertEqual(code, 2)
+        self.assertIn("Antigravity index has no owner session", err)
+
     def test_a_codex_index_needs_an_existing_folder_and_path_needs_codex(self):
         code, out, err = self.add("--source", "codex", "--path", str(self.cfg.parent / "none"),
                                   "--group", "research")
@@ -1007,6 +1100,9 @@ class IndexNames(unittest.TestCase):
     """An index name is one safe path component everywhere it is read or given."""
 
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller("owner"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         self.cfg, self.data, self.old = base / "config", base / "data", base / "old"
         use_layout(self, self.cfg, self.data)
@@ -1093,11 +1189,12 @@ class IndexCommandsGuard(unittest.TestCase):
             "student": {"group": "ferpa", "owner_session": "Grading", "owner_session_id": SID2}})
 
     def run_as(self, session, argv):
+        caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
         with mock.patch.object(refresh, "main") as drv, \
                 mock.patch.object(refresh, "cmd_triage") as tri, \
                 mock.patch.object(index_migrate, "verify", return_value=0) as ver, \
                 mock.patch.object(index_migrate, "migrate", return_value=0) as mig, \
-                mock.patch.object(indexes, "calling_session", return_value=session):
+                mock.patch.object(indexes, "classify_caller", return_value=caller):
             code, out, err = capture(index_cli.main, argv)
         return code, err, drv.called or tri.called or ver.called or mig.called
 
@@ -1123,7 +1220,8 @@ class IndexCommandsGuard(unittest.TestCase):
 
     def test_status_without_a_name_lists_only_readable_indexes(self):
         def status(session):
-            with mock.patch.object(indexes, "calling_session", return_value=session):
+            caller = indexes.Caller("session", session) if session else indexes.Caller("owner")
+            with mock.patch.object(indexes, "classify_caller", return_value=caller):
                 return capture(index_cli.main, ["status"])
         code, out, err = status(("Lab", SID))
         self.assertEqual(code, 0, err)
@@ -1151,7 +1249,8 @@ class IndexCommandsGuard(unittest.TestCase):
         # the driver run as a script checks ownership too
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
                 mock.patch.object(refresh, "forget_session") as fs, \
-                mock.patch.object(indexes, "calling_session", return_value=("Peer", SID2)):
+                mock.patch.object(indexes, "classify_caller",
+                                  return_value=indexes.Caller("session", ("Peer", SID2))):
             code, out, err = capture(refresh._main, ["forget", "lab", SID])
         self.assertEqual(code, 3)
         self.assertFalse(fs.called)
@@ -1165,7 +1264,8 @@ class IndexCommandsGuard(unittest.TestCase):
         reg = indexes.load_registry()
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
                 mock.patch.object(refresh, "cmd_triage") as tri, \
-                mock.patch.object(indexes, "calling_session", return_value=("Lab", SID)):
+                mock.patch.object(indexes, "classify_caller",
+                                  return_value=indexes.Caller("session", ("Lab", SID))):
             code, out, err = capture(refresh._main, ["triage", "student"])
         self.assertEqual(code, 3)
         self.assertFalse(tri.called)
@@ -1175,6 +1275,10 @@ class IndexCommandsGuard(unittest.TestCase):
 
 class Wrappers(unittest.TestCase):
     def setUp(self):
+        patcher = mock.patch.object(indexes, "classify_caller",
+                                    return_value=indexes.Caller("session", ("Mine", SID)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         base = tmp(self)
         use_layout(self, base / "config", base / "data")
         write_registry(base / "config" / "indexes", entries={
@@ -1270,6 +1374,30 @@ class Schedule(unittest.TestCase):
         self.assertIn("ExecStart=", (base / "fleetwatch-index-refresh.service").read_text())
         self.assertIn("*/30 * * * *", out)
         self.assertIn("systemctl --user enable", out)
+
+    def test_linux_service_and_cron_line_carry_the_environment_overrides(self):
+        env = {"FLEETWATCH_CONFIG_DIR": "/tmp/fw dir", "FLEETWATCH_GH_CMD": '/opt/my "gh"', "GH_CONFIG_DIR": "/tmp/100%"}
+        with mock.patch.dict(os.environ, env):
+            _code, out = self.run_schedule("install", "linux")
+        base = Path(os.environ["FLEETWATCH_SYSTEMD_USER_DIR"])
+        service = (base / "fleetwatch-index-refresh.service").read_text()
+        self.assertIn('Environment="FLEETWATCH_CONFIG_DIR=/tmp/fw dir"\n', service)
+        self.assertIn('Environment="FLEETWATCH_GH_CMD=/opt/my \\"gh\\""\n', service)
+        self.assertIn('Environment="GH_CONFIG_DIR=/tmp/100%%"\n', service)
+        self.assertLess(service.index("Environment="), service.index("ExecStart="))
+        cron = next(line for line in out.splitlines() if line.startswith("or use cron:"))
+        self.assertIn("FLEETWATCH_CONFIG_DIR='/tmp/fw dir' ", cron)
+        self.assertIn("GH_CONFIG_DIR=/tmp/100\\% ", cron)
+        self.assertLess(cron.index("FLEETWATCH_CONFIG_DIR="), cron.index(" nice "))
+
+    def test_linux_install_without_overrides_writes_no_environment_lines(self):
+        with mock.patch.dict(os.environ, clear=False):
+            for k in schedule.PASSED:
+                os.environ.pop(k, None)
+            _code, out = self.run_schedule("install", "linux")
+        base = Path(os.environ["FLEETWATCH_SYSTEMD_USER_DIR"])
+        self.assertNotIn("Environment=", (base / "fleetwatch-index-refresh.service").read_text())
+        self.assertIn("*/30 * * * * nice ", out)
 
     def test_an_unknown_verb_is_a_usage_error(self):
         self.assertEqual(schedule.main(["nope"]), 2)

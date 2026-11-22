@@ -16,6 +16,7 @@ atexit.register(_CONFIG.cleanup)
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import standin  # noqa: E402
+from waiting import settle  # noqa: E402
 from fleetwatch import app as fapp, config, data, iterm, prune  # noqa: E402
 
 TTY = "/dev/ttys099"
@@ -70,19 +71,12 @@ def run(coro):
 async def refresh(app, pilot):
     before = app.refreshes
     app.refresh_now()
-    for _ in range(100):
-        await pilot.pause(0.05)
-        if app.refreshes > before:
-            return
-    raise AssertionError("refresh did not finish")
+    await settle(pilot, lambda: app.refreshes > before, "the refresh to finish")
 
 
 async def boot(app, pilot):
-    for _ in range(100):
-        await pilot.pause(0.05)
-        if app.refreshes:
-            break
-    await pilot.pause(0.1)
+    await settle(pilot, lambda: app.refreshes, "the first refresh")
+    await pilot.pause()
 
 
 class PruneModalTests(unittest.TestCase):
@@ -129,7 +123,7 @@ class PruneModalTests(unittest.TestCase):
             async with app.run_test(size=(120, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("P")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 text = self.dialog_text(app)
                 self.assertIn("1 ready · unnamed sessions only", text)
                 self.assertLess(text.index("Old Done"), text.index("Kept: named session (1)"))
@@ -146,23 +140,21 @@ class PruneModalTests(unittest.TestCase):
             async with app.run_test(size=(120, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("P")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 await pilot.press("n")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "2 ready · named sessions included" in self.dialog_text(app), "the named sessions to be included")
                 text = self.dialog_text(app)
                 self.assertIn("2 ready · named sessions included", text)
                 self.assertNotIn("Kept: named session", text)
                 self.assertIn("n leave out named sessions", text)
                 self.assertIn("named session, not live", text)
                 await pilot.press("n")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "1 ready · unnamed sessions only" in self.dialog_text(app), "the named sessions to be left out")
                 self.assertIn("1 ready · unnamed sessions only", self.dialog_text(app))
                 await pilot.press("n", "y")
                 status = self.w.paths["status"]
-                for _ in range(100):
-                    await pilot.pause(0.05)
-                    if not os.path.exists(os.path.join(status, "named.json")):
-                        break
+                await settle(pilot, lambda: not os.path.exists(os.path.join(status, "named.json")), "the prune")
+                await settle(pilot, lambda: "pruned" in (app.status_text or ""), "the prune message")  # the app's refresh must finish before it exits
                 self.assertFalse(os.path.exists(os.path.join(status, "named.json")))
                 self.assertFalse(os.path.exists(self.old))
                 self.assertTrue(os.path.exists(os.path.join(status, "lost.json")))
@@ -176,12 +168,10 @@ class PruneModalTests(unittest.TestCase):
             async with app.run_test(size=(120, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("P")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 await pilot.press("y")
-                for _ in range(100):
-                    await pilot.pause(0.05)
-                    if not os.path.exists(self.old):
-                        break
+                await settle(pilot, lambda: not os.path.exists(self.old), "the prune")
+                await settle(pilot, lambda: "pruned" in (app.status_text or ""), "the prune message")  # the app's refresh must finish before it exits
                 self.assertTrue(os.path.exists(os.path.join(self.w.paths["status"], "named.json")))
         run(go())
 
@@ -191,14 +181,14 @@ class PruneModalTests(unittest.TestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("P")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 self.assertIsInstance(app.screen, fapp.PruneScreen)
                 text = "\n".join(str(w.render()) for w in app.screen.query("Static"))
                 self.assertIn("Old Done", text)
                 self.assertIn("Kept: has open items", text)
                 self.assertIn("Old Asker", text)
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: not isinstance(app.screen, fapp.PruneScreen), "the prune dialog to close")
                 self.assertNotIsInstance(app.screen, fapp.PruneScreen)
                 self.assertTrue(os.path.isfile(self.old))
         run(go())
@@ -211,16 +201,13 @@ class PruneModalTests(unittest.TestCase):
                 await pilot.press("3")
                 self.assertIn("1 ready to prune (P)", app.lists[2].visible_text())
                 await pilot.press("P")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: isinstance(app.screen, fapp.PruneScreen) and "ready" in self.dialog_text(app), "the prune dialog")
                 await pilot.press("y")
-                for _ in range(100):
-                    await pilot.pause(0.05)
-                    if not os.path.exists(self.old):
-                        break
+                await settle(pilot, lambda: not os.path.exists(self.old), "the prune")
                 self.assertFalse(os.path.exists(self.old))
                 self.assertTrue(os.path.isfile(os.path.join(self.w.paths["status"], ".pruned", "old.json")))
                 self.assertTrue(os.path.isfile(os.path.join(self.w.paths["status"], "openq.json")))
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "pruned 1" in (app.status_text or ""), "the prune message")
                 self.assertIn("pruned 1", app.status_text or "")
         run(go())
 
@@ -473,7 +460,7 @@ class AppTests(unittest.TestCase):
                 await pilot.press("3")
                 lst = app.current
                 await pilot.press("pagedown", "pagedown")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: lst.scroll_y > 0, "the list to scroll")
                 scroll, cursor = lst.scroll_y, lst.cursor
                 self.assertGreater(scroll, 0)
                 row = lst._spans[cursor][0] - lst.scroll_y
@@ -494,10 +481,7 @@ class AppTests(unittest.TestCase):
                 await boot(app, pilot)
                 n = app.refreshes
                 await pilot.press("r")
-                for _ in range(60):
-                    await pilot.pause(0.05)
-                    if app.refreshes > n:
-                        break
+                await settle(pilot, lambda: app.refreshes > n, "the refresh")
                 self.assertGreater(app.refreshes, n)
         run(go())
 
@@ -548,14 +532,9 @@ class JumpAppTests(unittest.TestCase):
         self.patch.stop()
         self.w.close()
 
-    def wait_calls(self, pilot, n=1):
-        async def inner():
-            for _ in range(60):
-                await pilot.pause(0.05)
-                if len(self.calls) >= n:
-                    break
-            await pilot.pause(0.1)
-        return inner()
+    async def wait_calls(self, pilot, app, n=1):
+        await settle(pilot, lambda: len(self.calls) >= n, "the osascript call")
+        await settle(pilot, lambda: (app.status_text or "").startswith("jumped"), "the jump message")
 
     def test_g_jumps_with_the_right_tty_as_argv(self):
         async def go():
@@ -563,7 +542,7 @@ class JumpAppTests(unittest.TestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("g")
-                await self.wait_calls(pilot)
+                await self.wait_calls(pilot, app)
                 self.assertEqual(len(self.calls), 1)
                 script, args = self.calls[0]
                 self.assertEqual(args, [TTY])
@@ -585,7 +564,7 @@ class JumpAppTests(unittest.TestCase):
                 key = next(k for k in lst._order if "Review the PR" in lst._by_key[k].head.plain)
                 lst.move_to(key)
                 await pilot.press("g")
-                await self.wait_calls(pilot)
+                await self.wait_calls(pilot, app)
                 self.assertEqual(self.calls[-1][1], [TTY])
         asyncio.run(go())
 
@@ -596,7 +575,7 @@ class JumpAppTests(unittest.TestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("g")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "not in an iTerm2 tab" in (app.status_text or ""), "the toast")
                 self.assertEqual(self.calls, [])
                 self.assertIn("not in an iTerm2 tab", app.status_text)
         asyncio.run(go())
@@ -613,7 +592,7 @@ class JumpAppTests(unittest.TestCase):
                 snap.jump = {"ttys": {}, "iterm": None, "err": "iTerm2 is not running"}
                 app.apply(snap)
                 await pilot.press("up", "g")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: "could not reach iTerm2" in (app.status_text or ""), "the toast")
                 self.assertEqual(app.status_text, "could not reach iTerm2: iTerm2 is not running")
                 self.assertEqual(self.calls, [])
         asyncio.run(go())
@@ -626,8 +605,7 @@ class JumpAppTests(unittest.TestCase):
                 async with app.run_test(size=(100, 30)) as pilot:
                     await boot(app, pilot)
                     await pilot.press("g")
-                    for _ in range(40):
-                        await pilot.pause(0.05)
+                    await settle(pilot, lambda: "could not reach iTerm2" in (app.status_text or ""), "the toast")
                     self.assertEqual(app.status_text, "could not reach iTerm2: Not authorized")
             asyncio.run(go())
         self.patch.start()

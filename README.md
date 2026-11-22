@@ -226,7 +226,7 @@ Each session appears once. Child sessions (helpers, worktree and run agents) are
 
 Press Enter (or `g`), or double click, on any row in any tab: a session, a question, a reminder, a to-do row (they jump to their session), or a helper row. A helper jumps to its own tab when it is in iTerm2 and otherwise to its parent's. On a section header (Working, a group, Also noted) Enter folds it instead. iTerm2 selects that session's tab, raises its window and activates; macOS follows to the window's Space. The status line shows `jumped to <name>`.
 
-- A session maps to a tab by its registry pid: `ps -o tty=` gives the terminal, and one `osascript` call per refresh lists every iTerm2 session's tty. Sessions outside iTerm (VS Code, the desktop app, background jobs) show a toast saying so.
+- A session maps to a tab by its registry pid: `ps -axo pid=,tty=` (run once) gives every pid's terminal, and one `osascript` call per refresh lists every iTerm2 session's tty. Sessions outside iTerm (VS Code, the desktop app, background jobs) show a toast saying so.
 - The tty reaches AppleScript as `argv` only, after it matches `^/dev/ttys[0-9]+$`. It is never part of the script text.
 - If iTerm2 is not running or Automation permission is missing, pressing Enter shows `could not reach iTerm2: <reason>`. The first jump may prompt macOS once to let your terminal control iTerm2; click Allow.
 - `FLEETWATCH_OSASCRIPT` and `FLEETWATCH_TTY_CMD` override the two commands (used by the tests).
@@ -249,10 +249,13 @@ A small radar floats over the bottom right corner of the board, above the hint l
 
 ### The Indexes tab
 
+Open a session index row to see its exchange counts by provider and how many agent runs
+were placed by launch, by folder, or by catch-all on the last successful refresh.
+
 Tab 5 shows the health of every registered index, grouped by trust group, without opening any of them. Each row gives the kind (session or plain), when it last refreshed and whether that worked, whether it is stale, whether the protection check passes for a protected group, and its exchange and corpus file counts. An index is stale when its last refresh is older than twice the refresh schedule's interval, or older than two days when no schedule is installed. A long scheduled `refresh --all` run does not make the indexes it finished early look stale. That run writes a small marker (`logs/refresh_run.json` in the index data folder, holding only its start and end times and the names it finished). An index the run finished counts as current until the run ended, and as waiting while the run is still going. An index the run skipped is judged by its own last refresh. A schedule that stopped flags every index once the last run ended more than twice the interval ago. It shows statuses and numbers only: a failure is named by a category such as `build`, never by its error text, and nothing from a corpus, probe, tag or path is shown. The board only reads; it never refreshes or writes an index. Each row names its owner session (`owner: NAME`, with `running` or `can resume` when the owner is a session fleetwatch can reach, or `no owner session`), matched by the registry's owner session id first and then by its name. Each problem row also carries a next step, one short line with the command and `(y copies)`: a failed refresh gives `fleetwatch index status NAME`, a refusal `fleetwatch index verify NAME`, a stale index `fleetwatch index schedule install` (no schedule installed) or `fleetwatch index schedule status`, and an index that never refreshed `fleetwatch index refresh NAME`. `y` copies the first one. An index whose refresh lock is fresh shows `refreshing now`, and while any refresh is running an index it has not reached yet shows `waiting for the running refresh`; neither is flagged as a problem. An index that failed, is refused by the protection check or is stale also appears in an Indexes section on Needs you, with the same owner and next step. Enter on an index row, here or on Needs you, goes to its owner: it jumps to the owner's iTerm2 tab when the owner is running, resumes the owner exactly as Enter does on the Resume tab (same checks, same refusals) when it is not, and with no owner or nothing to resume it says which command to run from a terminal. Space folds the row. In `--demo`, Enter only says what it would do. `y` on an index row of this tab copies the row's next command when it has a problem, and `fleetwatch search --index NAME "` for a healthy index, ready for a query. `z` opens or closes every row, and `s` sorts by name or by problems first. Without the `memory` extra the tab says to install `fleetwatch[memory]`.
 
 <p align="center">
-  <img src="docs/images/board-indexes.png" width="900" alt="The Indexes tab on the demo data, every row open, grouped by trust group. archive: release-history, whose last refresh failed (build) 40 minutes ago, with the next step `fleetwatch index status release-history (y copies)`, owner Pricing Page (can resume). ferpa: advising-notes, protection refused (settings), with the next step `fleetwatch index verify advising-notes (y copies)`, and no owner session. team: nightly-notes, waiting for the running refresh; site-docs, stale, with the next step `fleetwatch index schedule status (y copies)`, owner Docs Site (running); storefront-sessions, refreshed 14 minutes ago, owner Billing API (running); and support-faq, refreshing now, owner Status Page (can resume). The hint line offers Enter to go to the owner and y to copy.">
+  <img src="docs/images/board-indexes.png" width="900" alt="The Indexes tab on the demo data, every row open, grouped by trust group. archive: release-history, whose last refresh failed (build) 40 minutes ago, with the next step `fleetwatch index status release-history (y copies)`, owner Pricing Page (can resume). ferpa: advising-notes, protection refused (settings), with the next step `fleetwatch index verify advising-notes (y copies)`, and no owner session. team: nightly-notes, waiting for the running refresh; site-docs, stale, with the next step `fleetwatch index schedule status (y copies)`, owner Docs Site (running); storefront-sessions, refreshed 14 minutes ago, owner Billing API (running), with exchange counts by provider and agent run placements; and support-faq, refreshing now, owner Status Page (can resume). The hint line offers Enter to go to the owner and y to copy.">
 </p>
 
 ### Resume and park
@@ -469,14 +472,15 @@ documents), scrubbed, tagged and searchable. Config (registry, tags, allowlist, 
 `<config>/indexes/`, corpus and search data in `<data>/indexes/<name>/`.
 
 ```
-fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--path SUBSTR] [--around N] [--limit N]
+fleetwatch search "question" [--similar] [--provider claude|codex|antigravity] [--kind K] [--tag T] [--level D]
+                             [--path SUBSTR] [--around N] [--limit N]
                              [--json] [--no-rerank] [--expand | --no-expand] [--exact] [--index NAME]
 fleetwatch search show ID [ID ...] [--around N] [--full]
 fleetwatch search eval | stats [--index NAME]
 
 fleetwatch index list | status [NAME]
 fleetwatch index add [--session NAME] [--session-id ID] [--name INDEX] --group G [--docs PATH --include GLOB ... --label L]
-fleetwatch index add --source codex --group G [--path DIR] [--name INDEX]   index Codex CLI sessions
+fleetwatch index add --source codex|antigravity --group G [--path DIR] [--name INDEX]   index Codex or Antigravity CLI sessions
 fleetwatch index refresh [NAME | --all] [--full] [--no-tag] [--tag-budget N] [--build]
 fleetwatch index build NAME                     rebuild the search engine's index only
 fleetwatch index file PATH [--index NAME]       index a just-filed document now
@@ -496,17 +500,21 @@ there. In a command, `{python}` stands for the Python running the refresh, and
 old entry to that form and warns, by file and line, about any script that imports from the old
 shared engine folder, which is not copied.
 
+An index with exchanges from multiple providers labels each exchange hit. Use `--provider`
+to search only exchanges from the named provider, or repeat it to include several providers.
+It works with `--index` and `--similar`. By default the search includes the whole index.
+
 `--path` keeps only results whose file path contains the text. `--no-rerank` skips the reranking stage. `--expand` also searches the synonyms in `synonyms.yaml` at lower weight, and `--no-expand` turns off an `expand_by_default` setting. `--exact` stops fleetwatch correcting a word that appears nowhere in the corpus. `search eval --typos` misspells every probe to measure typo tolerance. `index add` names the index `<session>-session` unless `--name` says otherwise, and `--label` names the `--docs` folder (default `docs`).
 
 Without `--index`, `search` and `index refresh|file` use the calling session's own index, found from
 process ancestry the way `write-status` finds the session. `index add` registers the calling session
 and collects every project folder that holds its transcripts.
 
-**Codex indexes.** The Codex CLI writes one rollout per session under `~/.codex/sessions/YYYY/MM/DD/`
-(`rollout-*.jsonl`, compressed to `rollout-*.jsonl.zst` once a session is old). An entry with
-`transcripts.source: codex` indexes them with the same exchanges, scrubbing, tagging and search as
-Claude Code sessions; `index add --source codex --group G` writes the entry (`--path` names another
-folder, `--name` defaults to `codex-sessions`):
+**Codex and Antigravity indexes.** Codex and the Antigravity CLI each keep every session in one
+folder, and an entry with `transcripts.source: codex` or `transcripts.source: antigravity` indexes
+that folder with the same exchanges, scrubbing, tagging and search as Claude Code sessions.
+`index add --source codex --group G` or `index add --source antigravity --group G` writes the entry
+(`--path` names another folder; `--name` defaults to `codex-sessions` or `antigravity-sessions`):
 
 ```yaml
 indexes:
@@ -515,26 +523,123 @@ indexes:
     transcripts:
       source: codex            # claude is the default, with project_dir instead of path
       path: ~/.codex/sessions
+  antigravity-sessions:
+    group: research
+    transcripts:
+      source: antigravity
+      path: ~/.gemini/antigravity-cli/conversations
 ```
 
-An exchange is a user message plus the assistant's text up to the next user message, with the names of
-the tools used. Tool inputs and outputs, reasoning, developer messages and the context Codex injects
-as user messages (AGENTS.md, the environment block, the plugin list) stay out. Each exchange records
-its working folder (home written as `~`) and shows `Source: codex | Folder: ...` in its header, so a
-hit carries its date and folder and `search show ID` prints them. A plain rollout is read
-incrementally; a `.zst` rollout never changes, so it is streamed once through `zstd -dc` (the `zstd`
-command must be installed) and not opened again, and a session present in both forms is indexed once.
-`transcripts.sessions` limits the index to listed session ids. A malformed line is skipped and
-counted in the refresh summary, a rollout that cannot be read keeps its stored records and is retried
-on the next refresh, and exchange ids carry ten characters of the session id
-(`Sc0b903b19a-EX-0001`). `index add --source codex` takes no `--session` or `--session-id`, and
-`--path` is stored as an absolute path.
+An exchange is a user prompt plus the model's text up to the next prompt, with the names of the tools
+used. Tool inputs and outputs and reasoning stay out. Each exchange records its working folder (home
+written as `~`) and shows `Source: codex | Folder: ...` or `Source: antigravity | Folder: ...` in its
+header, so a hit carries its date and folder and `search show ID` prints them. Exchange ids carry ten
+characters of the session id (`Sc0b903b19a-EX-0001`), `transcripts.sessions` limits the index to
+listed session ids, and a file that cannot be read keeps its stored records and is retried on the next
+refresh. `index add` with either source takes no `--session` or `--session-id`, and `--path` is
+stored as an absolute path.
 
-**One Codex index spans every project.** Codex keeps all sessions in one folder, so the index holds
-prompts from every project you used it in, and its trust group is chosen when it is created. Pick the
-group of the most private project in the folder, or index only the sessions you want with
-`transcripts.sessions`. The index has no owner session, so in a protected group nothing reads it but
-a plain terminal and the sessions in its `extra_readers`.
+*Codex* writes one rollout per session under `~/.codex/sessions/YYYY/MM/DD/` (`rollout-*.jsonl`,
+compressed to `rollout-*.jsonl.zst` once a session is old). Developer messages and the context Codex
+injects as user messages (AGENTS.md, the environment block, the plugin list) stay out. A plain rollout
+is read incrementally; a `.zst` rollout never changes, so it is streamed once through `zstd -dc` and
+not opened again, and a session present in both forms is indexed once. Without the `zstd` command the
+compressed rollouts are skipped and counted, with a hint to install it, and the plain ones still index.
+A malformed line is skipped and counted in the refresh summary.
+
+*Antigravity* keeps one SQLite database per conversation (`<uuid>.db`) whose steps are Protocol
+Buffers with no published schema. fleetwatch reads them by field number, mapped against one agy
+version (`MAPPED_VERSION` in `fleetwatch/memory/antigravity_parse.py`), so a later agy can move them.
+Every database is checked first: one with missing tables, an unreadable metadata blob, payloads that
+do not decode, or no step type in the mapping is skipped, and the refresh summary names it with the
+reason. A malformed step is skipped and counted, and a step type the mapping does not know is
+counted and ignored. Harness notices, error steps and compaction summaries stay out. A job run with
+a result schema ends with a `finish` call, and its arguments are that job's answer, so they index as
+the reply. A sub-agent runs in its own database and indexes as its own session, sent by the sub-agent
+under its display name. The folder is never written to: a database with no `-wal` file is opened
+immutable, and one being written is copied with its WAL to a private temporary folder and read
+there. A conversation is read again when its database or WAL changes size or modification time.
+
+**One Codex or Antigravity index spans every project.** Each tool keeps all sessions in one folder,
+so the index holds prompts from every project you used it in, and its trust group is chosen when it
+is created. Pick the group of the most private project in the folder, or index only the sessions you
+want with `transcripts.sessions`. The index has no owner session, so in a protected group nothing
+reads it but a plain terminal and the sessions in its `extra_readers`.
+
+### Routing Codex and Antigravity runs into session indexes
+
+Instead of putting every Codex or Antigravity run in one shared index, fleetwatch can route each run
+into the index of the Claude Code session that launched it. No new provider-specific indexes or
+groups are created: every routed run is parsed with its provider's source, labeled with its provider
+(`Source: codex | Folder: ...`), scrubbed under the target index's rules, and governed by the target
+index's trust group. Each run is placed in at most one index.
+
+**1. Record launches from Claude Code.** Add a `PreToolUse` hook for `Bash` to your Claude Code
+settings (`~/.claude/settings.json`):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "fleetwatch launch record"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`fleetwatch launch record` reads the hook payload on stdin and matches commands that start a Codex
+or Antigravity job (`codex exec`, `codex-companion.mjs` with `task`, `review` or
+`adversarial-review`, `codex-task-in-worktree.sh`, `multi-review.sh`, `agy`, and
+`agy-companion.mjs` with `task`, `review`, `plan` or `ask`). On a match it appends one JSON line to
+`launches.jsonl` in fleetwatch's state folder (`$XDG_STATE_HOME/fleetwatch`, else
+`~/.local/state/fleetwatch`) with the session id, session name (when status files supply it), tool,
+working folder (`--worktree` when present, else `cwd`, resolved to an absolute path) and ISO time.
+For `multi-review.sh`, the folder is its worktree root. The hook records only the Claude session
+found in its own process ancestry. It rejects `/`, the home folder, folders above home, and folders
+that are proper ancestors of the launching session's cwd.
+It always exits 0 and writes nothing to stdout, so it can never block or alter a command.
+
+**2. How each run is resolved on refresh.** For every agent run (provider, working folder, start
+time), fleetwatch picks the target index in this order:
+
+1. **Launch ledger:** a matching provider launch with the same folder, or a parent folder, recorded
+   within 10 minutes before the run's start places the run in that launching session's index.
+   The most specific folder wins; equal lengths go to the newest entry. Codex launches match
+   Codex runs, Antigravity launches match Antigravity runs, and `multi-review.sh` can match either.
+   A broad or invalid folder is ignored. Launchers from different trust groups in the same window
+   send the run to the catch-all as ambiguous.
+2. **Project folder:** else the unique registered session index whose project folders contain the
+   run's folder, following a git worktree to its main checkout via `git rev-parse --git-common-dir`
+   when the folder still exists. An index whose project folder is the home folder or above cannot
+   claim a run under home.
+3. **Catch-all or unplaced:** else the catch-all index named in `settings.toml` (`[routing]
+   catch_all`), which must belong to a protected group. With no catch-all configured, the run is not
+   indexed and is counted as unplaced.
+
+Placement is stored in fleetwatch's state folder on the first successful read of a run's metadata.
+Later refreshes reuse it, including after a worktree is removed. A run moves only when the project
+folder rule would place it in a protected group and its stored index is less protected. Protection
+never decreases. If metadata cannot be read, the run is retried on the next refresh.
+
+Optional `settings.toml` entries:
+
+```toml
+[routing]
+catch_all = "unrouted-agents"     # must be a registered index in a protected group
+sources = { codex = "~/.codex/sessions", antigravity = "~/.gemini/antigravity-cli/conversations" }   # optional provider -> sessions folder(s)
+```
+
+`fleetwatch index status` reports each session index's exchange counts by provider and how many
+runs were placed by launch, by folder, and by catch-all, followed by the unplaced count. Exchange
+counts by provider are recorded on the next successful refresh.
 
 **Deleted transcripts.** A session index keeps its history when Claude Code deletes an old transcript:
 a session whose transcript is gone is held from its stored records, which are scrubbed again whenever
@@ -558,7 +663,12 @@ prints the command that starts it; it does not start it.
 
 **Tagging sends scrubbed text to a model.** With `tag: true` (the registry default), `index refresh` sends each new exchange, already scrubbed, to a small Claude model through `claude -p` (Haiku unless `tags.yaml` says otherwise) for an area, kinds, topics and a one-line summary. Tags are cached by content hash and a run tags at most `tag_budget_per_run` (400) exchanges, newest first. These calls use your Claude account. `--no-tag`, or `tag: false` in the registry's `defaults:` or an entry, turns it off.
 
-**Trust groups.** From inside a session, `search --index X` reads another session's index only when
+**Trust groups.** Fleetwatch distinguishes four caller kinds: a Claude Code session, a delegated
+Codex or Antigravity agent under a session, the owner at a terminal, and an untrusted process.
+A session may read its own index. A delegated agent cannot read or refresh a protected index,
+even when its launching session owns it. An owner may read any index. An untrusted caller may
+read only an unprotected index whose group allows `"*"`; the scheduled refresh remains available.
+From inside a session, `search --index X` reads another session's index only when
 the caller's group (the group of its own index) is in X's group `readers` in the registry
 (`groups:`; `"*"` means everyone), or the session is in X's `extra_readers`. Otherwise it refuses and
 names the rule. An index in a protected group (settings.toml `[groups] protected`, default `ferpa`)
@@ -566,7 +676,9 @@ is readable only by its owner session and its `extra_readers`, whatever the grou
 Every `index` command that names an index runs the same check, and `index status` with no name lists
 only the indexes the calling session may read. This is a guard against mistakes, not a security
 boundary: the files are readable by anyone who can read the disk. A plain terminal is the owner at a
-shell and may read any index.
+shell and may read any index. A process that deliberately detaches from its agent parent, clears the
+agent environment markers, and allocates a pseudo-terminal is classified as the owner; it could also
+read the corpus files directly.
 
 **Groups are declared in the registry.** The first `fleetwatch index add` creates `<config>/indexes/registry.yaml` with its group; `index add --group` refuses a group the registry does not declare, so add others by hand:
 
@@ -590,7 +702,7 @@ owner_name = "Your Name"      # optional
 
 `timezone` sets the zone every date is shown in. A date-only `due` (`2026-10-28`) means midnight at the start of that day in this zone. A bad value falls back to the system zone.
 
-The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
+The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`, `[routing]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
 
 **Other environment variables.** `FLEETWATCH_GH_CMD` replaces the `gh` command that watches run (it is split like a shell command line), and the scheduled watch job carries it along with `GH_CONFIG_DIR`. `FLEETWATCH_LAUNCH_AGENTS_DIR` and `FLEETWATCH_SYSTEMD_USER_DIR` move where `schedule install` writes its launchd and systemd files, which is useful for trying an install without touching your own. A scheduled job carries the folder overrides that are set when you install it (`FLEETWATCH_CONFIG_DIR`, `FLEETWATCH_STATUS_DIR`, `FLEETWATCH_SESSIONS_DIR`, `FLEETWATCH_PROJECTS_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`), so install it from the shell whose settings you want it to use.
 

@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from test_fleetwatch import NOW, dstr, up_env  # noqa: E402
 from test_board_polish import BoardCase, walk  # noqa: E402
 from fleetwatch import app as fapp, config, data, holds, views  # noqa: E402
+from waiting import settle  # noqa: E402
 
 WHAT = "Review the quick start rewrite"
 
@@ -144,7 +145,7 @@ class BoardHoldTests(BoardCase):
             over_before = app.snapshot.header.plain
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("x")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: "marked done" in (app.status_text or ""), "the done message")
             return (app.lists[1].visible_text(), app.tab_counts()[1], n_before, app.footer_plain,
                     app.state["holds"], app.status_text, over_before)
         text, after, before_n, footer, saved, status, _hdr = self.board((140, 50), script)
@@ -160,7 +161,7 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("x")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: "marked done" in (app.status_text or ""), "the done message")
             return app.footer_plain
         footer = self.board((80, 40), script)
         self.assertLessEqual(len(footer), 78)
@@ -171,15 +172,15 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("x")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "marked done" in (app.status_text or ""), "the done message")
             await pilot.press("u")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "Snoozed and done" in app.lists[1].visible_text(), "the hidden items to show")
             shown = app.lists[1].visible_text()
             footer = app.footer_plain
             held = [n for n in walk(app.lists[1].nodes) if n.held]
             app.lists[1].move_to(held[0].key)
             await pilot.press("x")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "back on your list" in (app.status_text or ""), "the item to return")
             return shown, footer, app.lists[1].visible_text(), app.state["holds"], app.status_text
         shown, footer, after, saved, status = self.board((140, 50), script)
         self.assertIn("Snoozed and done · 1", shown)
@@ -196,11 +197,11 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("S")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.SnoozeScreen) and app.screen.query("#choices"), "the snooze dialog")
             screen = app.screen
             labels = [str(o.prompt) for o in screen.query_one("#choices").options]
             await pilot.press("enter")                      # tomorrow
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: "snoozed until" in (app.status_text or ""), "the snooze message")
             return labels, app.footer_plain, app.state["holds"], app.status_text
         labels, footer, saved, status = self.board((140, 50), script)
         self.assertTrue(labels[0].startswith("tomorrow"))
@@ -216,19 +217,19 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("S")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.SnoozeScreen) and app.screen.query("#choices"), "the snooze dialog")
             await pilot.press("down", "down", "enter")      # "a date…"
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.SnoozeScreen) and app.screen.query("#when"), "the date box")
             for ch in "yesterday":
                 await pilot.press(ch)
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "YYYY-MM-DD" in str(app.screen.query_one("#problem").render()), "the date problem")
             problem = str(app.screen.query_one("#problem").render())
             still_open = isinstance(app.screen, fapp.SnoozeScreen)
             box = app.screen.query_one("#when")
             box.value = (datetime.now() + timedelta(days=30)).date().isoformat()
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: app.state["holds"] and not isinstance(app.screen, fapp.SnoozeScreen), "the snooze")
             return problem, still_open, app.state["holds"]
         problem, still_open, saved = self.board((140, 50), script)
         self.assertIn("YYYY-MM-DD", problem)
@@ -240,7 +241,7 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("x")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "marked done" in (app.status_text or ""), "the done message")
             return True
         self.board((140, 50), first)
 
@@ -257,7 +258,7 @@ class BoardHoldTests(BoardCase):
             node = self.todo(app)
             app.holds.snooze(node.todo[0], time.time() + 3600)
             app._holds_changed("test")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: WHAT not in app.lists[1].visible_text(), "the snoozed item to hide")
             return WHAT in app.lists[1].visible_text()
         self.assertFalse(self.board((140, 50), first))
         state = json.load(open(os.path.join(os.environ["FLEETWATCH_CONFIG_DIR"], "state.json")))
@@ -277,7 +278,7 @@ class BoardHoldTests(BoardCase):
             await pilot.press("2")
             app.lists[1].move_to(self.todo(app).key)
             await pilot.press("x")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "marked done" in (app.status_text or ""), "the done message")
             gone = WHAT not in app.lists[1].visible_text()
             path = os.path.join(self.paths["status"], "docs.json")
             doc = json.load(open(path))
@@ -286,7 +287,7 @@ class BoardHoldTests(BoardCase):
                     it["what"] = WHAT + " again"
             json.dump(doc, open(path, "w"))
             app.refresh_now()
-            await pilot.pause(1.5)
+            await settle(pilot, lambda: WHAT + " again" in app.lists[1].visible_text(), "the item to return")
             return gone, app.lists[1].visible_text(), app.state["holds"]
         gone, text, saved = self.board((140, 50), script)
         self.assertTrue(gone)
@@ -300,7 +301,7 @@ class BoardHoldTests(BoardCase):
             first = tasks[0]
             app.lists[0].move_to(first.key)
             await pilot.press("x")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: len([n for n in walk(app.lists[0].nodes) if n.todo]) == len(tasks) - 1, "the task to go")
             return len(tasks), len([n for n in walk(app.lists[0].nodes) if n.todo]), first.todo[1]
         n_before, n_after, what = self.board((140, 50), script)
         self.assertEqual(n_after, n_before - 1)
@@ -308,6 +309,6 @@ class BoardHoldTests(BoardCase):
     def test_x_off_a_to_do_says_where_it_works(self):
         async def script(app, pilot):
             await pilot.press("3", "x")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "highlight one on Your to-dos" in (app.status_text or ""), "the hint")
             return app.status_text
         self.assertIn("highlight one on Your to-dos", self.board((140, 40), script))

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 import standin  # noqa: E402  (pins the zone and a clean config folder first)
 from fleetwatch import app as fapp, data, demo, prune, views, watches, write_status  # noqa: E402
+from waiting import first_scan, settle  # noqa: E402
 from fleetwatch.write_status import StatusError  # noqa: E402
 
 FAKE_GH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_gh.py")
@@ -888,7 +889,7 @@ class BoardCase(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return await script(app, pilot)
         return asyncio.run(go())
 
@@ -917,7 +918,7 @@ class BoardTests(BoardCase):
             await pilot.press("1")
             app.lists[0].move_to(key)
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: calls["jump"] or calls["resume"], "the Enter action")
             return app.status_text
         return calls, self.board((140, 60), script)
 
@@ -940,7 +941,7 @@ class BoardTests(BoardCase):
             await pilot.press("1")
             app.lists[0].move_to("watch:%s:example-shop/storefront" % demo.RESUME_SIDS[0])
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: "demo: Enter would" in (app.status_text or ""), "the demo message")
             return app.status_text
         self.assertIn("demo: Enter would resume Pricing Page", self.board((140, 60), script))
 

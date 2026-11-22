@@ -10,6 +10,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import standin  # noqa: E402
+from waiting import settle  # noqa: E402
 import test_app  # noqa: E402,F401  (points FLEETWATCH_CONFIG_DIR at a temp folder before fleetwatch loads)
 from test_app import World, boot, refresh  # noqa: E402
 from fleetwatch import app as fapp, config, iterm, render_text  # noqa: E402
@@ -59,19 +60,17 @@ class Env(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump(d, fh)
 
-    async def jumps(self, pilot, n):
-        for _ in range(60):
-            await pilot.pause(0.05)
-            if len(self.calls) >= n:
-                break
-        await pilot.pause(0.1)
+    async def jumps(self, app, pilot, n):
+        await settle(pilot, lambda: len(self.calls) >= n and
+                     (app.status_text or "").startswith("jumped"), "the jump status")
+        await pilot.pause()
 
     async def enter_on(self, app, pilot, tab, key):
         await pilot.press(str(tab + 1), "e")
         app.current.move_to(key)
         before = len(self.calls)
         await pilot.press("enter")
-        await self.jumps(pilot, before + 1)
+        await self.jumps(app, pilot, before + 1)
         return self.calls[before][1] if len(self.calls) > before else None
 
 
@@ -85,7 +84,7 @@ class EnterTests(Env):
                 await boot(app, pilot)
                 await pilot.press("space")
                 await pilot.press("enter")
-                await self.jumps(pilot, 1)
+                await self.jumps(app, pilot, 1)
                 self.assertEqual(self.calls[0][1], [TTY])
         run(go())
 
@@ -138,7 +137,7 @@ class EnterTests(Env):
                 await boot(app, pilot)
                 await pilot.press("e")
                 await pilot.press("enter")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "not in an iTerm2 tab" in (app.status_text or ""), "the toast")
                 self.assertEqual(self.calls, [])
                 self.assertIn("not in an iTerm2 tab", app.status_text)
                 app.current.move_to("needs:Stuck Session:q:1")
@@ -164,7 +163,7 @@ class EnterTests(Env):
                 self.assertEqual(app.status_text, "no session is highlighted")
                 lst.move_to("ses:Stuck Session")
                 await pilot.press("g")
-                await self.jumps(pilot, 1)
+                await self.jumps(app, pilot, 1)
                 self.assertEqual(self.calls[0][1], [TTY])
         run(go())
 
@@ -383,14 +382,15 @@ class GroupTests(Env):
                 picker.highlighted = picker.option_count - 3          # Personal (Other is Sleeper's natural group)
                 chosen = app.screen.names[picker.highlighted]
                 await pilot.press("enter")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: type(app.screen).__name__ == "Screen", "the picker to close")
                 self.assertEqual(type(app.screen).__name__, "Screen")
                 with open(self.groups) as fh:
                     self.assertIn('"Sleeper" = "%s"' % chosen, fh.read())
-                for _ in range(60):
-                    await pilot.pause(0.05)
-                    if "%s · " % chosen in app.current.visible_text() and "Sleeper" in app.current.visible_text():
-                        break
+                # Wait on what is asserted below: the board text can show the group and the
+                # session before the refresh that regroups Sleeper has landed.
+                await settle(pilot, lambda: app.snapshot.grouping.of("Sleeper") == chosen
+                             and "moved Sleeper to %s" % chosen in (app.status_text or "")
+                             and "%s · " % chosen in app.current.visible_text(), "the moved session to show")
                 self.assertIn("moved Sleeper to %s" % chosen, app.status_text)
                 self.assertEqual(app.snapshot.grouping.of("Sleeper"), chosen)
         run(go())
@@ -408,7 +408,7 @@ class GroupTests(Env):
                 await pilot.press("enter")
                 await pilot.press("Z", "e", "d", "space", "q", "g", "e")   # q, g, e type text, not commands
                 await pilot.press("enter")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "moved Sleeper to Zed qge" in (app.status_text or ""), "the move")
                 await refresh(app, pilot)
                 self.assertIn("Zed qge · 1", app.current.visible_text())
                 self.assertEqual(config.load_groups(self.groups)[0].overrides["Sleeper"], "Zed qge")
@@ -449,7 +449,7 @@ class GroupTests(Env):
                 self.assertNotIn("▾ Work", text)
                 app.current.move_to("ses:Sleeper")
                 await pilot.press("m", "enter")                       # pick the only group, Other
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: "could not save the group" in (app.status_text or ""), "the failure message")
                 self.assertIn("could not save the group", app.status_text)
                 self.assertEqual(open(self.groups).read(), '[[group]\nname = "broken\n')
         run(go())

@@ -162,6 +162,23 @@ def read_ps(command, warnings, timeout=10):
         return {}
 
 
+def split_ps_command(text):
+    """Separate ps's executable path from argv, including paths containing spaces."""
+    columns = re.split(r"\s{2,}", text, maxsplit=1)
+    if len(columns) == 2:
+        return columns[0], columns[1]
+    for gap in re.finditer(r"\s+", text):
+        command, args = text[:gap.start()], text[gap.end():]
+        if args.startswith(command) and (len(args) == len(command) or
+                                         args[len(command)].isspace()):
+            return command, args
+    match = re.match(r"(.+?/(?:node|codex|agy|antigravity|claude))\s+"
+                     r"((?:node|codex|agy|antigravity|claude)(?:\s|$).*)", text, re.I)
+    if match:
+        return match.group(1), match.group(2)
+    return text, None
+
+
 # struct kinfo_proc on 64-bit macOS: 648 bytes, kp_eproc.e_ppid at byte 560 (the same layout psutil
 # reads). CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1.
 _KINFO_SIZE, _E_PPID = 648, 560
@@ -192,14 +209,44 @@ def kernel_ppid(pid):
 
 
 class Ancestry:
-    """pid -> ppid for walking up from one process. Asks the kernel per pid; reads the whole `ps`
-    table, with a long timeout, only for a pid the kernel cannot answer. FLEETWATCH_PS_CMD forces the
-    table (the tests' stand-in process tree)."""
+    """pid -> ppid for walking up from one process. The general ancestry lookup asks the kernel
+    per pid and falls back to a cached parent table. Caller classification reads names and
+    arguments in separate process snapshots keyed by pid."""
 
     def __init__(self, command=None, timeout=60):
         self.command = command or "ps -axo pid=,ppid="
         self.forced = "FLEETWATCH_PS_CMD" in os.environ
         self.timeout, self.table, self.warnings = timeout, None, []
+        self._processes = None
+        self.process_unreadable = False
+
+    def _snapshot(self):
+        """Read structured names and full arguments by pid."""
+        if self._processes is None:
+            self._processes = {}
+            try:
+                names = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="],
+                                       capture_output=True, text=True, timeout=5)
+                args = subprocess.run(["ps", "-axww", "-o", "pid=,args="],
+                                      capture_output=True, text=True, timeout=5)
+                if names.returncode != 0 or args.returncode != 0:
+                    raise OSError("ps failed")
+                by_pid = {}
+                for line in args.stdout.splitlines():
+                    fields = line.strip().split(None, 1)
+                    if fields and fields[0].isdigit():
+                        by_pid[int(fields[0])] = fields[1] if len(fields) > 1 else ""
+                for line in names.stdout.splitlines():
+                    fields = line.strip().split(None, 2)
+                    if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+                        continue
+                    pid = int(fields[0])
+                    self._processes[pid] = (int(fields[1]), fields[2], by_pid.get(pid, ""))
+                if not self._processes:
+                    raise OSError("empty process table")
+            except (OSError, subprocess.TimeoutExpired):
+                self.process_unreadable = True
+        return self._processes
 
     def _table(self):
         if self.table is None:
@@ -207,10 +254,26 @@ class Ancestry:
         return self.table
 
     def get(self, pid, default=None):
+        if self._processes is not None:
+            row = self._snapshot().get(pid)
+            return row[0] if row is not None else default
         p = None if self.forced else kernel_ppid(pid)
         if p is None:
             p = self._table().get(pid)
         return default if p is None else p
+
+    def process_name(self, pid):
+        """Executable path from the cached process snapshot."""
+        row = self._snapshot().get(pid)
+        if row is None:
+            self.process_unreadable = True
+        return row[1] if row is not None else None
+
+    def process_args(self, pid):
+        row = self._snapshot().get(pid)
+        if row is None or not row[2]:
+            self.process_unreadable = True
+        return row[2] if row is not None else None
 
     @property
     def unreadable(self):
