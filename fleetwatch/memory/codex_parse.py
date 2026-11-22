@@ -25,7 +25,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import session_parse
 from .session_parse import DEFAULT_OPTS, DEFAULT_RULES, index_kind
 
 PROVIDER = "codex"

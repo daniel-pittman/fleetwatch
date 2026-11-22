@@ -953,6 +953,30 @@ class Add(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("no transcript", err)
 
+    def test_a_codex_index_names_its_folder_and_has_no_owner_session(self):
+        codex = self.cfg.parent / "codex-sessions"
+        codex.mkdir()
+        code, out, err = self.add("--source", "codex", "--path", str(codex), "--group", "research")
+        self.assertEqual(code, 0, err)
+        entry = yaml.safe_load((self.cfg / "indexes" / "registry.d" / "codex-sessions.yaml")
+                               .read_text())["indexes"]["codex-sessions"]
+        self.assertEqual(entry["transcripts"], {"source": "codex", "path": str(codex)})
+        self.assertNotIn("owner_session", entry)
+        self.assertIn("Codex CLI", (self.cfg / "indexes" / "codex-sessions" / "tags.yaml").read_text())
+        reg = indexes.load_registry()
+        ix = refresh.Index("codex-sessions", reg["indexes"]["codex-sessions"], reg["defaults"])
+        self.assertTrue(ix.tc.version)
+        code, out, err = self.add("--source", "codex", "--path", str(codex), "--group", "research")
+        self.assertEqual(code, 2)
+        self.assertIn("already exists", err)
+
+    def test_a_codex_index_needs_an_existing_folder_and_path_needs_codex(self):
+        code, out, err = self.add("--source", "codex", "--path", str(self.cfg.parent / "none"),
+                                  "--group", "research")
+        self.assertEqual((code, "does not exist" in err), (2, True))
+        code, out, err = self.add("--session", "Fleet Dev", "--path", "/x", "--group", "oss")
+        self.assertEqual((code, "--source codex" in err), (2, True))
+
 
 # ----------------------------------------------------------------- guard on index commands
 

@@ -323,6 +323,7 @@ class Codex(unittest.TestCase):
         recs, _ = self.load()
         text = render.render_exchange(recs[0], None, recs[1]["id"], {}, [])
         self.assertIn("Source: codex | Folder: ~/git/demo/widgets\n", text)
+        self.assertRegex(text.splitlines()[0], r"^# S03b19a-EX-0001 .* owner ~/git/demo/widgets$")
         meta_ = render.parse_exchange(text, recs[0]["id"])
         self.assertEqual((meta_["provider"], meta_["folder"]), ("codex", "~/git/demo/widgets"))
         self.assertEqual(meta_["session"], SID)

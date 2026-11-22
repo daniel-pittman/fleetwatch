@@ -6,7 +6,7 @@ header lines are chunk text, so their wording changes BM25 and vector scores), t
 of `show` and `--around`, and the Tags: line that --tag filters on. Change the writer and
 the reader together, and run the round-trip test.
 
-    # <id> <local time> <sender kind>
+    # <id> <local time> <sender kind>[ <working folder>]
     Exchange <id> | <utc> UTC | <local time> | from <who>
     Previous: <id|none> | Next: <id|none> | Source lines <a>-<b>
     Session: <session id>
@@ -67,7 +67,8 @@ def render_exchange(r, prev_id, next_id, t, tags, rules=DEFAULT_RULES):
     tools = ", ".join("%s x%d" % (k, v) if v > 1 else k
                       for k, v in sorted(r["tools"].items(), key=lambda kv: -kv[1])) or "none"
     who = sender_label(r, rules)
-    out = ["# %s %s %s" % (r["id"], local, r["sender_kind"]),
+    out = ["# %s %s %s%s" % (r["id"], local, r["sender_kind"],
+                             " " + r["cwd"] if r.get("provider") and r.get("cwd") else ""),
            "Exchange %s | %s UTC | %s | from %s" % (r["id"], utc, local, who),
            "Previous: %s | Next: %s | Source lines %d-%d"
            % (prev_id or "none", next_id or "none", r["start_line"], r["end_line"]),
