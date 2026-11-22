@@ -386,8 +386,11 @@ class GroupTests(Env):
                 self.assertEqual(type(app.screen).__name__, "Screen")
                 with open(self.groups) as fh:
                     self.assertIn('"Sleeper" = "%s"' % chosen, fh.read())
-                await settle(pilot, lambda: "%s · " % chosen in app.current.visible_text()
-                             and "Sleeper" in app.current.visible_text(), "the moved session to show")
+                # Wait on what is asserted below: the board text can show the group and the
+                # session before the refresh that regroups Sleeper has landed.
+                await settle(pilot, lambda: app.snapshot.grouping.of("Sleeper") == chosen
+                             and "moved Sleeper to %s" % chosen in (app.status_text or "")
+                             and "%s · " % chosen in app.current.visible_text(), "the moved session to show")
                 self.assertIn("moved Sleeper to %s" % chosen, app.status_text)
                 self.assertEqual(app.snapshot.grouping.of("Sleeper"), chosen)
         run(go())
