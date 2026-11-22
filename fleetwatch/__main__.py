@@ -15,6 +15,7 @@ def build_parser():
                "  unpark [NAME]       take a session off the parked list\n"
                "  prune               move finished sessions' status files to .pruned/\n"
                "  write-status        write this session's status file from JSON on stdin\n"
+               "  launch record       record a Codex or Antigravity launch from a Claude Code hook\n"
                "  jump NAME           raise a running session's iTerm2 tab\n"
                "  notify              desktop notifications when something new needs you\n"
                "  watch               run | report | ack | schedule: GitHub watches for stopped sessions\n"
@@ -65,6 +66,9 @@ def main(argv=None):
     if argv[:1] == ["write-status"]:
         from . import write_status
         return write_status.main(argv[1:])
+    if argv[:1] == ["launch"]:
+        from . import launch
+        return launch.main(argv[1:])
     if argv[:1] == ["watch"]:
         from . import watches
         return watches.main(argv[1:])
