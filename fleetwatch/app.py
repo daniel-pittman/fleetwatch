@@ -1598,7 +1598,7 @@ class FleetwatchApp(App):
             # A row that wraps would hide the next result, so the folder takes only what is left.
             used = len(e["name"]) + len(date) + len(status) + (len(e["persona"]) + 3 if e["persona"] else 0)
             out.append({"sid": e["sid"], "name": e["name"], "persona": e["persona"], "updated": e["last"],
-                        "fields": [e["name"], e["persona"] or "", resume.short_folder(e["cwd"], 200)],
+                        "fields": [e["name"], e["persona"] or "", find.exact(resume.short_folder(e["cwd"], 200))],
                         "group": "%s  %s" % (date, resume.short_folder(e["cwd"], max(FIND_ROW_ROOM - used, 8))),
                         "status": status})
         return out

@@ -25,6 +25,15 @@ def names(q):
 
 
 class RankTests(unittest.TestCase):
+    def test_an_exact_field_does_not_match_by_scattered_letters(self):
+        path = "/home/alex/downloads/old-archive-budget"         # d, o, c appear in order, but never together
+        exact = {"name": "Grant Proposal", "persona": None, "updated": 1, "fields": ["Grant Proposal", find.exact(path)]}
+        plain = dict(exact, fields=["Grant Proposal", path])
+        self.assertEqual(find.rank("doc", [exact]), [])
+        self.assertEqual(find.rank("doc", [plain]), [plain])      # a plain field still takes them
+        self.assertEqual(find.rank("gnt", [exact]), [exact])      # the name still takes subsequences
+        self.assertEqual(find.rank("budget", [exact]), [exact])   # a substring of the folder still matches
+
     def test_initials_and_prefix(self):
         self.assertEqual(names("ba")[0], "Billing API Development")
         self.assertEqual(names("doc"), ["Docs Site"])
