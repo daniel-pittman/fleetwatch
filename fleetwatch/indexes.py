@@ -239,7 +239,7 @@ def session_config(name, entry, settings):
         "tag_line_prefix": "Tags:",
         "kind_rules": rules,
         "level_folder_pattern": "^(\\d{8})()$",
-        "exact_heading_pattern": "\\bS[0-9a-f]{6}-(?:EX|AQ)-\\d{4,}\\b",
+        "exact_heading_pattern": "\\bS[0-9a-f]{6,12}-(?:EX|AQ)-\\d{4,}\\b",
         "labels": {
             "description": "Search the %s session: transcript exchanges and reference documents."
                            % who,

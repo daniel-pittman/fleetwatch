@@ -6,10 +6,11 @@ header lines are chunk text, so their wording changes BM25 and vector scores), t
 of `show` and `--around`, and the Tags: line that --tag filters on. Change the writer and
 the reader together, and run the round-trip test.
 
-    # <id> <local time> <sender kind>
+    # <id> <local time> <sender kind>[ <working folder>]
     Exchange <id> | <utc> UTC | <local time> | from <who>
     Previous: <id|none> | Next: <id|none> | Source lines <a>-<b>
     Session: <session id>
+    Source: <provider> | Folder: <working folder>      (only for a record that names its provider)
     Tools used: <tool xN, ...|none>[ | interrupted by the user]
     Tagged by: <model|untagged>
     Summary: <summary|(untagged)>
@@ -51,6 +52,14 @@ def sender_label(r, rules=DEFAULT_RULES):
     return who
 
 
+def source_line(r):
+    """The `Source:` header line of a record from a provider other than Claude Code, as a
+    list of zero or one lines: its provider and, when known, the folder the session ran in."""
+    if not r.get("provider"):
+        return []
+    return ["Source: %s%s" % (r["provider"], " | Folder: %s" % r["cwd"] if r.get("cwd") else "")]
+
+
 def render_exchange(r, prev_id, next_id, t, tags, rules=DEFAULT_RULES):
     """The file text for parser record `r`, its tag record `t` (may be empty) and its
     rendered `tags` (facet:value strings). `rules` gives the owner's label and the zone."""
@@ -58,11 +67,13 @@ def render_exchange(r, prev_id, next_id, t, tags, rules=DEFAULT_RULES):
     tools = ", ".join("%s x%d" % (k, v) if v > 1 else k
                       for k, v in sorted(r["tools"].items(), key=lambda kv: -kv[1])) or "none"
     who = sender_label(r, rules)
-    out = ["# %s %s %s" % (r["id"], local, r["sender_kind"]),
+    out = ["# %s %s %s%s" % (r["id"], local, r["sender_kind"],
+                             " " + r["cwd"] if r.get("provider") and r.get("cwd") else ""),
            "Exchange %s | %s UTC | %s | from %s" % (r["id"], utc, local, who),
            "Previous: %s | Next: %s | Source lines %d-%d"
            % (prev_id or "none", next_id or "none", r["start_line"], r["end_line"]),
            "Session: %s" % r["session"],
+           *source_line(r),
            "Tools used: %s%s" % (tools, " | interrupted by the user" if r["interrupted"] else ""),
            "Tagged by: %s" % (t.get("model") or "untagged"),
            "Summary: %s" % (t.get("summary") or "(untagged)"),
@@ -90,8 +101,9 @@ def parse_exchange(text, ex_id):
     """The header fields, incoming text and reply of a rendered exchange.
 
     Keys: id, utc, local (the local time as written), from, previous, next,
-    source_lines, session, tagged_by, tools, summary, tags (list), incoming, reply. The
-    texts come back as written, headings still escaped.
+    source_lines, session, provider and folder (only when the header has a Source line),
+    tagged_by, tools, summary, tags (list), incoming, reply. The texts come back as written,
+    headings still escaped.
     """
     head, _, rest = text.partition("\n\n## ")
     meta = {"id": ex_id}
@@ -105,6 +117,11 @@ def parse_exchange(text, ex_id):
             meta["previous"], meta["next"], meta["source_lines"] = parse_links(line)
         elif line.startswith("Session: "):
             meta["session"] = line[len("Session: "):]
+        elif line.startswith("Source: "):
+            provider, _, folder = line[len("Source: "):].partition(" | Folder: ")
+            meta["provider"] = provider
+            if folder:
+                meta["folder"] = folder
         elif line.startswith("Tagged by: "):
             meta["tagged_by"] = line[len("Tagged by: "):]
         elif line.startswith("Tools used: "):

@@ -44,7 +44,7 @@ from pathlib import Path
 
 import yaml
 
-SCAN_RULES_VERSION = 19
+SCAN_RULES_VERSION = 20
 
 EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
 # A local part whose domain was cut off ("jdoe@" in a table cell) still carries a surname.
@@ -855,10 +855,28 @@ class Scanner:
         return out
 
     def scan_records(self, recs, triage=None):
-        """Redact session records in place (user_text, assistant); set r['scan'], r['dropped']."""
+        """Redact session records in place (user_text, assistant, the sender name, the working
+        folder and the tool names, for the records that have them); set r['scan'],
+        r['dropped']. Tool names are scanned as a group of their own, after the text, so the
+        text of a record scans exactly as it would without them. A name has its whitespace
+        collapsed to single spaces, and names that scrub to the same text add their counts."""
         res = self.scan_groups([[r["user_text"], r.get("sender_name") or ""] + r["assistant"]
-                                for r in recs], triage)
+                                + ([r["cwd"]] if r.get("cwd") else []) for r in recs], triage)
+        with_tools = [r for r in recs if r.get("tools")]
+        tool_res = iter(self.scan_groups([[" ".join(str(k).split()) for k in r["tools"]]
+                                          for r in with_tools], triage))
         for r, (fields, cats, dropped) in zip(recs, res):
+            if r.get("tools"):
+                names, tcats, tdropped = next(tool_res)
+                tools = {}
+                for name, n in zip(names, r["tools"].values()):
+                    tools[name] = tools.get(name, 0) + n
+                r["tools"] = tools
+                for k, v in tcats.items():
+                    cats[k] = cats.get(k, 0) + v
+                dropped = dropped or tdropped
+            if r.get("cwd"):
+                r["cwd"] = fields.pop()
             r["user_text"], r["assistant"] = fields[0], fields[2:]
             if r.get("sender_name"):
                 r["sender_name"] = fields[1]

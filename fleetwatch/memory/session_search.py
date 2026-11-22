@@ -26,7 +26,7 @@ from fleetwatch.search.errors import SearchError
 from .render import HEADER_LINES, parse_exchange, parse_header_links
 
 MEM_CAP = 4 << 30
-ID_RE = re.compile(r"^(?:S[0-9a-f]{6}-)?(?:EX|AQ)-\d{4,}$")
+ID_RE = re.compile(r"^(?:S[0-9a-f]{6,12}-)?(?:EX|AQ)-\d{4,}$")
 
 
 def arm_memory_cap(limit=MEM_CAP):
@@ -152,6 +152,9 @@ def print_exchange(meta, full, marker=" "):
     tprint("    tools: %s | session %s lines %s | tagged by %s"
            % (meta.get("tools", ""), meta.get("session", "")[:8], meta.get("source_lines", ""),
               meta.get("tagged_by", "?")))
+    if meta.get("provider"):
+        tprint("    source: %s%s" % (meta["provider"], " | folder: %s" % meta["folder"]
+                                     if meta.get("folder") else ""))
     if full:
         tprint("\n    --- incoming ---\n" + "\n".join("    " + x for x in meta["incoming"].splitlines()))
         if meta["reply"]:
