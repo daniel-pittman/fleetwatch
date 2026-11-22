@@ -501,7 +501,8 @@ def _compare_old(loc, name, old_root, scanner, tc, sig, mine, say, flag):
                             old_root / priv["denylist"] if priv.get("denylist") else None,
                             RuleSet(r.SETTINGS.rule_packs))
             otc = session_tagger.TagConfig(yaml.safe_load((old_root / old_entry["tags"]).read_text()),
-                                           r.SETTINGS.default_guidance)
+                                           r.SETTINGS.default_guidance,
+                                           source=r.source_name(old_entry.get("transcripts")))
         except Exception as e:
             # A YAML error quotes the offending line, which may be an allowlisted name;
             # verify reports numbers and names of checks only.

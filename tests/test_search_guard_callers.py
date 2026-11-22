@@ -8,6 +8,7 @@ from unittest import mock
 from pathlib import Path
 
 from fleetwatch import index_cli, indexes, search_cmd
+from fleetwatch.memory import routing
 from fleetwatch.memory import refresh
 
 
@@ -106,6 +107,18 @@ class CallerGuardTests(unittest.TestCase):
         node.process_args = lambda pid: "node /opt/claude/cli.js" if pid == 500 else None
         self.assertEqual(self.caller(node).kind, "session")
 
+    def test_versioned_claude_and_hosted_claude_never_downgrade(self):
+        (Path(self.paths["sessions"]) / "600.json").write_text(json.dumps(
+            {"name": "Owner", "sessionId": "owner-id"}))
+        for command, args in (("/opt/claude-v2.1.0", None),
+                              ("/usr/bin/node", "node claude.js codex agy"),
+                              ("/usr/bin/electron", "electron claude --codex")):
+            with self.subTest(command=command, args=args):
+                tree = Tree({600: 1}, {600: command})
+                tree.process_args = lambda pid: args
+                caller = self.caller(tree, {"CODEX_THREAD_ID": "x"}, tty=False)
+                self.assertEqual(caller.kind, "session")
+
     def test_planted_session_file_for_shell_pid_does_not_raise_trust(self):
         (Path(self.paths["sessions"]) / "600.json").write_text(json.dumps(
             {"name": "Owner", "sessionId": "owner-id"}))
@@ -126,6 +139,10 @@ class CallerGuardTests(unittest.TestCase):
                 tree = Tree({600: 500, 500: 1}, {500: "/usr/bin/node"})
                 tree.process_args = lambda pid: "node /opt/bin/%s server" % agent if pid == 500 else None
                 self.assertEqual(self.caller(tree).kind, "untrusted")
+        for host in ("bun", "deno", "nodejs"):
+            tree = Tree({600: 500, 500: 1}, {500: "/usr/bin/" + host})
+            tree.process_args = lambda pid: host + " /opt/codex-companion.mjs task"
+            self.assertEqual(self.caller(tree).kind, "untrusted")
 
     def test_search_and_index_cli_refuse_untrusted_read(self):
         caller = indexes.Caller("untrusted", sign="agy process in the ancestry")
@@ -147,6 +164,7 @@ class CallerGuardTests(unittest.TestCase):
         with mock.patch.object(indexes, "classify_caller", return_value=caller), \
                 mock.patch.object(indexes, "refresh") as indexer:
             indexer.return_value.SETTINGS.protected_groups = PROTECTED
+            indexer.return_value.index_name_problem.return_value = None
             index_cli.cmd_status(REG, [])
             shown = indexer.return_value.cmd_status.call_args.args[0]["indexes"]
             self.assertEqual(set(shown), {"public"})
@@ -156,10 +174,66 @@ class CallerGuardTests(unittest.TestCase):
         with mock.patch.object(indexes, "classify_caller", return_value=caller), \
                 mock.patch.object(refresh, "load_registry", return_value=REG), \
                 mock.patch.object(refresh, "SETTINGS") as settings, \
-                mock.patch.object(refresh, "cmd_status") as status:
+                mock.patch.object(refresh, "resolve_routing") as resolve, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
             settings.protected_groups = PROTECTED
+            resolve.return_value = routing.RoutingPlan()
             refresh._main(["status"])
-            self.assertEqual(set(status.call_args.args[0]["indexes"]), {"public"})
+            self.assertIn("== public", output.getvalue())
+            self.assertNotIn("private", output.getvalue())
+            self.assertIs(resolve.call_args.args[0], REG)
+
+    def test_restricted_status_hides_routing_error_index_name(self):
+        visible = dict(REG, indexes={"public": REG["indexes"]["public"]})
+        with mock.patch.object(refresh, "resolve_routing", side_effect=ValueError("private missing")), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            refresh.cmd_status(visible, full_reg=REG)
+        self.assertIn("agent routing unavailable", output.getvalue())
+        self.assertNotIn("private", output.getvalue())
+
+    def test_delegated_caller_cannot_refresh_or_build_protected_index(self):
+        callers = (indexes.Caller("delegated", ("Owner", "owner-id"), "codex process"),
+                   indexes.Caller("untrusted", sign="agy process in the ancestry"))
+        for caller in callers:
+            with self.subTest(caller=caller.kind), \
+                    mock.patch.object(indexes, "classify_caller", return_value=caller), \
+                    mock.patch.object(indexes, "refresh") as indexer:
+                indexer.return_value.SETTINGS.protected_groups = PROTECTED
+                indexer.return_value.index_name_problem.return_value = None
+                with self.assertRaises(index_cli.Refused):
+                    index_cli.cmd_refresh(REG, ["private"])
+                with self.assertRaises(index_cli.Refused):
+                    index_cli.cmd_build(REG, ["private"])
+                indexer.return_value.main.assert_not_called()
+
+    def test_direct_refresh_all_refuses_agent_but_allows_scheduler(self):
+        with mock.patch.object(refresh, "load_registry", return_value=REG), \
+                mock.patch.object(refresh, "SETTINGS") as settings, \
+                mock.patch.object(refresh, "resolve_routing", side_effect=RuntimeError("reached routing")):
+            settings.protected_groups = PROTECTED
+            with mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller(
+                    "delegated", ("Owner", "owner-id"), "codex process")):
+                with self.assertRaises(SystemExit) as cm:
+                    refresh._main([])
+                self.assertEqual(cm.exception.code, 3)
+            with mock.patch.object(indexes, "classify_caller", return_value=indexes.Caller(
+                    "untrusted", sign="stdin has no controlling terminal")):
+                with self.assertRaisesRegex(RuntimeError, "reached routing"):
+                    refresh._main([])
+
+    def test_forget_routed_run_in_catch_all(self):
+        reg = dict(REG, defaults={})
+        with mock.patch.object(refresh, "SETTINGS") as settings, \
+                mock.patch.object(refresh, "resolve_routing") as resolve, \
+                mock.patch.object(refresh, "Index") as index, \
+                mock.patch.object(refresh, "Lock") as lock:
+            settings.catch_all_index = "private"
+            resolve.return_value = routing.RoutingPlan(all_present={"codex": set()})
+            lock.return_value.__enter__.return_value = object()
+            index.return_value.forget.return_value = {"stored_files": 1}
+            got = refresh.forget_session(reg, "private", "run-id")
+            self.assertEqual(got["stored_files"], 1)
+            index.return_value.forget.assert_called_once_with("run-id")
 
     def test_index_add_and_force_migrate_refuse_untrusted_and_delegated(self):
         for caller in (indexes.Caller("untrusted", sign="no terminal"),

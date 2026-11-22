@@ -193,8 +193,11 @@ def cmd_build(reg, args):
     # content. Recognized Claude sessions still use their existing named-index guard.
     caller = indexes.classify_caller()
     name = args[0]
-    if caller.kind != "untrusted":
-        name = _guard(reg, name)
+    protected = indexes.refresh().SETTINGS.protected_groups
+    target_group = (reg.get("indexes", {}).get(name) or {}).get("group")
+    if caller.kind != "untrusted" or (indexes.is_agent_caller(caller) and
+                                      indexes.is_protected(target_group, protected)):
+        name = _guard(reg, name, caller)
     else:
         why = indexes.refresh().index_name_problem(name)
         if why:

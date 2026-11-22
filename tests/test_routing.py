@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
 import tempfile
 import textwrap
@@ -151,6 +152,9 @@ class CodexRunMeta(unittest.TestCase):
 
 class ResolverBranches(unittest.TestCase):
     def setUp(self):
+        self.ledger_env = mock.patch.dict(os.environ, {"FLEETWATCH_LAUNCH_LEDGER": ""})
+        self.ledger_env.start()
+        self.addCleanup(self.ledger_env.stop)
         self.base = tmp(self)
         self.repo_a = self.base / "repos" / "alpha"
         self.repo_b = self.base / "repos" / "beta"
@@ -206,8 +210,7 @@ class ResolverBranches(unittest.TestCase):
             entry["session_name"] = name
         launch.append_entry(entry, str(self.ledger))
 
-    def test_branch_a_launch_matches_same_or_parent_folder_and_newest_wins(self):
-        # Beta launches in Alpha's repo 3 minutes before the run; launch beats folder fallback.
+    def test_branch_a_conflicting_groups_go_to_unplaced_without_catch_all(self):
         self._append_launch(SID_A, self.repo_a, "2026-04-01T10:00:00Z")
         self._append_launch(SID_B, self.repo_a, "2026-04-01T10:02:00Z")
         write_codex_rollout(self.codex_dir, CODEX_1, self.repo_sub, ts="2026-04-01T10:05:00Z")
@@ -215,9 +218,8 @@ class ResolverBranches(unittest.TestCase):
                                    ledger_path=str(self.ledger))
         self.assertEqual(len(plan.placements), 1)
         self.assertEqual((plan.placements[0].index, plan.placements[0].reason),
-                         ("beta-session", routing.REASON_LAUNCH))
-        self.assertEqual(plan.counts_for("beta-session"), {"launch": 1, "folder": 0, "catch_all": 0})
-        self.assertEqual(len(plan.unplaced), 0)
+                         (None, routing.REASON_UNPLACED))
+        self.assertEqual(len(plan.unplaced), 1)
 
     def test_branch_a_time_window_boundaries_and_sibling_folder_isolation(self):
         sibling = self.base / "repos" / "alpha-other"
@@ -245,6 +247,17 @@ class ResolverBranches(unittest.TestCase):
         placed = {p.run.session_id: (p.index, p.reason) for p in plan2.placements}
         self.assertEqual(placed["01a1fbfd-0000-7000-8000-000000001234"],
                          ("beta-session", routing.REASON_LAUNCH))
+
+    def test_ledger_reader_rejects_ancestor_of_launcher_cwd(self):
+        run = routing.AgentRun("codex", CODEX_1, self.base / "run",
+                               str(self.base / "repos" / "unowned"), 1000)
+        folders = {name: routing.index_project_folders(entry)
+                   for name, entry in self.reg["indexes"].items()
+                   if routing._is_claude_session_entry(entry)}
+        entry = {"session_id": SID_A, "tool": "codex", "cwd": str(self.base / "repos"),
+                 "ts_epoch": 900}
+        got = routing.resolve_run(run, self.reg, [entry], folders, git_lookup=lambda _: None)
+        self.assertEqual((got.index, got.reason), (None, routing.REASON_UNPLACED))
 
     def test_branch_b_project_folder_and_worktree_via_fake_git(self):
         wt_live = self.base / "worktrees" / "wt-alpha"
@@ -411,6 +424,9 @@ class WiringAndTrust(unittest.TestCase):
     `fleetwatch index status`, and trust-group enforcement."""
 
     def setUp(self):
+        self.ledger_env = mock.patch.dict(os.environ, {"FLEETWATCH_LAUNCH_LEDGER": ""})
+        self.ledger_env.start()
+        self.addCleanup(self.ledger_env.stop)
         self.base = tmp(self)
         self.cfg = self.base / "config"
         self.data = self.base / "data"
@@ -647,7 +663,7 @@ class WiringAndTrust(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("unplaced agent runs: 1", out)
 
-    def test_rerouting_moves_a_run_out_of_its_previous_index(self):
+    def test_placed_run_stays_in_its_first_index(self):
         # Initially CODEX_1 lands in alpha-session by folder.
         write_codex_rollout(self.codex_dir, CODEX_1, self.repo_a, ts="2026-04-01T10:03:00Z",
                             prompt="Moving rollout prompt")
@@ -656,15 +672,33 @@ class WiringAndTrust(unittest.TestCase):
         self.assertTrue(any(CODEX_1 in t for t in corpora["alpha-session"].values()))
         self.assertFalse(any(CODEX_1 in t for t in corpora["beta-session"].values()))
 
-        # A launch entry attributes the run to beta-session instead; refreshing moves it.
+        # A later launch entry cannot move a previously placed run.
         launch.append_entry({
             "session_id": SID_B, "session_name": "Beta", "tool": "codex",
             "cwd": str(self.repo_a), "ts": "2026-04-01T10:00:00Z",
         }, str(self.ledger))
         reg, _ = self._refresh_all()
         corpora = self._corpus_by_index(reg)
-        self.assertFalse(any(CODEX_1 in t for t in corpora["alpha-session"].values()))
-        self.assertTrue(any(CODEX_1 in t for t in corpora["beta-session"].values()))
+        self.assertTrue(any(CODEX_1 in t for t in corpora["alpha-session"].values()))
+        self.assertFalse(any(CODEX_1 in t for t in corpora["beta-session"].values()))
+
+    def test_placement_survives_worktree_removal(self):
+        write_codex_rollout(self.codex_dir, CODEX_2, self.wt_a,
+                            ts="2026-04-01T11:00:00Z", prompt="Lane history")
+        reg, _ = self._refresh_all()
+        self.assertTrue(any(CODEX_2 in t for t in self._corpus_by_index(reg)["alpha-session"].values()))
+        shutil.rmtree(self.wt_a)
+        reg, plan = self._refresh_all()
+        self.assertEqual(plan.placements[0].index, "alpha-session")
+        self.assertTrue(any(CODEX_2 in t for t in self._corpus_by_index(reg)["alpha-session"].values()))
+
+    def test_routed_source_counts_reach_last_run(self):
+        write_codex_rollout(self.codex_dir, CODEX_1, self.repo_a,
+                            ts="2026-04-01T10:03:00Z")
+        self._refresh_all()
+        info = json.loads((refresh.ROOT / "alpha-session" / "state" / "last_run.json").read_text())
+        self.assertEqual(info["files_read"]["plain"], 1)
+        self.assertEqual(info["zst_skipped"], 0)
 
     def test_second_provider_source_plugs_into_refresh_without_routing_changes(self):
         agy_dir = self.base / "agy"
@@ -686,7 +720,9 @@ class WiringAndTrust(unittest.TestCase):
                 return sid[-10:]
 
             def stats(self):
-                return {}
+                return {"conversations_read": 1, "conversations_skipped": [["bad.db", "invalid"]],
+                        "conversations_vanished": [], "steps_skipped": 2,
+                        "unknown_steps": {"new-step": 3}}
 
             def list(self, dirs, *_):
                 out = []
@@ -718,6 +754,10 @@ class WiringAndTrust(unittest.TestCase):
         with mock.patch.dict(refresh.TRANSCRIPT_SOURCES, {"antigravity": FakeAgySource}):
             reg, _ = self._refresh_all()
         corpora = self._corpus_by_index(reg)
+        info = json.loads((refresh.ROOT / "alpha-session" / "state" / "last_run.json").read_text())
+        self.assertEqual(info["conversations_read"], 1)
+        self.assertEqual(info["conversations_skipped"], [["bad.db", "invalid"]])
+        self.assertEqual(info["unknown_steps"], {"new-step": 3})
         holders = [idx for idx, files in corpora.items()
                    if any(("Session: %s\n" % run_sid) in txt for txt in files.values())]
         self.assertEqual(holders, ["alpha-session"])

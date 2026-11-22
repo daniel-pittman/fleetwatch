@@ -659,8 +659,12 @@ class EndToEndWithNoSettings(unittest.TestCase):
         (ix / "search_config.yaml").write_text(E2E_CONFIG.format(root=dix))
         sessions = base / "sessions"
         sessions.mkdir()
+        home = base / "home"
+        home.mkdir()
         env = {k: v for k, v in os.environ.items() if k not in ("FLEETWATCH_PROJECTS_DIR", "TZ")}
-        env.update(FLEETWATCH_CONFIG_DIR=str(cfg), XDG_DATA_HOME=str(data), TZ="UTC",
+        env.update(HOME=str(home), FLEETWATCH_CONFIG_DIR=str(cfg), XDG_DATA_HOME=str(data),
+                   XDG_STATE_HOME=str(base / "state"),
+                   FLEETWATCH_LAUNCH_LEDGER=str(base / "state" / "launches.jsonl"), TZ="UTC",
                    FLEETWATCH_SESSIONS_DIR=str(sessions), FLEETWATCH_NO_MIGRATE="1",
                    PYTHONPATH=str(REPO) + os.pathsep + env.get("PYTHONPATH", ""))
         run = lambda *argv: subprocess.run([sys.executable, *argv], capture_output=True, text=True,

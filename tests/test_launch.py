@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 
@@ -50,7 +51,7 @@ class CommandMatching(unittest.TestCase):
                 self.assertEqual(launch.parse_command(cmd), (want_tool, want_wt))
 
     def test_multiline_and_heredoc_commands_match(self):
-        cmd = "cd /Users/alex/repo\ncodex exec - <<'EOF'\nDon't break on apostrophes\nEOF\n"
+        cmd = "cd /Users/alex/repo\ncodex exec - <<'EOF'\nKeep going after the first line\nEOF\n"
         self.assertEqual(launch.parse_command(cmd), ("codex", None))
 
     def test_non_launch_commands_do_not_match(self):
@@ -89,7 +90,8 @@ class RecordLedger(unittest.TestCase):
     def _run(self, raw_stdin, extra=()):
         out, err = io.StringIO(), io.StringIO()
         argv = ["--ledger", str(self.ledger), "--status-dir", str(self.status), *extra]
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+                mock.patch("fleetwatch.indexes.calling_session", return_value=("Billing API", SID)):
             code = launch.record_main(argv, stdin=io.StringIO(raw_stdin), now=FIXED_NOW)
         return code, out.getvalue(), err.getvalue()
 
@@ -187,7 +189,7 @@ class RecordLedger(unittest.TestCase):
                                       stdin=io.StringIO(payload), now=FIXED_NOW)
         self.assertEqual((code, out.getvalue(), err.getvalue()), (0, "", ""))
 
-    def test_cli_subprocess_via_xdg_state_home(self):
+    def test_cli_subprocess_without_session_drops_entry(self):
         env = dict(os.environ,
                    FLEETWATCH_NO_MIGRATE="1",
                    XDG_STATE_HOME=str(self.state),
@@ -203,8 +205,7 @@ class RecordLedger(unittest.TestCase):
                            input=payload, capture_output=True, text=True, env=env, cwd=str(self.base))
         self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""))
         entries = launch.read_ledger(str(self.ledger))
-        self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["tool"], "codex")
+        self.assertEqual(len(entries), 0)
 
         bad = subprocess.run([sys.executable, "-m", "fleetwatch", "launch", "record"],
                              input="{broken", capture_output=True, text=True, env=env, cwd=str(self.base))

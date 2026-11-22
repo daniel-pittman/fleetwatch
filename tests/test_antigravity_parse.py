@@ -464,7 +464,7 @@ class Routing(Base):
         self.db([prompt("Catch-all", T0 + 30)], cid=other, meta=blob(other, folder=str(base / "other")))
         before = self.listing()
         # The blob's creation time precedes the launch. The first step follows it.
-        ledger = [{"session_id": SID_B, "cwd": str(checkout), "ts_epoch": T0 + 15}]
+        ledger = [{"session_id": SID_B, "tool": "agy", "cwd": str(checkout), "ts_epoch": T0 + 15}]
         plan = routing.resolve_all(reg, cfg, refresh.agent_sources(), ledger=ledger)
         self.assertEqual({p.run.session_id: (p.run.provider, p.index, p.reason)
                           for p in plan.placements}, {
@@ -481,7 +481,7 @@ class Routing(Base):
         cache = self.state / "routing.json"
         sources = {"antigravity": ap.AntigravitySource}
         runs, _ = routing.discover_runs(sources, cfg, cache_path=cache)
-        self.assertIsNone(runs[0].start_time)
+        self.assertEqual(runs, [])
         with contextlib.closing(sqlite3.connect(str(path))) as writer:
             writer.execute("PRAGMA wal_autocheckpoint=0")
             self.insert(writer, [turn(T0 + 1), prompt("First prompt", T0 + 2)])

@@ -181,7 +181,8 @@ def routing_cache_path():
 def resolve_routing(reg, ledger_path=None, git_cmd=None):
     return routing.resolve_all(
         reg, SETTINGS, agent_sources(), ledger_path=ledger_path,
-        git_cmd=git_cmd, cache_path=routing_cache_path(), project_dirs_fn=project_dirs)
+        git_cmd=git_cmd, cache_path=routing_cache_path(), project_dirs_fn=project_dirs,
+        placement_path=Path(fleetwatch_settings.state_dir()) / "placements.json")
 
 
 def _merge_session_records(groups_of_records):
@@ -494,8 +495,15 @@ class Index:
                         on_missing=on_missing, all_present_sids=plan.all_present.get(provider))
                     if r_recs:
                         extra_groups.append(r_recs)
-                    for key in ("sessions", "new", "files_reparsed", "removed", "held"):
-                        st[key] = st.get(key, 0) + rst.get(key, 0)
+                    for key, value in rst.items():
+                        if isinstance(value, dict):
+                            counts = st.setdefault(key, {})
+                            for item, count in value.items():
+                                counts[item] = counts.get(item, 0) + count
+                        elif isinstance(value, (int, float)):
+                            st[key] = st.get(key, 0) + value
+                        elif isinstance(value, list):
+                            st.setdefault(key, []).extend(value)
                 if extra_groups:
                     records = _merge_session_records([records] + extra_groups)
                 st["agent_runs"] = agent_counts
@@ -1012,7 +1020,10 @@ def cmd_status(reg, full_reg=None):
             print("   staleness: transcript %s the last run by %.0f min"
                   % ("is newer than" if lag > 0 else "is older than", abs(lag) / 60))
     if routing_err:
-        print("agent routing error: %s" % routing_err)
+        if full_reg is not None and set(reg["indexes"]) != set(full_reg["indexes"]):
+            print("agent routing unavailable")
+        else:
+            print("agent routing error: %s" % routing_err)
     elif plan is not None:
         print("unplaced agent runs: %d" % len(plan.unplaced))
 
@@ -1082,11 +1093,14 @@ def forget_session(reg, name, sid, force=False):
     unless `force`."""
     entry = reg["indexes"][name]
     t = entry.get("transcripts")
-    if not t:
+    if not t and name != SETTINGS.catch_all_index:
         sys.exit("[%s] has no transcripts, so there is no session to forget" % name)
     if not SESSION_ID_RE.fullmatch(sid):
         sys.exit("not a session id: %r" % sid)
-    present = transcript_source(t).present(project_dirs(t), sid)
+    present = transcript_source(t).present(project_dirs(t), sid) if t else False
+    if not present:
+        plan = resolve_routing(reg)
+        present = any(sid in ids for ids in plan.all_present.values())
     if present and not force:
         sys.exit("[%s] the transcript of session %s is still in a registered folder, so the next "
                  "refresh would index it again; remove it first, or pass --force" % (name, sid))
@@ -1136,7 +1150,7 @@ def _main(argv):
         caller = indexes.classify_caller()
         visible = {name: entry for name, entry in reg["indexes"].items()
                    if indexes.read_refusal(reg, caller, name, SETTINGS.protected_groups) is None}
-        return cmd_status(dict(reg, indexes=visible))
+        return cmd_status(dict(reg, indexes=visible), full_reg=reg)
     if argv and argv[0] == "triage":
         if len(argv) < 2:
             sys.exit("usage: refresh_all.py triage NAME")
@@ -1187,6 +1201,11 @@ def _main(argv):
     opts = ap.parse_args(argv)
     opts.retag_all = False
     names = selected(reg, opts.index)
+    from fleetwatch import indexes
+    caller = indexes.classify_caller()
+    if indexes.is_agent_caller(caller) and any(fleetwatch_settings.is_protected(reg["indexes"][name].get("group"),
+                                                        SETTINGS.protected_groups) for name in names):
+        sys.exit(3)
     opts.routing_plan = resolve_routing(reg)
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
     failed = []

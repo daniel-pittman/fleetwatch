@@ -60,8 +60,9 @@ class Env(unittest.TestCase):
         with open(path, "w") as fh:
             json.dump(d, fh)
 
-    async def jumps(self, pilot, n):
-        await settle(pilot, lambda: len(self.calls) >= n, "the osascript call")
+    async def jumps(self, app, pilot, n):
+        await settle(pilot, lambda: len(self.calls) >= n and
+                     (app.status_text or "").startswith("jumped"), "the jump status")
         await pilot.pause()
 
     async def enter_on(self, app, pilot, tab, key):
@@ -69,7 +70,7 @@ class Env(unittest.TestCase):
         app.current.move_to(key)
         before = len(self.calls)
         await pilot.press("enter")
-        await self.jumps(pilot, before + 1)
+        await self.jumps(app, pilot, before + 1)
         return self.calls[before][1] if len(self.calls) > before else None
 
 
@@ -83,7 +84,7 @@ class EnterTests(Env):
                 await boot(app, pilot)
                 await pilot.press("space")
                 await pilot.press("enter")
-                await self.jumps(pilot, 1)
+                await self.jumps(app, pilot, 1)
                 self.assertEqual(self.calls[0][1], [TTY])
         run(go())
 
@@ -162,7 +163,7 @@ class EnterTests(Env):
                 self.assertEqual(app.status_text, "no session is highlighted")
                 lst.move_to("ses:Stuck Session")
                 await pilot.press("g")
-                await self.jumps(pilot, 1)
+                await self.jumps(app, pilot, 1)
                 self.assertEqual(self.calls[0][1], [TTY])
         run(go())
 

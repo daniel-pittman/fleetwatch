@@ -6,14 +6,9 @@ A transcript source participates in routing by exposing:
   - `run_meta(path)`: returns (working_folder, start_time) for one run file
   - optional `default_path`: default directory holding its run files
 
-Resolution order for each run (provider, folder, start_time):
-  (a) the newest launch-ledger entry with the same folder or a parent folder whose timestamp is
-      within 10 minutes before the run's start: that launcher session's index;
-  (b) else the unique registered session index whose project folders contain the run's folder,
-      following a git worktree to its main checkout via `git rev-parse --git-common-dir` when
-      the folder still exists;
-  (c) else the catch-all index named in settings.toml [routing] catch_all, which must belong to
-      a protected group; with no catch-all configured, the run is left unplaced and counted.
+The first resolved placement persists. A later refresh moves it only when the folder rule
+identifies a more protected index. Launches match their provider, prefer the longest containing
+folder, and send conflicting trust groups to the protected catch-all.
 """
 import json
 import os
@@ -244,6 +239,8 @@ def _folder_match_len(candidate_norm, candidate_abs, real_folders, slug_names):
     """Length of the longest project folder matching `candidate`, or -1 when none matches."""
     best = -1
     for pf in real_folders:
+        if is_same_or_parent(pf, str(Path.home())):
+            continue
         if is_same_or_parent(pf, candidate_norm):
             best = max(best, len(pf))
     if slug_names:
@@ -251,6 +248,8 @@ def _folder_match_len(candidate_norm, candidate_abs, real_folders, slug_names):
             p = Path(base)
             for anc in (p, *p.parents):
                 anc_str = str(anc).rstrip(os.sep) or os.sep
+                if is_same_or_parent(anc_str, str(Path.home())):
+                    continue
                 if _slugs_for(anc_str) & slug_names:
                     best = max(best, len(anc_str))
                     break
@@ -280,23 +279,13 @@ def validate_catch_all(reg, settings):
     return name
 
 
-def resolve_run(run, reg, ledger, index_folders, catch_all=None, git_lookup=None):
-    """Resolve one AgentRun to a Placement following the (a) launch -> (b) folder -> (c) catch-all order."""
-    # (a) Newest launch-ledger match with same or parent folder within 10 minutes before run start.
-    if run.folder and run.start_time is not None:
-        matches = [
-            e for e in ledger
-            if e.get("ts_epoch") is not None
-            and 0 <= (run.start_time - e["ts_epoch"]) <= LAUNCH_WINDOW_S
-            and is_same_or_parent(e["cwd"], run.folder)
-        ]
-        if matches:
-            newest = max(matches, key=lambda e: (e["ts_epoch"], e.get("line_no", 0)))
-            target = launcher_index(reg, newest.get("session_name"), newest.get("session_id"))
-            if target is not None:
-                return Placement(run, target, REASON_LAUNCH)
-
-    # (b) Registered session index whose project folders contain the run's folder or git main checkout.
+def resolve_run(run, reg, ledger, index_folders, catch_all=None, git_lookup=None,
+                protected_groups=None):
+    """Resolve a run while preserving the folder owner's protected group."""
+    protected_groups = (fleetwatch_settings.DEFAULT_PROTECTED_GROUPS if protected_groups is None
+                        else protected_groups)
+    folder_target = None
+    # The folder owner is needed before launch selection to enforce the protection floor.
     if run.folder:
         norm_run = norm_folder(run.folder)
         abs_run = _abs_folder(run.folder)
@@ -306,16 +295,55 @@ def resolve_run(run, reg, ledger, index_folders, catch_all=None, git_lookup=None
             candidates.append((main, main))
         hits = []
         for idx_name, (real_folders, slug_names) in index_folders.items():
-            best = -1
-            for cn, ca in candidates:
-                best = max(best, _folder_match_len(cn, ca, real_folders, slug_names))
+            best = max(_folder_match_len(cn, ca, real_folders, slug_names)
+                       for cn, ca in candidates)
             if best >= 0:
                 hits.append((best, idx_name))
         if hits:
             top = max(ml for ml, _ in hits)
             winners = sorted({ix for ml, ix in hits if ml == top})
             if len(winners) == 1:
-                return Placement(run, winners[0], REASON_FOLDER)
+                folder_target = winners[0]
+    if folder_target and fleetwatch_settings.is_protected(
+            reg["indexes"][folder_target].get("group"), protected_groups):
+        return Placement(run, folder_target, REASON_FOLDER)
+
+    if run.folder and run.start_time is not None:
+        matches = []
+        for e in ledger:
+            tool = str(e.get("tool") or "")
+            tool_matches = (tool == "multi-review" and run.provider in ("codex", "antigravity")
+                            or run.provider == "codex" and tool.startswith("codex")
+                            or run.provider == "antigravity" and tool.startswith(("agy", "antigravity")))
+            if not tool_matches:
+                continue
+            cwd = e.get("cwd")
+            if not cwd or is_same_or_parent(cwd, str(Path.home())):
+                continue
+            session_cwd = e.get("session_cwd")
+            if session_cwd and norm_folder(cwd) != norm_folder(session_cwd) and \
+                    is_same_or_parent(cwd, session_cwd):
+                continue
+            if (e.get("ts_epoch") is None or
+                    not 0 <= run.start_time - e["ts_epoch"] <= LAUNCH_WINDOW_S or
+                    not is_same_or_parent(cwd, run.folder)):
+                continue
+            target = launcher_index(reg, e.get("session_name"), e.get("session_id"))
+            if target is not None:
+                own_folders = index_folders.get(target, ([], set()))[0]
+                if any(norm_folder(cwd) != norm_folder(own) and
+                       is_same_or_parent(cwd, own) for own in own_folders):
+                    continue
+                matches.append((e, target))
+        if matches:
+            groups = {reg["indexes"][target].get("group") for _e, target in matches}
+            if len(groups) > 1:
+                return Placement(run, catch_all, REASON_CATCH_ALL if catch_all else REASON_UNPLACED)
+            chosen, target = max(matches, key=lambda pair: (len(norm_folder(pair[0]["cwd"])),
+                                                        pair[0]["ts_epoch"], pair[0].get("line_no", 0)))
+            return Placement(run, target, REASON_LAUNCH)
+    if folder_target:
+        return Placement(run, folder_target, REASON_FOLDER)
 
     # (c) Catch-all index in a protected group, else unplaced.
     if catch_all:
@@ -338,14 +366,7 @@ def _load_meta_cache(path):
 def _save_meta_cache(path, files):
     if not path:
         return
-    p = Path(path)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps({"version": CACHE_VERSION, "files": files}), encoding="utf-8")
-        os.replace(tmp, p)
-    except OSError:
-        pass
+    _save_private_json(Path(path), {"version": CACHE_VERSION, "files": files})
 
 
 def _claimed_by_standalone(reg, sources):
@@ -425,6 +446,8 @@ def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
             else:
                 folder, raw_ts = src.run_meta(path)
                 start_epoch = _to_epoch(raw_ts) if raw_ts is not None else None
+            if folder is None or start_epoch is None:
+                continue
             new_cache[key] = {"sig": sig, "folder": folder, "start_time": start_epoch}
             runs.append(AgentRun(provider=provider, session_id=sid, path=path,
                                  folder=folder, start_time=start_epoch))
@@ -435,7 +458,8 @@ def discover_runs(sources, settings, cache_path=None, claimed_fn=None):
 
 
 def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=None,
-                cache_path=None, project_dirs_fn=None, runs=None, all_present=None):
+                cache_path=None, project_dirs_fn=None, runs=None, all_present=None,
+                placement_path=None):
     """Discover and resolve all agent runs against `reg` and return a RoutingPlan."""
     catch_all = validate_catch_all(reg, settings)
     if ledger is None:
@@ -462,9 +486,30 @@ def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=N
         return git_cache[folder]
 
     plan = RoutingPlan(all_present=all_present)
+    placements_file = Path(placement_path) if placement_path else None
+    try:
+        stored = json.loads(placements_file.read_text()) if placements_file else {}
+    except (OSError, ValueError):
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    updated = dict(stored)
     for run in runs:
+        if run.folder is None or run.start_time is None:
+            continue
         placement = resolve_run(run, reg, ledger, index_folders, catch_all=catch_all,
-                                git_lookup=git_lookup)
+                                git_lookup=git_lookup, protected_groups=settings.protected_groups)
+        key = "%s:%s" % (run.provider, run.session_id)
+        old = stored.get(key)
+        if isinstance(old, dict) and old.get("index") in reg["indexes"]:
+            old_group = reg["indexes"][old["index"]].get("group")
+            new_group = (reg["indexes"][placement.index].get("group") if placement.index else None)
+            if not (placement.reason == REASON_FOLDER and
+                    fleetwatch_settings.is_protected(new_group, settings.protected_groups)
+                    and not fleetwatch_settings.is_protected(old_group, settings.protected_groups)):
+                placement = Placement(run, old["index"], old.get("reason", REASON_FOLDER))
+        if placement.index:
+            updated[key] = {"index": placement.index, "reason": placement.reason}
         plan.placements.append(placement)
         if placement.index is None:
             plan.unplaced.append(placement)
@@ -474,4 +519,24 @@ def resolve_all(reg, settings, sources, ledger=None, ledger_path=None, git_cmd=N
                 REASON_LAUNCH: 0, REASON_FOLDER: 0, REASON_CATCH_ALL: 0,
             })
             c[placement.reason] = c.get(placement.reason, 0) + 1
+    if placements_file and updated != stored:
+        _save_placements(placements_file, updated)
     return plan
+
+
+def _save_placements(path, placements):
+    _save_private_json(path, placements)
+
+
+def _save_private_json(path, value):
+    try:
+        path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(value, out)
+        os.replace(tmp, path)
+    except OSError:
+        pass

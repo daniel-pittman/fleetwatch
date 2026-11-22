@@ -81,16 +81,19 @@ class AncestryTests(unittest.TestCase):
                     mock.patch.object(data, "read_ps", side_effect=AssertionError("ps ran")):
                 self.assertEqual(find_session(sessions, data.Ancestry(), 300), ("Billing API", "abc"))
 
-    def test_caller_reads_one_process_snapshot(self):
-        result = mock.Mock(returncode=0, stdout="600 500 /usr/bin/python  python task.py\n"
-                          "500 1 /Library/Application Support/antigravity "
-                          "/Library/Application Support/antigravity --server\n")
+    def test_caller_reads_structured_process_snapshots(self):
+        names = mock.Mock(returncode=0, stdout="600 500 /usr/bin/python\n"
+                          "500 1 /Library/Application Support/antigravity\n")
+        args = mock.Mock(returncode=0, stdout="600 python task.py\n"
+                         "500 /Library/Application Support/antigravity --server\n")
         with tempfile.TemporaryDirectory() as sessions, \
-                mock.patch.object(data.subprocess, "run", return_value=result) as run:
+                mock.patch.object(data.subprocess, "run", side_effect=[names, args]) as run:
             caller = indexes.classify_caller({"sessions": sessions}, data.Ancestry(), 600,
                                              {}, mock.Mock(isatty=lambda: True))
         self.assertEqual(caller.kind, "untrusted")
-        run.assert_called_once()
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], ["ps", "-axo", "pid=,ppid=,comm="])
+        self.assertEqual(run.call_args_list[1].args[0], ["ps", "-axww", "-o", "pid=,args="])
 
     def test_unreadable_process_names_fail_closed(self):
         for result in (FileNotFoundError(), data.subprocess.TimeoutExpired("ps", 5),

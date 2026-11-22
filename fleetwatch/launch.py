@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import sys
 from datetime import datetime
 
@@ -54,17 +55,31 @@ def ledger_path(state_dir=None):
 def _tokenize(text):
     """Split shell text into tokens while keeping quoted strings intact and preserving
     command separators including unquoted newlines."""
-    lex = shlex.shlex(text, posix=True, punctuation_chars=True)
-    lex.whitespace_split = True
-    lex.whitespace = " \t\r"
-    lex.commenters = ""
-    tokens = []
-    for tok in lex:
-        if "\n" in tok and not (len(tok) > 1 and tok.strip("\n")):
-            tokens.append("\n")
+    separated = []
+    quote = None
+    escaped = False
+    for ch in text:
+        if escaped:
+            separated.append(ch)
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            separated.append(ch)
+            escaped = True
+        elif ch in ("'", '"'):
+            if quote is None:
+                quote = ch
+            elif quote == ch:
+                quote = None
+            separated.append(ch)
+        elif ch == "\n" and quote is None:
+            separated.append(" ; ")
         else:
-            tokens.append(tok)
-    return tokens
+            separated.append(ch)
+    lex = shlex.shlex("".join(separated), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.whitespace = " \t\r\n"
+    lex.commenters = ""
+    return list(lex)
 
 
 def _segments(command):
@@ -200,6 +215,17 @@ def _match_segment(tokens):
         return None
     cmd, args = tokens[0], tokens[1:]
     base = os.path.basename(cmd)
+    if any(a in HELP_FLAGS for a in args):
+        return None
+
+    def review_root(script, sargs):
+        root = _option_value(sargs, "--worktree-root") or _extract_worktree(sargs)
+        if root:
+            return root
+        located = script if os.path.dirname(script) else shutil.which(script)
+        if located:
+            return os.path.join(os.path.dirname(located), "work", "worktrees")
+        return None
 
     if base in JS_RUNTIMES:
         i = 0
@@ -246,7 +272,7 @@ def _match_segment(tokens):
         if script == "codex-task-in-worktree.sh":
             return ("codex-task-in-worktree", _extract_worktree(sargs))
         if script == "multi-review.sh":
-            return ("multi-review", _extract_worktree(sargs))
+            return ("multi-review", review_root(args[i], sargs))
         return None
 
     if base == "codex":
@@ -267,7 +293,7 @@ def _match_segment(tokens):
     if base == "codex-task-in-worktree.sh":
         return ("codex-task-in-worktree", _extract_worktree(args))
     if base == "multi-review.sh":
-        return ("multi-review", _extract_worktree(args))
+        return ("multi-review", review_root(cmd, args))
     if base == "agy":
         return ("agy", _extract_worktree(args))
     return None
@@ -281,6 +307,15 @@ def parse_command(command):
         hit = _match_segment(seg)
         if hit is not None:
             return hit
+    return None
+
+
+def _option_value(args, flag):
+    for i, arg in enumerate(args):
+        if arg.startswith(flag + "="):
+            return arg[len(flag) + 1:] or None
+        if arg == flag and i + 1 < len(args):
+            return args[i + 1]
     return None
 
 
@@ -352,6 +387,10 @@ def record_payload(payload, ledger=None, status_dir=None, now=None):
     sid = payload.get("session_id")
     if not isinstance(sid, str) or not sid.strip():
         return None
+    from . import indexes
+    session = indexes.calling_session()
+    if session is None or session[1] != sid.strip():
+        return None
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
@@ -363,10 +402,17 @@ def record_payload(payload, ledger=None, status_dir=None, now=None):
     folder = resolve_folder(worktree, payload.get("cwd"))
     if not folder:
         return None
+    from .memory.routing import is_same_or_parent
+    home = os.path.expanduser("~")
+    session_cwd = resolve_folder(None, payload.get("cwd"))
+    if is_same_or_parent(folder, home) or (session_cwd and folder != session_cwd
+                                         and is_same_or_parent(folder, session_cwd)):
+        return None
     sid_clean = data.clean(sid).strip()
     sname = session_name_from_status(sid_clean, status_dir)
     ts = (now or datetime.now(settings.local_tz())).isoformat(timespec="seconds")
-    entry = {"session_id": sid_clean, "tool": tool, "cwd": folder, "ts": ts}
+    entry = {"session_id": sid_clean, "tool": tool, "cwd": folder,
+             "session_cwd": session_cwd, "ts": ts}
     if sname:
         entry["session_name"] = sname
     append_entry(entry, ledger)
@@ -407,6 +453,7 @@ def read_ledger(path=None):
                     if isinstance(d.get("session_name"), str) and d["session_name"].strip() else None,
                     "tool": str(d.get("tool") or ""),
                     "cwd": cwd.strip(),
+                    "session_cwd": d.get("session_cwd") if isinstance(d.get("session_cwd"), str) else None,
                     "ts": ts_raw,
                     "ts_epoch": ts_epoch,
                     "line_no": line_no,
@@ -465,4 +512,4 @@ def main(argv, stdin=None):
               "prints nothing to stdout.")
         return 0
     print("fleetwatch launch: unknown command %r (expected: record)" % argv[0], file=sys.stderr)
-    return 2
+    return 0

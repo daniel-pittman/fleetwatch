@@ -602,19 +602,32 @@ or Antigravity job (`codex exec`, `codex-companion.mjs` with `task`, `review` or
 `launches.jsonl` in fleetwatch's state folder (`$XDG_STATE_HOME/fleetwatch`, else
 `~/.local/state/fleetwatch`) with the session id, session name (when status files supply it), tool,
 working folder (`--worktree` when present, else `cwd`, resolved to an absolute path) and ISO time.
+For `multi-review.sh`, the folder is its worktree root. The hook records only the Claude session
+found in its own process ancestry. It rejects `/`, the home folder, folders above home, and folders
+that are proper ancestors of the launching session's cwd.
 It always exits 0 and writes nothing to stdout, so it can never block or alter a command.
 
 **2. How each run is resolved on refresh.** For every agent run (provider, working folder, start
 time), fleetwatch picks the target index in this order:
 
-1. **Launch ledger:** the newest ledger entry with the same folder, or a parent folder, recorded
+1. **Launch ledger:** a matching provider launch with the same folder, or a parent folder, recorded
    within 10 minutes before the run's start places the run in that launching session's index.
+   The most specific folder wins; equal lengths go to the newest entry. Codex launches match
+   Codex runs, Antigravity launches match Antigravity runs, and `multi-review.sh` can match either.
+   A broad or invalid folder is ignored. Launchers from different trust groups in the same window
+   send the run to the catch-all as ambiguous.
 2. **Project folder:** else the unique registered session index whose project folders contain the
    run's folder, following a git worktree to its main checkout via `git rev-parse --git-common-dir`
-   when the folder still exists.
+   when the folder still exists. An index whose project folder is the home folder or above cannot
+   claim a run under home.
 3. **Catch-all or unplaced:** else the catch-all index named in `settings.toml` (`[routing]
    catch_all`), which must belong to a protected group. With no catch-all configured, the run is not
    indexed and is counted as unplaced.
+
+Placement is stored in fleetwatch's state folder on the first successful read of a run's metadata.
+Later refreshes reuse it, including after a worktree is removed. A run moves only when the project
+folder rule would place it in a protected group and its stored index is less protected. Protection
+never decreases. If metadata cannot be read, the run is retried on the next refresh.
 
 Optional `settings.toml` entries:
 
@@ -650,7 +663,12 @@ prints the command that starts it; it does not start it.
 
 **Tagging sends scrubbed text to a model.** With `tag: true` (the registry default), `index refresh` sends each new exchange, already scrubbed, to a small Claude model through `claude -p` (Haiku unless `tags.yaml` says otherwise) for an area, kinds, topics and a one-line summary. Tags are cached by content hash and a run tags at most `tag_budget_per_run` (400) exchanges, newest first. These calls use your Claude account. `--no-tag`, or `tag: false` in the registry's `defaults:` or an entry, turns it off.
 
-**Trust groups.** From inside a session, `search --index X` reads another session's index only when
+**Trust groups.** Fleetwatch distinguishes four caller kinds: a Claude Code session, a delegated
+Codex or Antigravity agent under a session, the owner at a terminal, and an untrusted process.
+A session may read its own index. A delegated agent cannot read or refresh a protected index,
+even when its launching session owns it. An owner may read any index. An untrusted caller may
+read only an unprotected index whose group allows `"*"`; the scheduled refresh remains available.
+From inside a session, `search --index X` reads another session's index only when
 the caller's group (the group of its own index) is in X's group `readers` in the registry
 (`groups:`; `"*"` means everyone), or the session is in X's `extra_readers`. Otherwise it refuses and
 names the rule. An index in a protected group (settings.toml `[groups] protected`, default `ferpa`)

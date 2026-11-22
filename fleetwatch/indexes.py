@@ -75,6 +75,14 @@ class Caller:
     sign: str | None = None
 
 
+def is_agent_caller(caller):
+    """Whether ancestry or environment identifies an agent, including detached jobs."""
+    if caller.kind == "delegated":
+        return True
+    return caller.kind == "untrusted" and any(
+        word in (caller.sign or "").lower() for word in ("codex", "agy", "antigravity", "agent"))
+
+
 def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=None):
     """Identify a Claude session, its delegated agent, an owner, or an untrusted caller."""
     paths = paths or data.default_paths()
@@ -84,6 +92,7 @@ def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=
     sign = next(("%s environment variable" % marker for marker in CODEX_ENV_MARKERS
                  if marker in environ), None)
     seen = set()
+    first_pid = pid
     while isinstance(pid, int) and pid > 1 and pid not in seen and len(seen) < 512:
         seen.add(pid)
         process_name = getattr(ppids, "process_name", None)
@@ -91,18 +100,18 @@ def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=
         process_args = getattr(ppids, "process_args", None)
         args = process_args(pid) if process_args is not None else None
         executable = os.path.basename(command).lower() if command else ""
-        if command:
-            if executable in AGENT_EXECUTABLES:
-                sign = "%s process in the ancestry" % executable
-            if executable == "node" and args and any(
-                    re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(agent), args, re.I)
-                    for agent in NODE_AGENT_NAMES):
-                sign = sign or "node agent process in the ancestry"
         path = os.path.join(paths["sessions"], "%d.json" % pid)
-        claude_process = executable in ("claude", "claude code") or executable.startswith("claude helper")
-        if executable in ("node", "electron") and args:
+        claude_process = bool(re.match(r"^claude(?:$|[- .])", executable))
+        if executable in ("node", "nodejs", "bun", "deno", "electron") and args:
             claude_process = claude_process or bool(
                 re.search(r"(?<![\w-])claude(?![\w-])", args, re.I))
+        if command and not claude_process:
+            if executable in AGENT_EXECUTABLES:
+                sign = "%s process in the ancestry" % executable
+            if executable in ("node", "nodejs", "bun", "deno") and args and any(
+                    re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(agent), args, re.I)
+                    for agent in NODE_AGENT_NAMES):
+                sign = sign or "JS agent process in the ancestry"
         if os.path.isfile(path) and claude_process:
             try:
                 record = data.load_json(path)
@@ -112,6 +121,8 @@ def classify_caller(paths=None, ppids=None, start_pid=None, environ=None, stdin=
                     record["name"].strip() and isinstance(record.get("sessionId"), str) and \
                     record["sessionId"]:
                 session = (data.clean(record["name"]).strip(), record["sessionId"])
+                if pid == first_pid:
+                    return Caller("session", session)
                 return Caller("delegated" if sign else "session", session, sign)
         pid = ppids.get(pid)
     if sign:

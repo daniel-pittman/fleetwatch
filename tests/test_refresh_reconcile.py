@@ -50,7 +50,9 @@ class Reconcile(unittest.TestCase):
         old = refresh.SETTINGS
         self.addCleanup(refresh.configure, old)
         refresh.configure(settings.indexer(raw={"paths": {"data_dir": str(data),
-                                                          "projects_dir": str(base / "projects")}},
+                                                          "projects_dir": str(base / "projects")},
+                                                "routing": {"sources": {"codex": [],
+                                                                        "antigravity": []}}},
                                            cfg_dir=cfg))
         c = refresh.CONFIG_ROOT / "demo"
         c.mkdir(parents=True)

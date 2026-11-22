@@ -178,6 +178,8 @@ class TabTests(BoardCase):
 
         async def script(app, pilot):
             await pilot.press("5", "z")
+            await settle(pilot, lambda: app.active == views.INDEXES_TAB and
+                         all_open(app.lists[views.INDEXES_TAB]), "the Indexes tab to open")
             return app.lists[views.INDEXES_TAB].visible_text()
 
         text = self.board((140, 40), script, loader)

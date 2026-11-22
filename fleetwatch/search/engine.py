@@ -1407,7 +1407,8 @@ def search(ix, query, opts=None):
     notes = []
     con = ix.connect()
     try:
-        prepare_providers(con, ix.cfg)
+        if opts.provider:
+            prepare_providers(con, ix.cfg)
         results, tag, header, effective = run_query(ix, con, query, opts, opts.limit, notes)
         label_mixed_results(con, results)
     finally:
