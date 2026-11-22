@@ -10,6 +10,7 @@ from .config import OTHER
 from .data import (MARKERS_UTF8, LOCAL_TZ, ago, build_view, clean, date_label, day, dedup_key,
                    due_label, has_overdue, items_of, plural, short_name, task_label, timeline_rows)
 from .index_health import problem_rows
+from .providers import format_counts
 from .resume import home_folder, left_off, short_folder, tags
 
 RED = "bold red"
@@ -628,6 +629,12 @@ def index_node(h, now, owners=None):
             (Text("  "), Text("group: %s" % h.group)),
             (Text("  "), Text("refresh schedule: %s" % ("installed, stale after %s" % _age_text(h.stale_after)
                                                          if h.scheduled else "not installed, stale after 2 d")))]
+    if h.exchanges_by_provider is not None:
+        body.append((Text("  "), Text("exchanges by provider: " + format_counts(h.exchanges_by_provider))))
+    if h.agent_runs:
+        counts = h.agent_runs
+        body.append((Text("  "), Text("agent runs: %d by launch, %d by folder, %d by catch-all" %
+                                      (counts.get("launch", 0), counts.get("folder", 0), counts.get("catch_all", 0)))))
     body = [(Text("  "), Text(p, style=RED)) for p in problems] + next_lines(h, now) + body
     return Node("idx:" + h.name, _row_text(head), body, session=None, index=h.name, hang=2)
 

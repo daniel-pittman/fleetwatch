@@ -19,6 +19,7 @@ import threading
 import time
 from pathlib import Path
 
+from fleetwatch.providers import EXCHANGE_ID_RE as ID_RE
 from fleetwatch.search import cli as search_cli
 from fleetwatch.search import engine as search_engine
 from fleetwatch.search.errors import SearchError
@@ -26,7 +27,6 @@ from fleetwatch.search.errors import SearchError
 from .render import HEADER_LINES, parse_exchange, parse_header_links
 
 MEM_CAP = 4 << 30
-ID_RE = re.compile(r"^(?:S[0-9a-f]{6,12}-)?(?:EX|AQ)-\d{4,}$")
 
 
 def arm_memory_cap(limit=MEM_CAP):
@@ -218,7 +218,8 @@ def cmd_search_around(ix, store, argv, around, full, as_json, doc):
     for rank, g in enumerate(groups, start=1):
         r, ex = g["result"], g["exchange"]
         print("=" * 78)
-        search_cli.tprint("#%d hit in %s (%s), score %s" % (rank, ex or r["path"], r["heading"], r["score"]))
+        search_cli.tprint("#%d hit in %s%s (%s), score %s" % (
+            rank, ex or r["path"], search_cli.provider_label(r), r["heading"], r["score"]))
         if ex:
             for m in g["around"]:
                 if m:

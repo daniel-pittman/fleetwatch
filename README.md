@@ -249,10 +249,13 @@ A small radar floats over the bottom right corner of the board, above the hint l
 
 ### The Indexes tab
 
+Open a session index row to see its exchange counts by provider and how many agent runs
+were placed by launch, by folder, or by catch-all on the last successful refresh.
+
 Tab 5 shows the health of every registered index, grouped by trust group, without opening any of them. Each row gives the kind (session or plain), when it last refreshed and whether that worked, whether it is stale, whether the protection check passes for a protected group, and its exchange and corpus file counts. An index is stale when its last refresh is older than twice the refresh schedule's interval, or older than two days when no schedule is installed. A long scheduled `refresh --all` run does not make the indexes it finished early look stale. That run writes a small marker (`logs/refresh_run.json` in the index data folder, holding only its start and end times and the names it finished). An index the run finished counts as current until the run ended, and as waiting while the run is still going. An index the run skipped is judged by its own last refresh. A schedule that stopped flags every index once the last run ended more than twice the interval ago. It shows statuses and numbers only: a failure is named by a category such as `build`, never by its error text, and nothing from a corpus, probe, tag or path is shown. The board only reads; it never refreshes or writes an index. Each row names its owner session (`owner: NAME`, with `running` or `can resume` when the owner is a session fleetwatch can reach, or `no owner session`), matched by the registry's owner session id first and then by its name. Each problem row also carries a next step, one short line with the command and `(y copies)`: a failed refresh gives `fleetwatch index status NAME`, a refusal `fleetwatch index verify NAME`, a stale index `fleetwatch index schedule install` (no schedule installed) or `fleetwatch index schedule status`, and an index that never refreshed `fleetwatch index refresh NAME`. `y` copies the first one. An index whose refresh lock is fresh shows `refreshing now`, and while any refresh is running an index it has not reached yet shows `waiting for the running refresh`; neither is flagged as a problem. An index that failed, is refused by the protection check or is stale also appears in an Indexes section on Needs you, with the same owner and next step. Enter on an index row, here or on Needs you, goes to its owner: it jumps to the owner's iTerm2 tab when the owner is running, resumes the owner exactly as Enter does on the Resume tab (same checks, same refusals) when it is not, and with no owner or nothing to resume it says which command to run from a terminal. Space folds the row. In `--demo`, Enter only says what it would do. `y` on an index row of this tab copies the row's next command when it has a problem, and `fleetwatch search --index NAME "` for a healthy index, ready for a query. `z` opens or closes every row, and `s` sorts by name or by problems first. Without the `memory` extra the tab says to install `fleetwatch[memory]`.
 
 <p align="center">
-  <img src="docs/images/board-indexes.png" width="900" alt="The Indexes tab on the demo data, every row open, grouped by trust group. archive: release-history, whose last refresh failed (build) 40 minutes ago, with the next step `fleetwatch index status release-history (y copies)`, owner Pricing Page (can resume). ferpa: advising-notes, protection refused (settings), with the next step `fleetwatch index verify advising-notes (y copies)`, and no owner session. team: nightly-notes, waiting for the running refresh; site-docs, stale, with the next step `fleetwatch index schedule status (y copies)`, owner Docs Site (running); storefront-sessions, refreshed 14 minutes ago, owner Billing API (running); and support-faq, refreshing now, owner Status Page (can resume). The hint line offers Enter to go to the owner and y to copy.">
+  <img src="docs/images/board-indexes.png" width="900" alt="The Indexes tab on the demo data, every row open, grouped by trust group. archive: release-history, whose last refresh failed (build) 40 minutes ago, with the next step `fleetwatch index status release-history (y copies)`, owner Pricing Page (can resume). ferpa: advising-notes, protection refused (settings), with the next step `fleetwatch index verify advising-notes (y copies)`, and no owner session. team: nightly-notes, waiting for the running refresh; site-docs, stale, with the next step `fleetwatch index schedule status (y copies)`, owner Docs Site (running); storefront-sessions, refreshed 14 minutes ago, owner Billing API (running), with exchange counts by provider and agent run placements; and support-faq, refreshing now, owner Status Page (can resume). The hint line offers Enter to go to the owner and y to copy.">
 </p>
 
 ### Resume and park
@@ -469,7 +472,8 @@ documents), scrubbed, tagged and searchable. Config (registry, tags, allowlist, 
 `<config>/indexes/`, corpus and search data in `<data>/indexes/<name>/`.
 
 ```
-fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--path SUBSTR] [--around N] [--limit N]
+fleetwatch search "question" [--similar] [--provider claude|codex|antigravity] [--kind K] [--tag T] [--level D]
+                             [--path SUBSTR] [--around N] [--limit N]
                              [--json] [--no-rerank] [--expand | --no-expand] [--exact] [--index NAME]
 fleetwatch search show ID [ID ...] [--around N] [--full]
 fleetwatch search eval | stats [--index NAME]
@@ -495,6 +499,10 @@ there. In a command, `{python}` stands for the Python running the refresh, and
 `{python} -P -m fleetwatch index build NAME` rebuilds the search index. `index migrate` rewrites an
 old entry to that form and warns, by file and line, about any script that imports from the old
 shared engine folder, which is not copied.
+
+An index with exchanges from multiple providers labels each exchange hit. Use `--provider`
+to search only exchanges from the named provider, or repeat it to include several providers.
+It works with `--index` and `--similar`. By default the search includes the whole index.
 
 `--path` keeps only results whose file path contains the text. `--no-rerank` skips the reranking stage. `--expand` also searches the synonyms in `synonyms.yaml` at lower weight, and `--no-expand` turns off an `expand_by_default` setting. `--exact` stops fleetwatch correcting a word that appears nowhere in the corpus. `search eval --typos` misspells every probe to measure typo tolerance. `index add` names the index `<session>-session` unless `--name` says otherwise, and `--label` names the `--docs` folder (default `docs`).
 
@@ -616,8 +624,9 @@ catch_all = "unrouted-agents"     # must be a registered index in a protected gr
 sources = { codex = "~/.codex/sessions", antigravity = "~/.gemini/antigravity-cli/conversations" }   # optional provider -> sessions folder(s)
 ```
 
-`fleetwatch index status` reports per index how many runs were placed by launch, by folder and by
-catch-all, followed by the unplaced count.
+`fleetwatch index status` reports each session index's exchange counts by provider and how many
+runs were placed by launch, by folder, and by catch-all, followed by the unplaced count. Exchange
+counts by provider are recorded on the next successful refresh.
 
 **Deleted transcripts.** A session index keeps its history when Claude Code deletes an old transcript:
 a session whose transcript is gone is held from its stored records, which are scrubbed again whenever

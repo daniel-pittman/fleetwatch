@@ -200,7 +200,9 @@ def index_rows(now=None):
     two_scheduled = 2 * 1800
     return [
         Health("storefront-sessions", "team", "session", "ok", finished=now - 14 * 60, stale_after=two_scheduled,
-               exchanges=1842, files=96, scheduled=True, owner="Billing API"),
+               exchanges=1842, files=96, scheduled=True, owner="Billing API",
+               exchanges_by_provider={"claude": 1542, "codex": 210, "antigravity": 90},
+               agent_runs={"launch": 19, "folder": 7, "catch_all": 0}),
         Health("site-docs", "team", "plain", "ok", finished=now - 5 * 3600, stale_after=two_scheduled,
                files=212, scheduled=True, owner="Docs Site"),
         Health("nightly-notes", "team", "plain", "ok", finished=now - 3 * 3600, stale_after=two_scheduled,

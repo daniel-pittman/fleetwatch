@@ -23,6 +23,8 @@ from pathlib import Path
 
 import yaml
 
+from fleetwatch.providers import exchange_provider, is_exchange_path
+
 try:
     import numpy as np
 except ImportError:
@@ -32,7 +34,7 @@ from .errors import (ConfigError, EmbedderUnavailable, EmbeddingFailed, EmptyCor
                      IndexMissing, IndexStale, ModelMismatch, NoProbesYet, ProbesInvalid,
                      ProbesMissing)
 
-# Bumped whenever the SQLite schema or the stored vector format changes, so an index
+# Bumped for incompatible SQLite schema or stored vector format changes, so an index
 # built by an older copy of this tool is reported as stale instead of failing somewhere
 # confusing. Borrowed from zenhub-cli's CACHE_VERSION.
 INDEX_VERSION = "3"
@@ -111,6 +113,7 @@ class SearchOptions:
     expand: bool = False
     no_expand: bool = False
     exact: bool = False         # no typo correction
+    provider: list = None      # any of the selected transcript providers
 
 
 def _note(notes, kind, text):
@@ -335,6 +338,7 @@ def scan_markdown_file(cfg, root_cfg, fpath, rel):
 
     text = fpath.read_text(encoding="utf-8", errors="replace")
     tags = file_tags(cfg, text)
+    provider = exchange_provider(text.split("\n", 5)) if is_exchange_path(rel) else None
     blocks = split_markdown(text)
     file_title = stem
     for lvl, head, _ in blocks:
@@ -367,7 +371,7 @@ def scan_markdown_file(cfg, root_cfg, fpath, rel):
             out.append(dict(
                 root=root_cfg["name"], path=str(rel), file_title=file_title,
                 heading=head or "", heading_path=hpath, level=level, region=region,
-                area=area, kind=kind, part=part_i, text=full, tags=tags))
+                area=area, kind=kind, part=part_i, text=full, tags=tags, provider=provider))
     return out
 
 
@@ -488,10 +492,11 @@ def dedupe_chunks(chunks, cfg):
         norm = normalize_for_hash(c["heading"], c["text"])
         if len(norm) < min_chars:
             continue
-        digest = hashlib.sha1(norm.encode("utf-8")).hexdigest()
-        owner = seen.get(digest)
+        # A provider filter must be able to retrieve each provider's copy.
+        key = (c.get("provider"), hashlib.sha1(norm.encode("utf-8")).hexdigest())
+        owner = seen.get(key)
         if owner is None:
-            seen[digest] = i
+            seen[key] = i
             continue
         keep[i] = False
         dropped += 1
@@ -773,6 +778,7 @@ def tfidf_query_vector(query_terms, vocab, idf):
 
 # ---------------------------------------------------------------------------- build
 
+PROVIDER_TABLE = "exchange_providers (path TEXT PRIMARY KEY, provider TEXT NOT NULL)"
 SCHEMA = """
 CREATE TABLE chunks (
   id INTEGER PRIMARY KEY, root TEXT, path TEXT, file_title TEXT, heading TEXT,
@@ -790,7 +796,9 @@ CREATE TABLE vectors (chunk_id INTEGER, window INTEGER, idx BLOB, val BLOB,
 CREATE TABLE vocab (term TEXT PRIMARY KEY, idx INTEGER, idf REAL);
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE words (word TEXT PRIMARY KEY, df INTEGER);
-"""
+CREATE TABLE %s;
+CREATE INDEX exchange_providers_provider ON exchange_providers(provider);
+""" % PROVIDER_TABLE
 
 
 def build(ix, progress=None):
@@ -841,6 +849,8 @@ def build(ix, progress=None):
             "INSERT INTO chunks (root, path, file_title, heading, heading_path, level, region,"
             " area, kind, part, text, also_in, tags) VALUES (:root,:path,:file_title,:heading,"
             ":heading_path,:level,:region,:area,:kind,:part,:text,:also_in,:tags)", chunks)
+        providers = {c["path"]: c["provider"] for c in chunks if c.get("provider")}
+        con.executemany("INSERT INTO exchange_providers VALUES (?,?)", providers.items())
         con.execute("INSERT INTO chunks_fts (rowid, heading, heading_path, text) "
                     "SELECT id, heading, heading_path, text FROM chunks")
         # Unstemmed words and their chunk frequency, for typo correction. The FTS table holds
@@ -928,6 +938,41 @@ def get_meta(con, key, default=None):
     return row["value"] if row else default
 
 
+def prepare_providers(con, cfg):
+    """Load provider labels from exchange headers for indexes built without the provider table."""
+    if con.execute("SELECT 1 FROM sqlite_master WHERE name='exchange_providers'").fetchone():
+        return
+    con.execute("CREATE TEMP TABLE " + PROVIDER_TABLE)
+    root = cfg["_corpus_root"].resolve()
+    prefix = str(Path("corpus", "session")) + os.sep
+    for (path,) in con.execute("SELECT DISTINCT path FROM chunks WHERE path LIKE ?", (prefix + "%",)):
+        if not is_exchange_path(path):
+            continue
+        try:
+            file = (root / path).resolve()
+            if not file.is_relative_to(root) or not file.is_file():
+                continue
+            with file.open(encoding="utf-8", errors="replace") as fh:
+                provider = exchange_provider(fh)
+        except (OSError, RuntimeError):
+            continue
+        if provider:
+            con.execute("INSERT INTO exchange_providers VALUES (?,?)", (path, provider))
+
+
+def label_mixed_results(con, results):
+    if len(con.execute("SELECT DISTINCT provider FROM exchange_providers LIMIT 2").fetchall()) < 2:
+        return
+    by_path = {}
+    for row, _ in results:
+        path = row["path"]
+        if path not in by_path:
+            found = con.execute("SELECT provider FROM exchange_providers WHERE path=?", (path,)).fetchone()
+            by_path[path] = found["provider"] if found else None
+        if by_path[path]:
+            row["provider"] = by_path[path]
+
+
 def filter_sql(args):
     clauses, params = [], []
     if args.level is not None:
@@ -941,6 +986,11 @@ def filter_sql(args):
     if args.path:
         clauses.append("c.path LIKE ?")
         params.append("%" + args.path + "%")
+    providers = tuple(dict.fromkeys(getattr(args, "provider", None) or ()))
+    if providers:
+        marks = ",".join("?" for _ in providers)
+        clauses.append("c.path IN (SELECT path FROM exchange_providers WHERE provider IN (%s))" % marks)
+        params.extend(providers)
     # Every --tag must match (AND). "facet:value" matches that tag exactly, a bare "value"
     # matches it under any facet, and a trailing "*" matches by prefix. Needs an index built
     # with tag_line_prefix set; older indexes have no tags column.
@@ -1239,7 +1289,8 @@ def result_dicts(results):
          "heading_path": r["heading_path"], "region": r["region"],
          "text": r["text"],
          "also_in": json.loads(r["also_in"]) if r.get("also_in") else [],
-         "tags": (r.get("tags") or "").split()}
+         "tags": (r.get("tags") or "").split(),
+         **({"provider": r["provider"]} if r.get("provider") else {})}
         for i, (r, s) in enumerate(results, start=1)]
 
 
@@ -1356,7 +1407,9 @@ def search(ix, query, opts=None):
     notes = []
     con = ix.connect()
     try:
+        prepare_providers(con, ix.cfg)
         results, tag, header, effective = run_query(ix, con, query, opts, opts.limit, notes)
+        label_mixed_results(con, results)
     finally:
         con.close()
     return SearchResult(results, tag, header, effective, notes)
@@ -1432,6 +1485,8 @@ def evaluate(ix, opts=None, typos=False):
     con = ix.connect()
     notes = []
     try:
+        if opts.provider:
+            prepare_providers(con, ix.cfg)
         reranker = ix.cfg["similarity"].get("reranker")
         label = "%s%s" % (get_meta(con, "model", "tfidf"),
                           "" if (reranker and not opts.no_rerank) else " (no rerank)")

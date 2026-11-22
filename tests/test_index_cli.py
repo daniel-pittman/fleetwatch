@@ -8,6 +8,7 @@ import json
 import os
 import plistlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -21,7 +22,7 @@ import yaml
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 
 from fleetwatch import index_cli, index_migrate, indexes, schedule, search_cmd, settings
-from fleetwatch.memory import refresh
+from fleetwatch.memory import refresh, render
 from fleetwatch.search import engine
 
 REPO = Path(__file__).resolve().parent.parent
@@ -63,11 +64,13 @@ def tmp(test):
 
 
 def use_layout(test, cfg, data_dir, projects=None, packs=("education",), protected=("ferpa",)):
-    """Point the refresh module at a synthetic config and data folder for one test."""
+    """Use a synthetic config, data folder and terminal caller for one test."""
     raw = {"paths": {"data_dir": str(data_dir), "projects_dir": str(projects or cfg / "projects")},
-           "scanner": {"rule_packs": list(packs)}, "groups": {"protected": list(protected)}}
+           "scanner": {"rule_packs": list(packs)}, "groups": {"protected": list(protected)},
+           "routing": {"sources": {"codex": [], "antigravity": []}}}
     old = refresh.SETTINGS
     test.addCleanup(refresh.configure, old)
+    test.enterContext(mock.patch.object(indexes, "calling_session", return_value=None))
     refresh.configure(settings.indexer(raw=raw, cfg_dir=cfg))
 
 
@@ -274,6 +277,59 @@ class SearchCommand(unittest.TestCase):
         with mock.patch.object(indexes, "calling_session", return_value=session):
             return capture(search_cmd.main, list(argv))
 
+    def build_mixed_index(self):
+        self.migrate_both()
+        loc = indexes.locate(indexes.load_registry(), "demo-session")
+        day = loc.data_dir / "corpus" / "session" / "2026-04" / "20260401"
+        for n, provider in enumerate(("claude", "codex", "antigravity"), start=3):
+            record = dict(id="Saa11bb-EX-%04d" % n, ts="2026-04-01T10:00:00Z", session=SID,
+                          sender_kind="owner", sender_name="", interrupted=False, tools={},
+                          start_line=n, end_line=n, user_text="Telescope alignment for a test.",
+                          assistant=[], provider=provider if provider != "claude" else None)
+            (day / (record["id"] + ".owner.md")).write_text(render.render_exchange(record, None, None, {}, []))
+        docs = loc.data_dir / "corpus" / "docs"
+        docs.mkdir(parents=True, exist_ok=True)
+        (docs / "alignment.md").write_text("# Telescope alignment\n\nReference instructions for a test.\n")
+        return engine.build(engine.Index(loc.cfg_dir, indexes.search_config(loc)))["index_path"]
+
+    def test_mixed_search_labels_hit_headings_even_when_filtered_to_one_provider(self):
+        self.build_mixed_index()
+        code, out, err = self.search("telescope", "--index", "demo-session")
+        self.assertEqual(code, 0, err)
+        headings = [line for line in out.splitlines() if line.lstrip()[:1].isdigit()]
+        for provider in ("claude", "codex", "antigravity"):
+            self.assertTrue(any(line.endswith("[%s]" % provider) for line in headings), out)
+        self.assertTrue(any(line.endswith("alignment.md") for line in headings), out)
+
+        code, out, err = self.search("telescope", "--index", "demo-session",
+                                     "--provider", "codex", "--around", "0")
+        self.assertEqual(code, 0, err)
+        self.assertIn("#1 hit in Saa11bb-EX-0004 [codex]", out)
+        self.assertNotIn("alignment.md", out)
+
+    def test_provider_filter_works_on_own_index_and_with_index_and_similarity(self):
+        self.build_mixed_index()
+        code, out, err = self.search("telescope", "--provider", "antigravity", "--limit", "1", "--json",
+                                     session=("Demo Session", SID))
+        self.assertEqual(code, 0, err)
+        self.assertEqual([hit["provider"] for hit in json.loads(out)], ["antigravity"])
+
+        code, out, err = self.search("telescope", "--index", "demo-session", "--similar", "--no-rerank",
+                                     "--provider", "claude", "--provider=codex", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({hit["provider"] for hit in json.loads(out)}, {"claude", "codex"})
+
+    def test_provider_filter_reads_exchanges_from_an_index_built_without_provider_metadata(self):
+        path = self.build_mixed_index()
+        with contextlib.closing(sqlite3.connect(path)) as con:
+            con.execute("DROP TABLE exchange_providers")
+        before = path.stat().st_mtime_ns
+        code, out, err = self.search("telescope", "--index", "demo-session",
+                                     "--provider", "codex", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertEqual({hit["provider"] for hit in json.loads(out)}, {"codex"})
+        self.assertEqual(path.stat().st_mtime_ns, before)
+
     def test_output_equals_the_old_cli_and_json_matches(self):
         self.migrate_both()
         from fleetwatch.memory import session_search
@@ -290,6 +346,7 @@ class SearchCommand(unittest.TestCase):
                 self.assertEqual(strip(new_out), strip(old_out))
             else:
                 self.assertEqual(new_out, old_out)
+                self.assertNotIn("[claude]", new_out)
 
     def test_an_unknown_index_is_named_as_missing(self):
         self.migrate_both()

@@ -19,6 +19,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from fleetwatch.providers import PROVIDERS
+
 from . import engine
 from .errors import NoProbesYet, SearchError
 
@@ -71,6 +73,10 @@ def tprint(*parts, **kw):
     print(*(terminal_safe(p) for p in parts), **kw)
 
 
+def provider_label(hit):
+    return " [%s]" % hit["provider"] if hit.get("provider") else ""
+
+
 def print_results(results, query, as_json, tag="rrf", header=None):
     if as_json:
         print(json.dumps(engine.result_dicts(results), indent=2))
@@ -84,8 +90,8 @@ def print_results(results, query, as_json, tag="rrf", header=None):
         loc = "L%s" % r["level"] if r["level"] is not None else (r["region"] or "-")
         area = r["area"] or "-"
         head = r["heading_path"] or r["heading"] or r["file_title"]
-        tprint("%2d. [%s %-7.4f] %-6s area %-4s %-8s %s"
-               % (i, tag, score, loc, area, r["kind"], Path(r["path"]).name))
+        tprint("%2d. [%s %-7.4f] %-6s area %-4s %-8s %s%s"
+               % (i, tag, score, loc, area, r["kind"], Path(r["path"]).name, provider_label(r)))
         tprint("    %s" % head)
         tprint("    %s" % engine.snippet(r["text"], query))
         if r.get("tags"):
@@ -200,7 +206,7 @@ def options_from_args(args):
     return engine.SearchOptions(
         similar=args.similar, level=args.level, kind=args.kind, path=args.path, tag=args.tag,
         limit=args.limit, no_rerank=args.no_rerank, expand=args.expand,
-        no_expand=args.no_expand, exact=args.exact)
+        no_expand=args.no_expand, exact=args.exact, provider=args.provider)
 
 
 def make_parser(ix, doc=None):
@@ -216,6 +222,8 @@ def make_parser(ix, doc=None):
     p.add_argument("--level", type=int, help=cfg["_label_level_help"])
     p.add_argument("--kind", help=cfg["_label_kinds"] or "chunk kind, from kind_rules in the config")
     p.add_argument("--path", help="substring the file path must contain")
+    p.add_argument("--provider", action="append", choices=PROVIDERS,
+                   help="only exchanges from these providers (repeatable, any may match)")
     p.add_argument("--tag", action="append",
                    help="only documents carrying this tag (repeatable, all must match): "
                         "facet:value exact, bare value under any facet, trailing * for prefix")
