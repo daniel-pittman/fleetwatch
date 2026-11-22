@@ -570,6 +570,30 @@ class TextutilPlatform(unittest.TestCase):
             doc_corpus.textutil_txt(Path("x.doc"), doc_corpus.Ctx())
 
 
+class TaggerPrompt(unittest.TestCase):
+    """The prompt text is the tag-cache version: a Claude index's must never change, or every
+    Claude index re-tags."""
+
+    def test_the_claude_prompt_hash_is_unchanged(self):
+        self.assertEqual(session_tagger.TagConfig(TAGS).version, "ab5e0b2866")
+        self.assertEqual(session_tagger.TagConfig(TAGS, "summary: say what changed.").version,
+                         "0c0f96a194")
+        self.assertEqual(session_tagger.TagConfig(TAGS, source="claude").version, "ab5e0b2866")
+
+    def test_other_sources_name_their_provider(self):
+        claude = session_tagger.TagConfig(TAGS).system
+        for source, words in (("codex", "a Codex CLI session."),
+                              ("antigravity", "an Antigravity CLI conversation.")):
+            tc = session_tagger.TagConfig(TAGS, source=source)
+            self.assertIn("You tag exchanges from the transcript of %s" % words, tc.system)
+            self.assertNotIn("Claude", tc.system)
+            self.assertNotEqual(tc.version, "ab5e0b2866")
+            self.assertEqual(tc.system.replace(words, "a Claude Code session.").replace(
+                "a peer session)", "a peer Claude session)"), claude)
+        with self.assertRaises(ValueError):
+            session_tagger.TagConfig(TAGS, source="gemini")
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -317,7 +317,8 @@ class Index:
                                RuleSet(SETTINGS.rule_packs))
         check_protected(name, entry.get("group"), self.scanner, doc_options=entry.get("doc_options"))
         self.tc = session_tagger.TagConfig(yaml.safe_load((CONFIG_ROOT / entry["tags"]).read_text()),
-                                           SETTINGS.default_guidance)
+                                           SETTINGS.default_guidance,
+                                           source_name(entry.get("transcripts") or {}))
         self.index_file = self.dir / "index" / ("%s.sqlite" % name)
 
     # ------------------------------------------------------------------ pieces

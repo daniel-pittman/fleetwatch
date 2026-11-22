@@ -414,7 +414,8 @@ def verify(name, baseline=None, compare_old=None, out=None):
             say("protection", "ok" if not problems else "REFUSED: " + "; ".join(problems))
             bad += bool(problems)
             tc = session_tagger.TagConfig(yaml.safe_load((r.CONFIG_ROOT / entry["tags"]).read_text()),
-                                          r.SETTINGS.default_guidance)
+                                          r.SETTINGS.default_guidance,
+                                          r.source_name(entry.get("transcripts") or {}))
         except Exception as e:
             say("protection", "FAILED: scanner or tags did not load (%s)" % type(e).__name__)
             bad += 1
