@@ -907,6 +907,7 @@ class AppTests(AppWorld):
             # Folders match by prefix, word start or substring only, so scattered letters in the
             # temp folder's path do not list Grant Proposal.
             await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown] == ["Docs Site"])
+            self.assertEqual([e["name"] for e in app.screen.shown], ["Docs Site"])
             await pilot.press("enter")
             await self.settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], want)
