@@ -977,6 +977,29 @@ class Add(unittest.TestCase):
         code, out, err = self.add("--session", "Fleet Dev", "--path", "/x", "--group", "oss")
         self.assertEqual((code, "--source codex" in err), (2, True))
 
+    def test_a_codex_index_refuses_session_flags(self):
+        codex = self.cfg.parent / "codex-sessions"
+        codex.mkdir()
+        for flags in (("--session", "Fleet Dev"), ("--session-id", SID)):
+            code, out, err = self.add("--source", "codex", "--path", str(codex), "--group", "research",
+                                      *flags)
+            self.assertEqual(code, 2, flags)
+            self.assertIn("--session", err)
+            self.assertIn("Codex", err)
+        self.assertFalse((self.cfg / "indexes" / "registry.d" / "codex-sessions.yaml").exists())
+
+    def test_a_relative_codex_path_is_stored_absolute(self):
+        codex = self.cfg.parent / "rollouts"
+        codex.mkdir()
+        old = os.getcwd()
+        os.chdir(self.cfg.parent)
+        self.addCleanup(os.chdir, old)
+        code, out, err = self.add("--source", "codex", "--path", "rollouts", "--group", "research")
+        self.assertEqual(code, 0, err)
+        entry = yaml.safe_load((self.cfg / "indexes" / "registry.d" / "codex-sessions.yaml")
+                               .read_text())["indexes"]["codex-sessions"]
+        self.assertEqual(entry["transcripts"]["path"], str(codex))
+
 
 # ----------------------------------------------------------------- guard on index commands
 

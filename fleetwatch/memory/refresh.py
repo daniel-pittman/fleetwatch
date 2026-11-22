@@ -145,21 +145,26 @@ def check_protected(name, group, scanner, settings=None, doc_options=None):
 TRANSCRIPT_SOURCES = {"claude": session_parse.ClaudeSource, "codex": codex_parse.CodexSource}
 
 
-def transcript_source(t):
-    """The source object for a `transcripts:` block: `source` is `claude` (the default; the
-    block names `project_dir`) or `codex` (the block names `path`, the sessions folder)."""
+def source_name(t):
+    """The `source` of a `transcripts:` block: `claude` (the default; the block names
+    `project_dir`) or `codex` (the block names `path`, the sessions folder)."""
     name = t.get("source", "claude")
     if name not in TRANSCRIPT_SOURCES:
         raise ValueError("transcripts.source must be one of %s, not %r"
                          % (", ".join(TRANSCRIPT_SOURCES), name))
-    return TRANSCRIPT_SOURCES[name]()
+    return name
+
+
+def transcript_source(t):
+    """The source object for a `transcripts:` block."""
+    return TRANSCRIPT_SOURCES[source_name(t)]()
 
 
 def project_dirs(t):
     """An index's transcript folders. For a Claude index `project_dir` is one folder or a
     list of them; a list covers a session whose working directory moved, which starts a new
     project folder. A Codex index names its sessions folder in `path`."""
-    if t.get("source", "claude") == "codex":
+    if source_name(t) == "codex":
         if not t.get("path"):
             raise ValueError("transcripts.path is required when transcripts.source is codex")
         return [Path(os.path.expanduser(t["path"]))]
@@ -479,8 +484,8 @@ class Index:
             write_s=round(t_write - t_tag, 1), docs_s=round(t_docs - t_write, 1),
             build_s=build_s, built=built, index_line=idx_line, build_retried=retried,
             sessions=st["sessions"], new_exchanges=st["new"], exchanges=n_live,
-            **({"files_read": st["files_read"], "files_failed": st["files_failed"]}
-               if "files_read" in st else {}),
+            **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped")
+               if k in st},
             sessions_removed=st.get("removed", 0), sessions_held=st.get("held", 0),
             corpus_files_changed=sess_changed, tags=tag_stats, tags_cached=len(cache),
             docs_changed=len(docs["changed"]), docs_removed=len(docs["removed"]),
@@ -684,9 +689,10 @@ def run_one(reg, name, opts):
               % (name, t["calls"], u["input_tokens"], u["cache_read_tokens"],
                  u["cache_creation_tokens"], u["output_tokens"], u["cost_usd"]))
     if "files_read" in info:
-        print("[%s] codex rollouts read: %d plain, %d compressed; %d unreadable"
+        print("[%s] codex rollouts read: %d plain, %d compressed; %d unreadable, %d moved during "
+              "the run; %d malformed lines skipped"
               % (name, info["files_read"]["plain"], info["files_read"]["zst"],
-                 len(info["files_failed"])))
+                 len(info["files_failed"]), len(info["files_vanished"]), info["lines_skipped"]))
     if info.get("build_retried"):
         print("[%s] build: retried, because the previous build failed" % name)
     print("[%s] build: %s; total %ss (parse %ss, tag %ss, write %ss, docs %ss, build %ss)"

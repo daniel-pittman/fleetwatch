@@ -133,14 +133,15 @@ WITHHELD_TEXT = "[Exchange withheld by index policy]"
 
 
 def withhold_matching(recs, patterns):
-    """Blank every record whose prompt or reply matches a pattern, before any scan, tag or
-    write sees the text. Returns the number withheld."""
+    """Blank every record whose prompt, reply or working folder matches a pattern, before any
+    scan, tag or write sees the text. Returns the number withheld."""
     if not patterns:
         return 0
     rx = re.compile("|".join("(?:%s)" % p for p in patterns), re.I)
     n = 0
     for r in recs:
-        if rx.search(r.get("user_text") or "") or any(rx.search(a or "") for a in r.get("assistant") or []):
+        if (rx.search(r.get("user_text") or "") or rx.search(r.get("cwd") or "")
+                or any(rx.search(a or "") for a in r.get("assistant") or [])):
             r["user_text"], r["assistant"], r["tools"] = WITHHELD_TEXT, [], {}
             r.pop("cwd", None)
             r["withheld"] = True
@@ -152,8 +153,12 @@ def opts_sig(opts):
     return hashlib.sha1(json.dumps(opts, sort_keys=True).encode()).hexdigest()[:10]
 
 
-def exchange_id(sid, ex, n, opts):
-    return "%s-%04d" % (ex, n) if opts["bare_exchange_ids"] else "S%s-%s-%04d" % (sid[:6], ex, n)
+def exchange_id(sid, ex, n, opts, stem=None):
+    """EX-NNNN with bare ids, else S<stem>-EX-NNNN; the stem is the session id's first six
+    characters unless its source gave a longer one (id_stem)."""
+    if opts["bare_exchange_ids"]:
+        return "%s-%04d" % (ex, n)
+    return "S%s-%s-%04d" % (sid[:6] if stem is None else stem, ex, n)
 
 
 def index_kind(opts, canon, rules=DEFAULT_RULES):
@@ -510,7 +515,7 @@ class ClaudeSource:
 
     def id_stem(self, sid):
         """The part of a session id that exchange ids are built from (its first six characters)."""
-        return sid
+        return sid[:6]
 
     def list(self, project_dir, state_dir, automated_prefixes, sessions, exclude_automated):
         return session_list(project_dir, state_dir, automated_prefixes, sessions, exclude_automated)
@@ -600,7 +605,7 @@ def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
         for r in recs:
             r.pop("seen", None)
             r["session"] = sid
-            r["id"] = exchange_id(source.id_stem(sid), r.get("ex", "EX"), r["n"], opts)
+            r["id"] = exchange_id(sid, r.get("ex", "EX"), r["n"], opts, source.id_stem(sid))
         withhold_matching(recs, opts.get("withhold_patterns"))
         if recs:
             n_files += 1
@@ -618,7 +623,11 @@ def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
             curp.write_text(json.dumps(cur))
         # a session file touched in the last 15 minutes still has an open final exchange
         part = drop_replays(merged)
-        if part and (path.stat().st_mtime > time.time() - 900):
+        try:
+            recent = path.stat().st_mtime > time.time() - 900
+        except OSError:
+            recent = False          # the file moved away since it was listed
+        if part and recent:
             part[-1]["open"] = True
         allrecs += part
     # heartbeat pointers store ids as numbers in cron_seen; render them as exchange ids
@@ -629,6 +638,7 @@ def load_transcripts(project_dir, state_dir, scanner, full=False, triage=None,
             if m:
                 r["user_text"] = r["user_text"].replace(
                     "identical to %s]" % m.group(1),
-                    "identical to %s]" % exchange_id(r["session"], "EX", int(m.group(1)), opts), 1)
+                    "identical to %s]" % exchange_id(r["session"], "EX", int(m.group(1)), opts,
+                                                     source.id_stem(r["session"])), 1)
     return allrecs, skipped, dict(sessions=len(keep), new=n_new, files_reparsed=n_files,
                                   removed=len(removed), held=len(held), **source.stats())

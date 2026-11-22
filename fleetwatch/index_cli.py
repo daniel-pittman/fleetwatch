@@ -194,8 +194,11 @@ def cmd_add(reg, args):
     if a.path and not codex:
         return _fail("--path names the Codex sessions folder; use it with --source codex")
     if codex:
+        if a.session or a.session_id:
+            return _fail("--session and --session-id name a Claude session; a Codex index has "
+                         "no owner session (drop them with --source codex)")
         sname = sid = None
-        folder = Path(os.path.expanduser(a.path or "~/.codex/sessions"))
+        folder = Path(os.path.abspath(os.path.expanduser(a.path or "~/.codex/sessions")))
         if not folder.is_dir():
             return _fail("the Codex sessions folder %s does not exist" % tilde(folder))
         name = a.name or "codex-sessions"

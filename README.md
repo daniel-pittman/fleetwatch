@@ -524,7 +524,11 @@ its working folder (home written as `~`) and shows `Source: codex | Folder: ...`
 hit carries its date and folder and `search show ID` prints them. A plain rollout is read
 incrementally; a `.zst` rollout never changes, so it is streamed once through `zstd -dc` (the `zstd`
 command must be installed) and not opened again, and a session present in both forms is indexed once.
-`transcripts.sessions` limits the index to listed session ids.
+`transcripts.sessions` limits the index to listed session ids. A malformed line is skipped and
+counted in the refresh summary, a rollout that cannot be read keeps its stored records and is retried
+on the next refresh, and exchange ids carry ten characters of the session id
+(`Sc0b903b19a-EX-0001`). `index add --source codex` takes no `--session` or `--session-id`, and
+`--path` is stored as an absolute path.
 
 **One Codex index spans every project.** Codex keeps all sessions in one folder, so the index holds
 prompts from every project you used it in, and its trust group is chosen when it is created. Pick the

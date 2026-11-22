@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .session_parse import DEFAULT_OPTS, DEFAULT_RULES, index_kind
+from .session_parse import DEFAULT_OPTS, DEFAULT_RULES, index_kind, iso_pair
 
 PROVIDER = "codex"
 ROLLOUT_RE = re.compile(r"rollout-(?P<ts>\d{4}-\d{2}-\d{2}T[\d-]+)-(?P<sid>[0-9a-f]{8}-[0-9a-f]{4}-"
@@ -66,8 +66,24 @@ def short_home(path):
 
 
 def text_blocks(content, kind):
-    return [b.get("text", "") for b in content or []
-            if isinstance(b, dict) and b.get("type") == kind and b.get("text", "").strip()]
+    """The text of every `kind` block in a message's content; anything that is not a list of
+    blocks with string text yields nothing."""
+    if not isinstance(content, list):
+        return []
+    return [b["text"] for b in content
+            if isinstance(b, dict) and b.get("type") == kind and isinstance(b.get("text"), str)
+            and b["text"].strip()]
+
+
+def valid_stamp(ts):
+    """True when `ts` is a timestamp the renderer can read."""
+    if not isinstance(ts, str):
+        return False
+    try:
+        iso_pair(ts)
+    except ValueError:
+        return False
+    return True
 
 
 def user_text(content):
@@ -81,8 +97,9 @@ def user_text(content):
 class Rollout:
     """A rollout file opened for reading lines, plain or through zstd."""
 
-    def __init__(self, path):
-        self.path, self.zst = Path(path), str(path).endswith(".zst")
+    def __init__(self, path, partial=False):
+        """`partial`: the caller reads only the start, so stopping zstd early is not a failure."""
+        self.path, self.zst, self.partial = Path(path), str(path).endswith(".zst"), partial
         self.proc = None
 
     def __enter__(self):
@@ -97,39 +114,48 @@ class Rollout:
     def __exit__(self, exc_type, *_):
         self.fh.close()
         if self.proc:
-            if exc_type:
+            if exc_type or self.partial:
                 self.proc.kill()
             err = self.proc.stderr.read().decode("utf-8", "replace").strip()
             self.proc.stderr.close()
             code = self.proc.wait()
-            if code and not exc_type:
+            if code and not exc_type and not self.partial:
                 raise ZstdError("zstd could not read %s: %s" % (self.path.name, err or code))
 
 
 def read_meta(path):
     """The session_meta payload of a rollout (its first line); {} when it is not one."""
-    with Rollout(path) as r:
+    with Rollout(path, partial=True) as r:
         line = r.fh.readline()
     try:
         d = json.loads(line)
     except ValueError:
         return {}
-    return (d.get("payload") or {}) if d.get("type") == "session_meta" else {}
+    if not isinstance(d, dict) or d.get("type") != "session_meta":
+        return {}
+    return d["payload"] if isinstance(d.get("payload"), dict) else {}
 
 
-def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd=""):
+def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, counts=None):
     """Stream one rollout from a byte offset. Returns (records, cursor); the last record is
     still open (it may receive more assistant text on the next refresh). A compressed
-    rollout is complete, so its last line counts even without a newline; a plain one stops
-    before a line still being written. `cwd` is the working folder recorded on every record;
-    when empty it comes from the file's session_meta line."""
+    rollout is complete, so its last line counts even without a newline; a plain one counts
+    an unterminated last line only when it is complete JSON, and otherwise waits for the
+    rest. The cursor's `size` is the number of bytes read, never a later size of the file, so
+    a line appended during the read is read next time. A line or message that is not in the
+    rollout format is skipped and added to counts["lines_skipped"]. The working folder comes
+    from the file's own session_meta line on every parse, unscrubbed: the scan that follows
+    must see the raw value, and no scrubbed copy is ever fed back in."""
     opts = opts or DEFAULT_OPTS
+    counts = counts if counts is not None else {}
     records, cur = [], None
     complete = str(path).endswith(".zst")
-    if not cwd and offset:
-        cwd = short_home(read_meta(path).get("cwd"))
+    cwd = short_home(read_meta(path).get("cwd")) if offset else ""
     owner = index_kind(opts, rules.owner_kind, rules)
     subagent = index_kind(opts, "subagent", rules)
+
+    def skip():
+        counts["lines_skipped"] = counts.get("lines_skipped", 0) + 1
 
     def start(kind, canon, name, body, ts, pos, ln):
         nonlocal next_n
@@ -149,10 +175,18 @@ def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd="")
         pos = offset
         while True:
             line = f.fh.readline()
-            if not line or (not line.endswith(b"\n") and not complete):
+            if not line:
                 break
+            if not line.endswith(b"\n") and not complete:
+                try:
+                    json.loads(line)
+                except ValueError:
+                    pos += len(line)        # cut off mid-write: counted as read, reread on growth
+                    break
             at, pos = pos, pos + len(line)
             line_no += 1
+            if not line.strip():
+                continue
             head = line[:HEAD]
             if b'"response_item"' in head:
                 if any(m in head for m in OUTPUT_MARKERS):
@@ -167,9 +201,11 @@ def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd="")
             try:
                 d = json.loads(line)
             except ValueError:
+                skip()
                 continue
-            p = d.get("payload")
+            p = d.get("payload") if isinstance(d, dict) else None
             if not isinstance(p, dict):
+                skip()
                 continue
             ts = d.get("timestamp")
             typ, ptype = d.get("type"), p.get("type")
@@ -186,6 +222,9 @@ def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd="")
                 if role == "user":
                     body = user_text(p.get("content"))
                     if body:
+                        if ts is not None and not valid_stamp(ts):
+                            skip()
+                            continue
                         if cur is not None:
                             cur["end_line"] = prev_end
                             records.append(cur)
@@ -197,6 +236,9 @@ def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd="")
             elif typ == "response_item" and ptype == "agent_message":
                 body = "\n\n".join(t.strip() for t in text_blocks(p.get("content"), "input_text"))
                 if body:
+                    if ts is not None and not valid_stamp(ts):
+                        skip()
+                        continue
                     if cur is not None:
                         cur["end_line"] = prev_end
                         records.append(cur)
@@ -207,7 +249,7 @@ def parse(path, offset, line_no, next_n, opts=None, rules=DEFAULT_RULES, cwd="")
                 cur["tools"][name] = cur["tools"].get(name, 0) + 1
     if cur is not None:
         records.append(cur)
-    return records, dict(next_n=next_n, next_aq=1, cron_seen={}, size=os.path.getsize(path),
+    return records, dict(next_n=next_n, next_aq=1, cron_seen={}, size=pos,
                          source="zst" if complete else "plain")
 
 
@@ -220,14 +262,19 @@ class CodexSource:
     def __init__(self):
         self.read = {"plain": 0, "zst": 0}
         self.failed = []
+        self.vanished = []
+        self.counts = {}
 
     def id_stem(self, sid):
         """Codex session ids are UUIDv7: the first characters are a timestamp, so sessions
-        started within hours of each other share them. The random tail tells them apart."""
-        return sid[-6:]
+        started within hours of each other share them. Ten of the random tail (40 bits)
+        tell them apart; six would clash across the many sessions one index holds."""
+        return sid[-10:]
 
     def stats(self):
-        return dict(files_read=dict(self.read), files_failed=list(self.failed))
+        return dict(files_read=dict(self.read), files_failed=list(self.failed),
+                    files_vanished=list(self.vanished),
+                    lines_skipped=self.counts.get("lines_skipped", 0))
 
     def list(self, project_dir, state_dir, automated_prefixes, sessions, exclude_automated):
         """(keep, skipped): every session in the folders as (sort key, session id, path),
@@ -250,14 +297,23 @@ class CodexSource:
         return [str(d) for d in dirs if any(d.rglob("rollout-*-%s.jsonl*" % sid))]
 
     def newest_mtime(self, dirs):
-        return max((f.stat().st_mtime for d in dirs for f in d.rglob("rollout-*.jsonl*")),
-                   default=0)
+        newest = 0
+        for d in dirs:
+            for f in d.rglob("rollout-*.jsonl*"):
+                try:
+                    newest = max(newest, f.stat().st_mtime)
+                except OSError:
+                    pass            # compressed away while listing
+        return newest
 
     def parse(self, path, cursor, old, opts, rules):
         """(new records, cursor, old records kept). A cursor from the other form of the file
-        is not trusted: the session is read again from the start. A compressed file already
-        read is not opened. A file that cannot be read is reported and left for the next
-        refresh, with its stored records untouched."""
+        is not trusted for reading, but the stored cursor and records stay in place until the
+        new read succeeds. A compressed file already read is not opened. A file that cannot be
+        read, or that vanished because Codex compressed it after it was listed, is reported
+        and left for the next refresh, with its stored records untouched."""
+        stored = (cursor, old)
+        old = list(old)
         kind = "zst" if path.name.endswith(".zst") else "plain"
         if cursor and cursor.get("source") != kind:
             cursor, old = None, []
@@ -268,15 +324,20 @@ class CodexSource:
                 tail = old.pop()
                 nx = 1 + max([r["n"] for r in old] or [0])
                 recs, cur = parse(path, tail["start_offset"], tail["start_line"] - 1, nx, opts,
-                                  rules, tail.get("cwd") or "")
+                                  rules, self.counts)
             else:
                 old = []
-                recs, cur = parse(path, 0, 0, 1, opts, rules)
-        except ZstdError as e:
-            if "not installed" in str(e):
+                recs, cur = parse(path, 0, 0, 1, opts, rules, self.counts)
+        except FileNotFoundError:
+            self.vanished.append(path.name)
+            return [], stored[0], stored[1]
+        except Exception as e:
+            if isinstance(e, ZstdError) and "not installed" in str(e):
                 raise
             self.failed.append(path.name)
-            print("codex: skipped %s: %s" % (path.name, e), file=sys.stderr)
-            return [], cursor, old
+            print("codex: skipped %s: %s: %s" % (path.name, type(e).__name__, e)
+                  if not isinstance(e, ZstdError) else "codex: skipped %s: %s" % (path.name, e),
+                  file=sys.stderr)
+            return [], stored[0], stored[1]
         self.read[kind] += 1
         return recs, cur, old
