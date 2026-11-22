@@ -140,7 +140,9 @@ def withhold_matching(recs, patterns):
     rx = re.compile("|".join("(?:%s)" % p for p in patterns), re.I)
     n = 0
     for r in recs:
-        if (rx.search(r.get("user_text") or "") or rx.search(r.get("cwd") or "")
+        # A record with no folder (every Claude record) is not tested against it: a pattern
+        # that matches the empty string would otherwise withhold every such exchange.
+        if (rx.search(r.get("user_text") or "") or (r.get("cwd") and rx.search(r["cwd"]))
                 or any(rx.search(a or "") for a in r.get("assistant") or [])):
             r["user_text"], r["assistant"], r["tools"] = WITHHELD_TEXT, [], {}
             r.pop("cwd", None)

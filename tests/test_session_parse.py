@@ -204,6 +204,14 @@ class Transcripts(unittest.TestCase):
         # Without the pattern the signature differs, so the state is reparsed, not reused.
         self.assertNotEqual(sp.opts_sig(opts), sp.opts_sig(sp.parse_opts({})))
 
+    def test_a_record_without_a_folder_is_not_withheld_by_an_empty_match(self):
+        self.write(user("Rake the leaves", "2026-03-03T07:00:00Z"),
+                   asst("Raking.", "2026-03-03T07:00:01Z", "m1"))
+        self.age(self.path)
+        recs, _, _ = self.load(opts=sp.parse_opts({"withhold_patterns": ["^$"]}))
+        self.assertEqual(recs[0]["user_text"], "Rake the leaves")
+        self.assertNotIn("withheld", recs[0])
+
     def test_heartbeats_interrupts_and_kinds(self):
         beat = "HEARTBEAT: check every lane and resume what stalled."
         self.write(user(beat, "2026-03-04T07:00:00Z", isMeta=True),
