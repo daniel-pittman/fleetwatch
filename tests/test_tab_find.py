@@ -7,7 +7,9 @@ from unittest import mock
 
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from fleetwatch import app as fapp, data, demo, views  # noqa: E402
+sys.path.insert(0, os.path.dirname(__file__))
+from fleetwatch import app as fapp, data, demo, find, views  # noqa: E402
+from waiting import first_scan, settle  # noqa: E402
 
 
 class TabFind(unittest.TestCase):
@@ -26,18 +28,21 @@ class TabFind(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return await script(app, pilot)
         return asyncio.run(go())
 
     @staticmethod
     async def search(app, pilot, tab, query):
         await pilot.press(tab, "slash")
-        await pilot.pause(0.2)
+        await settle(pilot, lambda: isinstance(app.screen, fapp.FindScreen) and app.screen.query_one("#query").has_focus,
+                     "the find box")
         for ch in query:
             await pilot.press("space" if ch == " " else ch)
-        await pilot.pause(0.2)
-        return app.screen
+        screen = app.screen
+        await settle(pilot, lambda: screen.query_one("#query").value == query
+                     and screen.shown == find.rank(query, screen.entries), "the results to follow the query")
+        return screen
 
     def results(self, tab, query):
         async def script(app, pilot):
@@ -77,7 +82,7 @@ class TabFind(unittest.TestCase):
                 screen = await self.search(app, pilot, tab, "zzqqxx")
                 out[tab] = str(screen.query_one("#results").get_option_at_index(0).prompt)
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: not isinstance(app.screen, fapp.FindScreen), "the find screen to close")
             return out
         self.assertEqual(self.board(script), {"1": "no matching row", "2": "no matching to-do",
                                               "3": "no matching session", "5": "no matching index"})
@@ -125,7 +130,8 @@ class TabFind(unittest.TestCase):
                 with mock.patch.object(app, "action_enter", lambda: seen.append((app.active, app.current.cursor))):
                     await self.search(app, pilot, tab, query)
                     await pilot.press("enter")
-                    await pilot.pause(0.3)
+                    await settle(pilot, lambda: seen, "the Enter action")
+                await settle(pilot, lambda: not isinstance(app.screen, fapp.FindScreen), "the find screen to close")
                 self.assertNotIsInstance(app.screen, fapp.FindScreen)
                 return seen
             seen = self.board(script)
@@ -139,7 +145,7 @@ class TabFind(unittest.TestCase):
             with mock.patch.object(app, "action_jump", lambda: seen.append(app.current.current().session)):
                 await self.search(app, pilot, "3", "billing")
                 await pilot.press("enter")
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: seen, "the Enter action")
             return seen
         self.assertEqual(self.board(script), ["Billing API"])
 
@@ -149,7 +155,7 @@ class TabFind(unittest.TestCase):
             with mock.patch.object(app, "go_to_index_owner", lambda name: seen.append(name)):
                 await self.search(app, pilot, "5", "release")
                 await pilot.press("enter")
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: seen, "the Enter action")
             return seen
         self.assertEqual(self.board(script), ["release-history"])
 
@@ -159,7 +165,7 @@ class TabFind(unittest.TestCase):
             with mock.patch.object(app, "start_resume", lambda sid, here: seen.append((sid, here))):
                 await self.search(app, pilot, "4", "pricing")
                 await pilot.press("enter")
-                await pilot.pause(0.3)
+                await settle(pilot, lambda: seen, "the Enter action")
             return seen
         self.assertEqual(self.board(script), [(demo.RESUME_SIDS[0], True)])
 
@@ -169,7 +175,7 @@ class TabFind(unittest.TestCase):
             with mock.patch.object(app, "action_enter", lambda: seen.append(1)):
                 await self.search(app, pilot, "2", "pricing")
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: not isinstance(app.screen, fapp.FindScreen), "the find screen to close")
             return seen, isinstance(app.screen, fapp.FindScreen)
         self.assertEqual(self.board(script), ([], False))
 
@@ -180,11 +186,11 @@ class TabFind(unittest.TestCase):
             out = []
             for tab in "12345":
                 await pilot.press(tab, "ctrl+k")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: type(app.screen) is fapp.FindScreen and app.screen.shown, "the find screen")
                 out.append((type(app.screen) is fapp.FindScreen,
                             sorted(e["name"] for e in app.screen.shown)[:2]))
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                await settle(pilot, lambda: not isinstance(app.screen, fapp.FindScreen), "the find screen to close")
             return out
         out = self.board(script)
         self.assertTrue(all(kind for kind, _ in out))
