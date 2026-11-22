@@ -11,6 +11,7 @@ from test_fleetwatch import dstr, iso, render_env, Env  # noqa: E402
 from test_needs_tasks import NOW, view_of  # noqa: E402
 from test_resume import AppWorld, sid  # noqa: E402
 import standin  # noqa: E402
+from waiting import settle  # noqa: E402
 from fleetwatch import data, iterm, views  # noqa: E402
 
 ITEMS = [{"what": "send the form", "due": dstr(-1), "yours": True}]
@@ -58,12 +59,9 @@ class EnterTests(AppWorld):
             app = self.app()
             async with app.run_test(size=(120, 30)) as pilot:
                 await boot(app, pilot)
-                for _ in range(100):
-                    if app.resume_data is not None:
-                        break
-                    await pilot.pause(0.05)
+                await settle(pilot, lambda: app.resume_data is not None, "the resume data to load")
                 await pilot.press("1")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: app.active == 0, "the needs tab to show")
                 await body(app, pilot)
         import asyncio
         asyncio.run(go())
@@ -75,11 +73,11 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "ReopenScreen", "the reopen dialog")
             self.assertEqual(type(app.screen).__name__, "ReopenScreen")
             self.assertEqual(calls, [])
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "opened Gone Session in a new window" in (app.status_text or ""))
+            await settle(pilot, lambda: "opened Gone Session in a new window" in (app.status_text or ""))
         with mock.patch.object(iterm, "osascript", lambda script, args=(): calls.append(list(args)) or (True, "9\n")):
             self.drive_needs(body)
         self.assertEqual(len(calls), 1)
@@ -92,17 +90,17 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("G")
-            await self.settle(pilot, lambda: "needs:Gone Session" in app.current._order)
+            await settle(pilot, lambda: "needs:Gone Session" in app.current._order)
             app.current.move_to("needs:Gone Session")
             self.assertNotIn("Gone Session", app.snapshot.records)
             await pilot.press("p")
-            await self.settle(pilot, lambda: type(app.screen).__name__ == "ParkScreen")
+            await settle(pilot, lambda: type(app.screen).__name__ == "ParkScreen")
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "parked Gone Session" in (app.status_text or ""))
+            await settle(pilot, lambda: "parked Gone Session" in (app.status_text or ""))
             self.assertIn(s, park.load())
             app.current.move_to("needs:Gone Session")
             await pilot.press("u")
-            await self.settle(pilot, lambda: "unparked Gone Session" in (app.status_text or ""))
+            await settle(pilot, lambda: "unparked Gone Session" in (app.status_text or ""))
             self.assertNotIn(s, park.load())
         self.drive_needs(body)
 
@@ -119,31 +117,31 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("G")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "needs:Gone Session" in app.current._order, "the needs row")
             app.current.move_to("needs:Gone Session")
             self.assertNotIn("Gone Session", app.snapshot.records)
             await pilot.press("m")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "GroupPicker", "the group picker")
             self.assertEqual(type(app.screen).__name__, "GroupPicker")
             picker = app.screen.query_one("#choices")
             picker.highlighted = app.screen.names.index("Personal")
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "moved Gone Session to Personal" in (app.status_text or ""))
+            await settle(pilot, lambda: "moved Gone Session to Personal" in (app.status_text or ""))
             groups, _w = config.load_groups(create=False)
             self.assertEqual(groups.overrides.get("Gone Session"), "Personal")
             self.assertEqual(groups.override_ids.get(s), "Personal")
-            await self.settle(pilot, lambda: app.snapshot.grouping.of("Gone Session") == "Personal")
-            await self.settle(pilot, lambda: "needs:Gone Session" in app.current._order)
+            await settle(pilot, lambda: app.snapshot.grouping.of("Gone Session") == "Personal")
+            await settle(pilot, lambda: "needs:Gone Session" in app.current._order)
             order = app.current._order
             heads = [k for k in order[:order.index("needs:Gone Session")] if k.startswith("grp:")]
             self.assertTrue(heads and heads[-1].endswith(":Personal"), heads)
             app.current.move_to("needs:Gone Session")
             await pilot.press("m")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "GroupPicker", "the group picker")
             picker = app.screen.query_one("#choices")
             picker.highlighted = app.screen.names.index("Other")
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "moved Gone Session to Other" in (app.status_text or ""))
+            await settle(pilot, lambda: "moved Gone Session to Other" in (app.status_text or ""))
             groups, _w = config.load_groups(create=False)
             self.assertNotIn("Gone Session", groups.overrides)
             self.assertNotIn(s, groups.override_ids)
@@ -156,9 +154,9 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "ReopenScreen", "the reopen dialog")
             await pilot.press("escape")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: type(app.screen).__name__ != "ReopenScreen", "the dialog to close")
             self.assertNotEqual(type(app.screen).__name__, "ReopenScreen")
         with mock.patch.object(iterm, "osascript", lambda script, args=(): calls.append(args) or (True, "9\n")):
             self.drive_needs(body)
@@ -175,10 +173,10 @@ class EnterTests(AppWorld):
             node = app.current.current()
             self.assertIn(":t:", node.key)
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: type(app.screen).__name__ == "ReopenScreen", "the reopen dialog")
             self.assertEqual(type(app.screen).__name__, "ReopenScreen")
             await pilot.press("y")
-            await self.settle(pilot, lambda: calls)
+            await settle(pilot, lambda: calls)
         with mock.patch.object(iterm, "osascript", lambda script, args=(): calls.append(list(args)) or (True, "9\n")):
             self.drive_needs(body)
         self.assertEqual(len(calls), 1)
@@ -189,7 +187,7 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "has no custom name" in (app.status_text or ""), "the reason")
             self.assertNotEqual(type(app.screen).__name__, "ReopenScreen")
             self.assertIn("Gone Session has no custom name, so fleetwatch can't reopen it; prune it with P",
                           app.status_text)
@@ -203,7 +201,7 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "folder is gone" in (app.status_text or ""), "the reason")
             self.assertNotEqual(type(app.screen).__name__, "ReopenScreen")
             self.assertIn("folder is gone", app.status_text)
         self.drive_needs(body)
@@ -216,7 +214,7 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await settle(pilot, lambda: app.jump_calls or jumped, "the jump")
             self.assertNotEqual(type(app.screen).__name__, "ReopenScreen")
             self.assertTrue(app.jump_calls or jumped)
         with mock.patch.object(iterm, "jump_to_tty", lambda tty: jumped.append(tty) or (True, "")):

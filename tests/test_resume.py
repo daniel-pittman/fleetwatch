@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_app  # noqa: E402  (sets FLEETWATCH_CONFIG_DIR before fleetwatch reads it)
 from test_app import TTY, boot  # noqa: E402
 import standin  # noqa: E402
+from waiting import settle  # noqa: E402
 from fleetwatch import app as fapp, config, data, iterm, park, prune, resume, views, write_status  # noqa: E402
 from textual.widgets import Input  # noqa: E402
 
@@ -795,25 +796,15 @@ class AppWorld(Tree):
             app = self.app()
             async with app.run_test(size=(120, 30)) as pilot:
                 await boot(app, pilot)
-                for _ in range(100):
-                    if app.resume_data is not None:
-                        break
-                    await pilot.pause(0.05)
+                await settle(pilot, lambda: app.resume_data is not None, "the resume data to load")
                 await pilot.press("4")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: app.active == views.RESUME_TAB, "the Resume tab")
                 await body(app, pilot)
             return app
         return asyncio.run(go())
 
     def rows(self, app):
         return app.lists[views.RESUME_TAB].visible_text()
-
-    async def settle(self, pilot, check):
-        for _ in range(100):
-            if check():
-                return
-            await pilot.pause(0.05)
-        self.fail("condition never held")
 
 
 class AppTests(AppWorld):
@@ -843,7 +834,7 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await self.settle(pilot, lambda: app._exit)
+            await settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], s)
         self.drive(body)
 
@@ -857,9 +848,9 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("o")
-            await self.settle(pilot, lambda: calls and "opened Open Me" in (app.status_text or ""))
+            await settle(pilot, lambda: calls and "opened Open Me" in (app.status_text or ""))
             await pilot.press("o")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: "just opened" in (app.status_text or ""), "the refusal message")
             self.assertEqual(len(calls), 1)
             self.assertIn("just opened", app.status_text)
             self.assertFalse(app._exit)
@@ -873,7 +864,7 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("o")
-            await self.settle(pilot, lambda: "could not reach iTerm2" in (app.status_text or ""))
+            await settle(pilot, lambda: "could not reach iTerm2" in (app.status_text or ""))
         with mock.patch.object(iterm, "osascript", lambda script, args=(): (False, "no iTerm")):
             self.drive(body)
         self.assertIn(s, park.load())
@@ -886,8 +877,8 @@ class AppTests(AppWorld):
             self.assertIn("⏎ new window", app.footer_plain)
             self.assertNotIn("resume here", app.footer_plain)
             await pilot.press("enter")
-            await self.settle(pilot, lambda: calls)
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: calls)
+            await pilot.pause(0.1)  # asserts a non-event: nothing signals that the app chose not to exit
             self.assertFalse(app._exit)
         with mock.patch.dict(os.environ, {"ITERM_PROFILE": "fleetwatch"}), \
                 mock.patch.object(iterm, "osascript", lambda s, args=(): calls.append(args) or (True, "1")):
@@ -899,17 +890,17 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("slash")
-            await self.settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen))
-            await self.settle(pilot, lambda: len(app.screen.shown) == 2)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen))
+            await settle(pilot, lambda: len(app.screen.shown) == 2)
             self.assertEqual(app.screen.shown[0]["name"], "Grant Proposal")   # newest first, before typing
             for ch in "doc":
                 await pilot.press(ch)
             # Folders match by prefix, word start or substring only, so scattered letters in the
             # temp folder's path do not list Grant Proposal.
-            await self.settle(pilot, lambda: [e["name"] for e in app.screen.shown] == ["Docs Site"])
+            await settle(pilot, lambda: [e["name"] for e in app.screen.shown] == ["Docs Site"])
             self.assertEqual([e["name"] for e in app.screen.shown], ["Docs Site"])
             await pilot.press("enter")
-            await self.settle(pilot, lambda: app._exit)
+            await settle(pilot, lambda: app._exit)
             self.assertEqual(app.return_value["sid"], want)
         self.drive(body)
 
@@ -920,9 +911,9 @@ class AppTests(AppWorld):
         async def body(app, pilot):
             app.find_jump = jumps.append
             await pilot.press("slash")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen), "the find screen")
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "no longer exists" in (app.status_text or ""))
+            await settle(pilot, lambda: "no longer exists" in (app.status_text or ""))
             self.assertEqual(jumps, [])
             self.assertIsInstance(app.screen, fapp.ResumeFindScreen)
         self.drive(body)
@@ -933,7 +924,7 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("slash")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen) and app.screen.shown, "the find rows")
             e = app.screen.shown[0]
             self.assertLessEqual(len(e["name"]) + len(e["group"]) + len(e["status"]) + 4, 68)
         self.drive(body)
@@ -944,10 +935,10 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("slash")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ResumeFindScreen), "the find screen")
             await pilot.press("ctrl+o")
-            await self.settle(pilot, lambda: calls)
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: calls)
+            await settle(pilot, lambda: not isinstance(app.screen, fapp.ResumeFindScreen), "the find screen to close")
             self.assertNotIsInstance(app.screen, fapp.ResumeFindScreen)
             self.assertFalse(app._exit)
         with mock.patch.object(iterm, "osascript", lambda s, args=(): calls.append(args) or (True, "1")):
@@ -959,7 +950,7 @@ class AppTests(AppWorld):
         async def body(app, pilot):
             await pilot.press("1")
             await pilot.press("slash")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.FindScreen), "the find screen")
             self.assertIsInstance(app.screen, fapp.FindScreen)
             self.assertNotIsInstance(app.screen, fapp.ResumeFindScreen)
         self.drive(body)
@@ -969,24 +960,24 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("p")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ParkScreen), "the park dialog")
             self.assertIsInstance(app.screen, fapp.ParkScreen)
             for ch in "later":
                 await pilot.press(ch)
             await pilot.press("enter")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "Parked · 1" in self.rows(app), "the parked row")
             self.assertEqual(park.load()[s]["note"], "later")
             self.assertIn("later", self.rows(app))
             self.assertIn("Parked · 1", self.rows(app))
             # Parking again edits the note that is there.
             await pilot.press("p")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ParkScreen), "the park dialog")
             self.assertEqual(app.screen.query_one("#note", Input).value, "later")
             await pilot.press("escape")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: not isinstance(app.screen, fapp.ParkScreen), "the park dialog to close")
             self.assertEqual(park.load()[s]["note"], "later")
             await pilot.press("u")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: s not in park.load() and "Parked" not in self.rows(app), "the unpark")
             self.assertNotIn(s, park.load())
             self.assertNotIn("Parked", self.rows(app))
         self.drive(body)
@@ -997,17 +988,17 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("3")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "ses:Live Session" in app.current._order, "the Sessions tab")
             app.current.move_to("ses:Live Session")
             await pilot.press("p")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: isinstance(app.screen, fapp.ParkScreen), "the park dialog")
             self.assertIsInstance(app.screen, fapp.ParkScreen)
             await pilot.press("x", "enter")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: s in park.load(), "the park")
             self.assertEqual(park.load()[s]["note"], "x")
             # Parked and running: it shows on the Resume tab, tagged, and Enter refuses.
             await pilot.press("4")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "running" in self.rows(app), "the running tag")
             self.assertIn("running", self.rows(app))
         self.drive(body)
 
@@ -1019,12 +1010,12 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("enter")
-            await self.settle(pilot, lambda: isinstance(app.screen, fapp.StillRunningScreen))
+            await settle(pilot, lambda: isinstance(app.screen, fapp.StillRunningScreen))
             self.assertFalse(app._exit)
             await pilot.press("enter")
-            await self.settle(pilot, lambda: calls)
+            await settle(pilot, lambda: calls)
             self.assertEqual(calls[0], [TTY])
-            await pilot.pause(0.2)
+            await pilot.pause(0.2)  # asserts a non-event: nothing signals that the app chose not to exit
             self.assertFalse(app._exit)
         with mock.patch.object(iterm, "osascript", lambda s, args=(): calls.append(list(args)) or (True, "ok")):
             self.drive(body)
@@ -1036,7 +1027,7 @@ class AppTests(AppWorld):
             self.assertIn("Started Since", self.rows(app))
             self.reg("Started Since", s)
             await pilot.press("enter")
-            await self.settle(pilot, lambda: isinstance(app.screen, fapp.StillRunningScreen))
+            await settle(pilot, lambda: isinstance(app.screen, fapp.StillRunningScreen))
             self.assertFalse(app._exit)
         with mock.patch.object(iterm, "jump_context", lambda: {"ttys": {}, "iterm": set(), "err": None}):
             self.drive(body)
@@ -1047,7 +1038,7 @@ class AppTests(AppWorld):
         async def body(app, pilot):
             self.assertIn("folder gone", self.rows(app))
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "no longer exists" in (app.status_text or ""))
+            await settle(pilot, lambda: "no longer exists" in (app.status_text or ""))
             self.assertFalse(app._exit)
         self.drive(body)
 
@@ -1058,7 +1049,7 @@ class AppTests(AppWorld):
             self.assertIn("folder unusable", self.rows(app))
             self.assertNotIn("\x1b", self.rows(app))
             await pilot.press("enter")
-            await self.settle(pilot, lambda: "can't be used" in (app.status_text or ""))
+            await settle(pilot, lambda: "can't be used" in (app.status_text or ""))
             self.assertNotIn("\x1b", app.status_text)
             self.assertFalse(app._exit)
         self.drive(body)
@@ -1082,11 +1073,11 @@ class AppTests(AppWorld):
             text = self.rows(app)
             self.assertLess(text.index("Beta"), text.index("Alpha"))
             await pilot.press("s")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "Alpha" in self.rows(app) and self.rows(app).index("Alpha") < self.rows(app).index("Beta"), "the sort")
             text = self.rows(app)
             self.assertLess(text.index("Alpha"), text.index("Beta"))
             await pilot.press("G")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: "Other · 2" in self.rows(app), "the grouping")
             self.assertIn("Other · 2", self.rows(app))
         self.drive(body)
 
@@ -1095,12 +1086,12 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("space")
-            await pilot.pause(0.1)
+            await settle(pilot, lambda: self.folder in self.rows(app).replace("\n", ""), "the full folder")
             text = self.rows(app)
             self.assertIn(self.folder, text.replace("\n", ""))
             self.assertNotIn(s, text)               # the session ID is in the details view, not the row
             await pilot.press("i")
-            await pilot.pause(0.2)
+            await settle(pilot, lambda: app.screen.query("#detailtext"), "the details view")
             shown = str(app.screen.query_one("#detailtext").render())
             self.assertIn(s, shown)
             self.assertIn(self.folder, shown.replace("\n", ""))
@@ -1149,18 +1140,15 @@ class AppTests(AppWorld):
                 await boot(app, pilot)
                 self.assertGreaterEqual(app.refreshes, 1)
                 await pilot.press("4")
-                await pilot.pause(0.1)
+                await settle(pilot, lambda: "Loading" in self.rows(app), "the loading row")
                 self.assertIn("Loading", self.rows(app))
                 before = app.refreshes
                 app.refresh_now()
-                for _ in range(100):
-                    await pilot.pause(0.05)
-                    if app.refreshes > before:
-                        break
+                await settle(pilot, lambda: app.refreshes > before, "the refresh")
                 self.assertGreater(app.refreshes, before)
                 self.assertIsNone(app.resume_data)
                 release.set()
-                await self.settle(pilot, lambda: app.resume_data is not None)
+                await settle(pilot, lambda: app.resume_data is not None)
                 self.assertIn("Named", self.rows(app))
         with mock.patch.object(resume, "load", slow):
             asyncio.run(go())

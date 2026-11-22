@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import standin  # noqa: E402,F401  (pins the time zone and config folder before fleetwatch loads)
 
 from fleetwatch import app as fapp, data, demo, overlay, radar  # noqa: E402
+from waiting import first_scan  # noqa: E402
 from fleetwatch.__main__ import main  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -246,7 +247,7 @@ class RadarInAppTests(unittest.TestCase):
             app = fapp.FleetwatchApp(lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                                      3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 rendered = app.query_one("#radar").render()
                 spans = [str(sp.style).lower() for sp in rendered.spans]
                 return rendered.plain, spans, app.refreshes
@@ -262,7 +263,7 @@ class RadarInAppTests(unittest.TestCase):
             app = fapp.FleetwatchApp(lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                                      3600, paths=self.paths)
             async with app.run_test(size=(100, 30)) as pilot:
-                await pilot.pause(1.5)
+                await first_scan(app, pilot)
                 return app.query_one("#radar").display
         self.assertFalse(asyncio.run(go()))
 
