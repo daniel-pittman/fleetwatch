@@ -476,7 +476,7 @@ fleetwatch search eval | stats [--index NAME]
 
 fleetwatch index list | status [NAME]
 fleetwatch index add [--session NAME] [--session-id ID] [--name INDEX] --group G [--docs PATH --include GLOB ... --label L]
-fleetwatch index add --source codex --group G [--path DIR] [--name INDEX]   index Codex CLI sessions
+fleetwatch index add --source codex|antigravity --group G [--path DIR] [--name INDEX]   index Codex or Antigravity CLI sessions
 fleetwatch index refresh [NAME | --all] [--full] [--no-tag] [--tag-budget N] [--build]
 fleetwatch index build NAME                     rebuild the search engine's index only
 fleetwatch index file PATH [--index NAME]       index a just-filed document now
@@ -502,11 +502,11 @@ Without `--index`, `search` and `index refresh|file` use the calling session's o
 process ancestry the way `write-status` finds the session. `index add` registers the calling session
 and collects every project folder that holds its transcripts.
 
-**Codex indexes.** The Codex CLI writes one rollout per session under `~/.codex/sessions/YYYY/MM/DD/`
-(`rollout-*.jsonl`, compressed to `rollout-*.jsonl.zst` once a session is old). An entry with
-`transcripts.source: codex` indexes them with the same exchanges, scrubbing, tagging and search as
-Claude Code sessions; `index add --source codex --group G` writes the entry (`--path` names another
-folder, `--name` defaults to `codex-sessions`):
+**Codex and Antigravity indexes.** Codex and the Antigravity CLI each keep every session in one
+folder, and an entry with `transcripts.source: codex` or `transcripts.source: antigravity` indexes
+that folder with the same exchanges, scrubbing, tagging and search as Claude Code sessions.
+`index add --source codex --group G` or `index add --source antigravity --group G` writes the entry
+(`--path` names another folder; `--name` defaults to `codex-sessions` or `antigravity-sessions`):
 
 ```yaml
 indexes:
@@ -515,26 +515,48 @@ indexes:
     transcripts:
       source: codex            # claude is the default, with project_dir instead of path
       path: ~/.codex/sessions
+  antigravity-sessions:
+    group: research
+    transcripts:
+      source: antigravity
+      path: ~/.gemini/antigravity-cli/conversations
 ```
 
-An exchange is a user message plus the assistant's text up to the next user message, with the names of
-the tools used. Tool inputs and outputs, reasoning, developer messages and the context Codex injects
-as user messages (AGENTS.md, the environment block, the plugin list) stay out. Each exchange records
-its working folder (home written as `~`) and shows `Source: codex | Folder: ...` in its header, so a
-hit carries its date and folder and `search show ID` prints them. A plain rollout is read
-incrementally; a `.zst` rollout never changes, so it is streamed once through `zstd -dc` (the `zstd`
-command must be installed) and not opened again, and a session present in both forms is indexed once.
-`transcripts.sessions` limits the index to listed session ids. A malformed line is skipped and
-counted in the refresh summary, a rollout that cannot be read keeps its stored records and is retried
-on the next refresh, and exchange ids carry ten characters of the session id
-(`Sc0b903b19a-EX-0001`). `index add --source codex` takes no `--session` or `--session-id`, and
-`--path` is stored as an absolute path.
+An exchange is a user prompt plus the model's text up to the next prompt, with the names of the tools
+used. Tool inputs and outputs and reasoning stay out. Each exchange records its working folder (home
+written as `~`) and shows `Source: codex | Folder: ...` or `Source: antigravity | Folder: ...` in its
+header, so a hit carries its date and folder and `search show ID` prints them. Exchange ids carry ten
+characters of the session id (`Sc0b903b19a-EX-0001`), `transcripts.sessions` limits the index to
+listed session ids, and a file that cannot be read keeps its stored records and is retried on the next
+refresh. `index add` with either source takes no `--session` or `--session-id`, and `--path` is
+stored as an absolute path.
 
-**One Codex index spans every project.** Codex keeps all sessions in one folder, so the index holds
-prompts from every project you used it in, and its trust group is chosen when it is created. Pick the
-group of the most private project in the folder, or index only the sessions you want with
-`transcripts.sessions`. The index has no owner session, so in a protected group nothing reads it but
-a plain terminal and the sessions in its `extra_readers`.
+*Codex* writes one rollout per session under `~/.codex/sessions/YYYY/MM/DD/` (`rollout-*.jsonl`,
+compressed to `rollout-*.jsonl.zst` once a session is old). Developer messages and the context Codex
+injects as user messages (AGENTS.md, the environment block, the plugin list) stay out. A plain rollout
+is read incrementally; a `.zst` rollout never changes, so it is streamed once through `zstd -dc` and
+not opened again, and a session present in both forms is indexed once. Without the `zstd` command the
+compressed rollouts are skipped and counted, with a hint to install it, and the plain ones still index.
+A malformed line is skipped and counted in the refresh summary.
+
+*Antigravity* keeps one SQLite database per conversation (`<uuid>.db`) whose steps are Protocol
+Buffers with no published schema. fleetwatch reads them by field number, mapped against one agy
+version (`MAPPED_VERSION` in `fleetwatch/memory/antigravity_parse.py`), so a later agy can move them.
+Every database is checked first: one with missing tables, an unreadable metadata blob, payloads that
+do not decode, or no step type in the mapping is skipped, and the refresh summary names it with the
+reason. A malformed step is skipped and counted, and a step type the mapping does not know is
+counted and ignored. Harness notices, error steps and compaction summaries stay out. A job run with
+a result schema ends with a `finish` call, and its arguments are that job's answer, so they index as
+the reply. A sub-agent runs in its own database and indexes as its own session, sent by the sub-agent
+under its display name. The folder is never written to: a database with no `-wal` file is opened
+immutable, and one being written is copied with its WAL to a private temporary folder and read
+there. A conversation is read again when its database or WAL changes size or modification time.
+
+**One Codex or Antigravity index spans every project.** Each tool keeps all sessions in one folder,
+so the index holds prompts from every project you used it in, and its trust group is chosen when it
+is created. Pick the group of the most private project in the folder, or index only the sessions you
+want with `transcripts.sessions`. The index has no owner session, so in a protected group nothing
+reads it but a plain terminal and the sessions in its `extra_readers`.
 
 **Deleted transcripts.** A session index keeps its history when Claude Code deletes an old transcript:
 a session whose transcript is gone is held from its stored records, which are scrubbed again whenever

@@ -309,14 +309,17 @@ class Codex(unittest.TestCase):
         recs, st = self.load()
         self.assertEqual((len(recs), st["files_failed"]), (4, []))
 
-    def test_a_missing_zstd_fails_with_a_clear_message(self):
+    def test_a_missing_zstd_skips_compressed_files_with_a_clear_message(self):
         z = self.day / ("rollout-2026-03-01T10-00-00-%s.jsonl.zst" % SID)
         z.write_bytes(b"not read")
         real = codex_parse.shutil.which
         codex_parse.shutil.which = lambda name: None
         self.addCleanup(setattr, codex_parse.shutil, "which", real)
-        with self.assertRaisesRegex(codex_parse.ZstdError, "zstd is not installed"):
-            self.load()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            recs, st = self.load()
+        self.assertIn("zstd is not installed", err.getvalue())
+        self.assertEqual((recs, st["zst_skipped"], st["files_failed"]), ([], 1, []))
 
     def test_sessions_list_limits_the_index(self):
         self.age(self.write(session_lines()))
@@ -613,6 +616,43 @@ class Scrubbing(unittest.TestCase):
         scanner.scan_records([r])
         self.assertNotIn("someone@example.org", json.dumps(r))
         self.assertEqual(r["assistant"], ["done"])
+
+
+class CodexWithoutZstd(unittest.TestCase):
+    """A missing zstd skips the compressed rollouts, counts them and hints once; plain ones
+    still index."""
+
+    def test_plain_rollouts_still_index_and_compressed_ones_are_counted(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        day = Path(tmp.name) / "sessions" / "2026" / "03" / "01"
+        day.mkdir(parents=True)
+        state = Path(tmp.name) / "state"
+        state.mkdir()
+        sid = "01a1fbfa-efba-7173-bb5c-6fc0b903b19a"
+
+        def rec(typ, payload, ts):
+            return json.dumps(dict(timestamp=ts, type=typ, payload=payload)) + "\n"
+        lines = [rec("session_meta", dict(id=sid, cwd="/x"), "2026-03-01T10:00:00.000Z"),
+                 rec("response_item", dict(type="message", role="user",
+                                           content=[dict(type="input_text", text="hello")]),
+                     "2026-03-01T10:00:01.000Z")]
+        plain = day / ("rollout-2026-03-01T10-00-00-%s.jsonl" % sid)
+        plain.write_text("".join(lines))
+        for i in range(2):
+            (day / ("rollout-2026-03-01T11-00-0%d-01a1fbfb-0000-7000-8000-00000000000%d.jsonl.zst"
+                    % (i, i))).write_bytes(b"compressed")
+        real = codex_parse.shutil.which
+        codex_parse.shutil.which = lambda name: None
+        self.addCleanup(setattr, codex_parse.shutil, "which", real)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            recs, _, st = sp.load_transcripts(day.parent.parent.parent, state, FakeScanner(),
+                                              source=codex_parse.CodexSource())
+        self.assertEqual([r["user_text"] for r in recs], ["hello"])
+        self.assertEqual((st["zst_skipped"], st["files_failed"]), (2, []))
+        self.assertEqual(err.getvalue().count("zstd is not installed"), 1)
+        self.assertTrue(issubclass(codex_parse.ZstdMissing, codex_parse.ZstdError))
 
 
 class Registry(unittest.TestCase):

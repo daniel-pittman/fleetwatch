@@ -970,6 +970,28 @@ class Add(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("already exists", err)
 
+    def test_an_antigravity_index_names_its_folder_and_has_no_owner_session(self):
+        convs = self.cfg.parent / "conversations"
+        convs.mkdir()
+        code, out, err = self.add("--source", "antigravity", "--path", str(convs), "--group",
+                                  "research")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Antigravity sessions", out)
+        entry = yaml.safe_load((self.cfg / "indexes" / "registry.d" / "antigravity-sessions.yaml")
+                               .read_text())["indexes"]["antigravity-sessions"]
+        self.assertEqual(entry["transcripts"], {"source": "antigravity", "path": str(convs)})
+        self.assertNotIn("owner_session", entry)
+        self.assertIn("Antigravity CLI",
+                      (self.cfg / "indexes" / "antigravity-sessions" / "tags.yaml").read_text())
+        reg = indexes.load_registry()
+        ix = refresh.Index("antigravity-sessions", reg["indexes"]["antigravity-sessions"],
+                           reg["defaults"])
+        self.assertTrue(ix.tc.version)
+        code, out, err = self.add("--source", "antigravity", "--path", str(convs), "--group",
+                                  "research", "--session", "Fleet Dev")
+        self.assertEqual(code, 2)
+        self.assertIn("Antigravity index has no owner session", err)
+
     def test_a_codex_index_needs_an_existing_folder_and_path_needs_codex(self):
         code, out, err = self.add("--source", "codex", "--path", str(self.cfg.parent / "none"),
                                   "--group", "research")

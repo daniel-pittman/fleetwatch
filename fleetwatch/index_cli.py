@@ -7,6 +7,7 @@
     retag NAME [--all] | discover | triage NAME
     forget NAME SESSION_ID [--force]  remove one session from an index (records, tags, corpus)
     add [--session NAME] --group G [--docs PATH --include GLOB ...]
+    add --source codex|antigravity --group G [--path DIR] [--name INDEX]
     migrate NAME --from OLD_ROOT [--force]
     verify NAME [--baseline FILE] [--compare-old OLD_ROOT]
     schedule install | remove | status
@@ -50,6 +51,18 @@ CODEX_TAGS_TEMPLATE = TAGS_TEMPLATE.replace(
     'description: "a Claude Code working session"',
     'description: "a Codex CLI working session (the transcripts are Codex rollouts, not '
     'Claude Code)"')
+ANTIGRAVITY_TAGS_TEMPLATE = TAGS_TEMPLATE.replace(
+    'description: "a Claude Code working session"',
+    'description: "an Antigravity CLI working session (the transcripts are Antigravity '
+    'conversations, not Claude Code)"')
+
+# The sources one index covers whole: the tool keeps every session in one folder, so the
+# index has no owner session. source -> (label, default folder, default index name, tags).
+FOLDER_SOURCES = {
+    "codex": ("Codex", "~/.codex/sessions", "codex-sessions", CODEX_TAGS_TEMPLATE),
+    "antigravity": ("Antigravity", "~/.gemini/antigravity-cli/conversations",
+                    "antigravity-sessions", ANTIGRAVITY_TAGS_TEMPLATE),
+}
 
 PROBES_TEMPLATE = """\
 # Fixed questions with the document or exchange that should answer each, for `fleetwatch
@@ -177,31 +190,35 @@ def cmd_add(reg, args):
     ap = argparse.ArgumentParser(prog="fleetwatch index add")
     ap.add_argument("--session", help="session name (default: the calling session)")
     ap.add_argument("--session-id", help="session id when --session names none that is running")
-    ap.add_argument("--name", help="index name (default: <session>-session, or codex-sessions)")
+    ap.add_argument("--name", help="index name (default: <session>-session, codex-sessions or "
+                                   "antigravity-sessions)")
     ap.add_argument("--group", required=True)
-    ap.add_argument("--source", choices=("claude", "codex"), default="claude",
-                    help="codex: index the Codex CLI sessions folder; the index has no owner "
-                         "session and one index covers every project, so choose its group "
-                         "for the most private project in it")
-    ap.add_argument("--path", help="the Codex sessions folder (default: ~/.codex/sessions)")
+    ap.add_argument("--source", choices=("claude",) + tuple(FOLDER_SOURCES), default="claude",
+                    help="codex or antigravity: index that CLI's sessions folder; the index has "
+                         "no owner session and one index covers every project, so choose its "
+                         "group for the most private project in it")
+    ap.add_argument("--path", help="the sessions folder of --source codex (default "
+                                   "~/.codex/sessions) or antigravity (default "
+                                   "~/.gemini/antigravity-cli/conversations)")
     ap.add_argument("--docs", help="a folder of reference documents to index")
     ap.add_argument("--include", action="append", help="glob under --docs (repeatable; default **/*.md)")
     ap.add_argument("--label", default="docs", help="label of the --docs folder")
     a = ap.parse_args(args)
     r = indexes.refresh()
     paths = data.default_paths()
-    codex = a.source == "codex"
-    if a.path and not codex:
-        return _fail("--path names the Codex sessions folder; use it with --source codex")
-    if codex:
+    whole = FOLDER_SOURCES.get(a.source)
+    if a.path and not whole:
+        return _fail("--path names a sessions folder; use it with --source codex or antigravity")
+    if whole:
+        label, default_path, default_name, tags_template = whole
         if a.session or a.session_id:
-            return _fail("--session and --session-id name a Claude session; a Codex index has "
-                         "no owner session (drop them with --source codex)")
+            return _fail("--session and --session-id name a Claude session; a %s index has "
+                         "no owner session (drop them with --source %s)" % (label, a.source))
         sname = sid = None
-        folder = Path(os.path.abspath(os.path.expanduser(a.path or "~/.codex/sessions")))
+        folder = Path(os.path.abspath(os.path.expanduser(a.path or default_path)))
         if not folder.is_dir():
-            return _fail("the Codex sessions folder %s does not exist" % tilde(folder))
-        name = a.name or "codex-sessions"
+            return _fail("the %s sessions folder %s does not exist" % (label, tilde(folder)))
+        name = a.name or default_name
     else:
         if a.session_id:
             sname, sid = a.session or a.session_id, a.session_id
@@ -218,7 +235,7 @@ def cmd_add(reg, args):
         name = a.name or indexes.slug(sname) + "-session"
     if r.index_name_problem(name):
         return _fail(r.index_name_problem(name))
-    owned = [] if codex else indexes.owned_by(reg, sname, sid)
+    owned = [] if whole else indexes.owned_by(reg, sname, sid)
     # Names compare without case: on a case-insensitive file system two names that differ
     # only in case share one config folder, one data folder and one registry.d file.
     rdir = Path(r.REGISTRY_DIR)
@@ -231,9 +248,9 @@ def cmd_add(reg, args):
     if groups and a.group not in groups:
         return _fail("group %r is not declared in the registry (have: %s)"
                      % (a.group, ", ".join(sorted(groups))))
-    if codex:
+    if whole:
         entry = {"group": a.group,
-                 "transcripts": {"source": "codex", "path": tilde(folder)}}
+                 "transcripts": {"source": a.source, "path": tilde(folder)}}
     else:
         entry = {"group": a.group, "owner_session": sname, "owner_session_id": sid,
                  "transcripts": {"project_dir": [tilde(f) for f in folders], "sessions": [sid],
@@ -253,7 +270,7 @@ def cmd_add(reg, args):
         allow.unlink()
         cfg.rmdir()
         return _fail("a %s index cannot start from the template: %s" % (a.group, "; ".join(problems)))
-    (cfg / "tags.yaml").write_text(CODEX_TAGS_TEMPLATE if codex else TAGS_TEMPLATE)
+    (cfg / "tags.yaml").write_text(tags_template if whole else TAGS_TEMPLATE)
     (cfg / "probes.yaml").write_text(PROBES_TEMPLATE)
     if not r.REGISTRY.exists():
         # A protected group starts with no readers: the guard ignores readers for it, and a
@@ -267,10 +284,11 @@ def cmd_add(reg, args):
     entry_file.parent.mkdir(parents=True, exist_ok=True)
     with open(entry_file, "x") as fh:
         fh.write("# Registry entry for the %s.\n"
-                 % ("Codex sessions index" if codex else "session %s" % sname))
+                 % ("%s sessions index" % label if whole else "session %s" % sname))
         fh.write(yaml.safe_dump({"indexes": {name: entry}}, sort_keys=False))
-    if codex:
-        print("added index %s (group %s) over the Codex sessions in %s" % (name, a.group, tilde(folder)))
+    if whole:
+        print("added index %s (group %s) over the %s sessions in %s"
+              % (name, a.group, label, tilde(folder)))
     else:
         print("added index %s (group %s) for session %s" % (name, a.group, sname))
         print("transcript folders: %d" % len(folders))
