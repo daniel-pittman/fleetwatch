@@ -585,6 +585,7 @@ class WiringAndTrust(unittest.TestCase):
             code, out, err = capture(index_cli.main, ["status"])
         self.assertEqual(code, 0, err)
         self.assertIn("== alpha-session (group work)", out)
+        self.assertIn("exchanges by provider: claude 1, codex 1", out)
         self.assertIn("agent runs: 0 by launch, 1 by folder, 0 by catch-all", out)
         self.assertIn("== beta-session (group oss)", out)
         self.assertIn("agent runs: 1 by launch, 0 by folder, 0 by catch-all", out)
@@ -712,6 +713,11 @@ class WiringAndTrust(unittest.TestCase):
         self.assertEqual(holders, ["alpha-session"])
         agy_doc = next(txt for txt in corpora["alpha-session"].values() if run_sid in txt)
         self.assertIn("Source: antigravity | Folder:", agy_doc)
+        with mock.patch.object(indexes, "calling_session", return_value=None):
+            code, out, err = capture(index_cli.main, ["status", "alpha-session"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("exchanges by provider: claude 1, antigravity 1", out)
+        self.assertIn("agent runs: 1 by launch, 0 by folder, 0 by catch-all", out)
 
 
 if __name__ == "__main__":

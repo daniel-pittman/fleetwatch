@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import data, schedule
+from .providers import PROVIDERS
 
 NO_SCHEDULE_STALE_S = 2 * 86400
 STALE_FACTOR = 2
@@ -50,6 +51,8 @@ class Health:
     owner_id: str = ""             # the registry's owner_session_id
     refresh_state: str = ""        # "refreshing" (its lock is fresh) or "waiting" (stale, a run is in progress)
     covered: float = None          # epoch seconds the last completed `refresh --all` run ended, when it finished this index
+    exchanges_by_provider: dict = None
+    agent_runs: dict = None
 
     def age(self, now):
         """Seconds since the index was last known current: its own last refresh, or the end of the last
@@ -121,6 +124,12 @@ class Result:
 
 def _int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _counts(value, keys):
+    if not isinstance(value, dict):
+        return None
+    return {k: value[k] for k in keys if _int(value.get(k)) is not None}
 
 
 def fail_category(error):
@@ -244,6 +253,8 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False,
     protection, refusal = _protection(mod, name, entry, cache)
     path = os.path.join(root, name, "state", "last_run.json")
     state, reason, finished, exchanges = "never", "", None, None
+    exchanges_by_provider, agent_runs = None, None
+    kind = "plain" if entry.get("kind") == "plain" else "session"
     try:
         info = json.loads(Path(path).read_text(encoding="utf-8"))
         if not isinstance(info, dict):
@@ -255,10 +266,12 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False,
         state = "ok" if info.get("ok") else "failed"
         reason = "" if state == "ok" else fail_category(info.get("error"))
         exchanges = _int(info.get("exchanges"))
+        if state == "ok" and kind == "session":
+            exchanges_by_provider = _counts(info.get("exchanges_by_provider"), PROVIDERS)
+            agent_runs = _counts(info.get("agent_runs"), ("launch", "folder", "catch_all"))
     except (OSError, ValueError):
         pass
     files = _corpus_files(root, name, _mtime(path), cache) if state != "never" else None
-    kind = "plain" if entry.get("kind") == "plain" else "session"
     lock = _lock_age(root, name)
     refresh_state = "refreshing" if lock is not None and lock < mod.LOCK_STALE_S else ""
     stale_after = interval_s * STALE_FACTOR if scheduled else NO_SCHEDULE_STALE_S
@@ -271,7 +284,7 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False,
     return Health(data.clean(name), data.clean(entry.get("group") or "?"), kind, state, reason, finished,
                   stale_after, protection, refusal, exchanges, files, scheduled,
                   data.clean(str(entry.get("owner_session") or "")), data.clean(str(entry.get("owner_session_id") or "")),
-                  refresh_state, covered)
+                  refresh_state, covered, exchanges_by_provider, agent_runs)
 
 
 def load(reg=None, root=None, scheduled=None, cache=None):

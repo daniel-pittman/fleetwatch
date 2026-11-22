@@ -1,12 +1,14 @@
 """`fleetwatch search`: query a session or plain index.
 
-    fleetwatch search "question" [--similar] [--kind K] [--tag T] [--level D] [--around N] [--limit N] [--json] [--index NAME]
+    fleetwatch search "question" [--similar] [--provider claude|codex|antigravity] [--kind K]
+                                 [--tag T] [--level D] [--around N] [--limit N] [--json] [--index NAME]
     fleetwatch search show ID [ID ...] [--around N] [--full]
     fleetwatch search eval | stats [--index NAME]
 
 Without --index the calling session's own index is searched (found from process ancestry, as
 `write-status` finds the session). From inside a session, another index is read only when the
 trust guard allows it (indexes.read_refusal). Output is the index CLI's own, flag for flag.
+Repeat --provider to match exchanges from any of the named providers.
 """
 import sys
 

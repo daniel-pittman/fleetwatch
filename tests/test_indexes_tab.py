@@ -37,6 +37,9 @@ class CanaryTree:
         state = self.root / name / "state"
         state.mkdir(parents=True)
         info = {"ok": ok, "finished": iso(ago), "exchanges": 12, "tags": {"tagged": 1, "x": "CANARY-TAG"}}
+        if name == "alpha":
+            info["exchanges_by_provider"] = {"claude": 7, "codex": 3, "antigravity": 2, "CANARY-TAG": 12}
+            info["agent_runs"] = {"launch": 2, "folder": 1, "catch_all": 3, "CANARY-TAG": 12}
         if error:
             info["error"] = error
         (state / "last_run.json").write_text(json.dumps(info))
@@ -74,6 +77,8 @@ class HealthTests(unittest.TestCase):
         self.assertEqual((rows["alpha"].state, rows["alpha"].exchanges, rows["alpha"].files), ("ok", 12, 3))
         self.assertEqual((rows["beta"].state, rows["beta"].reason), ("failed", "build"))
         self.assertEqual(rows["alpha"].kind, "session")
+        self.assertEqual(rows["alpha"].exchanges_by_provider, {"claude": 7, "codex": 3, "antigravity": 2})
+        self.assertEqual(rows["alpha"].agent_runs, {"launch": 2, "folder": 1, "catch_all": 3})
 
     def test_stale_is_twice_the_schedule_or_two_days_without_one(self):
         now = time.time()
@@ -140,7 +145,9 @@ class BoardCase(unittest.TestCase):
                 lambda: fapp.gather(self.paths, data.parse_window("24h"), data.DEFAULT_HORIZON_DAYS),
                 3600, paths=self.paths)
             async with app.run_test(size=size) as pilot:
-                await pilot.pause(1.5)
+                async with asyncio.timeout(5):
+                    while app.snapshot is None or app.resume_data is None:
+                        await pilot.pause()
                 return await script(app, pilot)
         if loader is None:
             return asyncio.run(go())
@@ -149,6 +156,24 @@ class BoardCase(unittest.TestCase):
 
 
 class TabTests(BoardCase):
+    def test_expanded_index_shows_provider_and_placement_counts(self):
+        tree = CanaryTree()
+        self.addCleanup(tree.close)
+        real = index_health.load
+
+        def loader():
+            with mock.patch.dict(os.environ, FLEETWATCH_DEMO=""):
+                return real(tree.reg, tree.root, False, index_health.Cache())
+
+        async def script(app, pilot):
+            await pilot.press("5", "z")
+            return app.lists[views.INDEXES_TAB].visible_text()
+
+        text = self.board((140, 40), script, loader)
+        self.assertIn("exchanges by provider: claude 7, codex 3, antigravity 2", text)
+        self.assertIn("agent runs: 2 by launch, 1 by folder, 3 by catch-all", text)
+        self.assertNotIn("CANARY-TAG", text)
+
     def test_tab_five_lists_each_index_by_group_with_its_state_in_words(self):
         async def script(app, pilot):
             await pilot.press("5", "z")

@@ -42,12 +42,14 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
 import yaml
 
 from fleetwatch import migrate, settings as fleetwatch_settings
+from fleetwatch.providers import format_counts
 
 from . import antigravity_parse, codex_parse, doc_corpus, routing, session_parse, session_tagger
 from .privacy_scan import RuleSet, Scanner, protected_ready
@@ -585,6 +587,8 @@ class Index:
         for r in records:
             r["hash"] = session_tagger.tag_hash(r)
         live = [r for r in records if not r.get("dropped")]
+        provider = source_name(self.entry.get("transcripts") or {})
+        exchanges_by_provider = Counter(r.get("provider") or provider for r in live)
         tags_path, usage_path = self.state / "tags.jsonl", self.state / "usage.jsonl"
         first_run = not tags_path.exists()
         cache = session_tagger.load_tags(tags_path)
@@ -655,6 +659,7 @@ class Index:
             write_s=round(t_write - t_tag, 1), docs_s=round(t_docs - t_write, 1),
             build_s=build_s, built=built, index_line=idx_line, build_retried=retried,
             sessions=st["sessions"], new_exchanges=st["new"], exchanges=n_live,
+            exchanges_by_provider=dict(exchanges_by_provider),
             **{k: st[k] for k in ("files_read", "files_failed", "files_vanished", "lines_skipped",
                                   "zst_skipped", "conversations_read", "conversations_skipped",
                                   "conversations_vanished", "steps_skipped", "unknown_steps")
@@ -976,6 +981,8 @@ def cmd_status(reg, full_reg=None):
               % (j["finished"], age, j["wall_s"], "ran %ss" % j["build_s"] if j["built"] else "skipped"))
         print("   %d exchanges (%d new last run), docs: %d changed / %d removed / %d unchanged"
               % (j["exchanges"], j["new_exchanges"], j["docs_changed"], j["docs_removed"], j["docs_unchanged"]))
+        if isinstance(j.get("exchanges_by_provider"), dict):
+            print("   exchanges by provider: " + format_counts(j["exchanges_by_provider"]))
         ar = j.get("agent_runs") if isinstance(j.get("agent_runs"), dict) else (
             plan.counts_for(name) if plan is not None else None)
         if ar is not None:
