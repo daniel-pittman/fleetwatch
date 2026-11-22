@@ -59,15 +59,25 @@ def command(job=INDEX):
     return [sys.executable, "-P", "-m", "fleetwatch", *job.args]
 
 
+def _passed_env():
+    """The PASSED variables that are set, in PASSED order."""
+    return [(k, os.environ[k]) for k in PASSED if os.environ.get(k)]
+
+
+def _systemd_env_line(key, value):
+    """One Environment= line. systemd takes the whole assignment in double quotes, with backslash and
+    double quote escaped, and expands % specifiers, so a literal % is doubled."""
+    escaped = (key + "=" + value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return 'Environment="%s"\n' % escaped
+
+
 def _log_name(job):
     return job.unit[len("fleetwatch-"):]
 
 
 def plist_dict(log_dir, job=INDEX):
     env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
-    for key in PASSED:
-        if os.environ.get(key):
-            env[key] = os.environ[key]
+    env.update(_passed_env())
     throttle = {"ProcessType": "Background", "LowPriorityIO": True} if job.background else {
         "ProcessType": "Standard"}
     return {
@@ -103,13 +113,18 @@ def install(out=None, job=INDEX):
         print("to start it: launchctl bootstrap gui/$(id -u) %s" % shlex.quote(str(path)), file=out)
         return 0
     cmd = " ".join(shlex.quote(a) for a in command(job))
+    environment = _passed_env()
+    # cron treats an unescaped % in a command line as a newline.
+    cron_env = "".join("%s=%s " % (k, shlex.quote(v).replace("%", "\\%")) for k, v in environment)
     minutes = job.interval_s // 60
     service, timer = _units(job)
     try:
         service.parent.mkdir(parents=True, exist_ok=True)
         service.write_text(
             "[Unit]\nDescription=%s\n\n[Service]\nType=oneshot\n"
-            "Nice=10\n%sExecStart=%s\n" % (job.what, "IOSchedulingClass=idle\n" if job.background else "", cmd))
+            "Nice=10\n%s%sExecStart=%s\n"
+            % (job.what, "IOSchedulingClass=idle\n" if job.background else "",
+               "".join(_systemd_env_line(k, v) for k, v in environment), cmd))
         timer.write_text(
             "[Unit]\nDescription=%s every %d minutes\n\n[Timer]\n"
             "OnBootSec=5min\nOnUnitActiveSec=%dmin\n\n[Install]\nWantedBy=timers.target\n"
@@ -118,8 +133,8 @@ def install(out=None, job=INDEX):
         print("to start it: systemctl --user enable --now %s" % timer.name, file=out)
     except OSError as e:
         print("could not write a systemd timer (%s)" % e, file=out)
-    print("or use cron: */%d * * * * nice %s >> %s 2>&1"
-          % (minutes, cmd, shlex.quote(str(log_dir / (_log_name(job) + ".log")))), file=out)
+    print("or use cron: */%d * * * * %snice %s >> %s 2>&1"
+          % (minutes, cron_env, cmd, shlex.quote(str(log_dir / (_log_name(job) + ".log")))), file=out)
     return 0
 
 
