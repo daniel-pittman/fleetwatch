@@ -658,7 +658,9 @@ is readable only by its owner session and its `extra_readers`, whatever the grou
 Every `index` command that names an index runs the same check, and `index status` with no name lists
 only the indexes the calling session may read. This is a guard against mistakes, not a security
 boundary: the files are readable by anyone who can read the disk. A plain terminal is the owner at a
-shell and may read any index.
+shell and may read any index. A process that deliberately detaches from its agent parent, clears the
+agent environment markers, and allocates a pseudo-terminal is classified as the owner; it could also
+read the corpus files directly.
 
 **Groups are declared in the registry.** The first `fleetwatch index add` creates `<config>/indexes/registry.yaml` with its group; `index add --group` refuses a group the registry does not declare, so add others by hand:
 

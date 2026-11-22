@@ -14,8 +14,8 @@
 
 The refresh, file, retag, discover, triage, forget and status commands are thin wrappers over
 fleetwatch.memory.refresh. With no NAME, refresh and file act on the calling session's own
-index (found from process ancestry, as `write-status` finds the session). A command that names
-an index runs the same trust guard as `search` first and exits 3 when it refuses.
+index (found from process ancestry, as `write-status` finds the session). Commands that read a
+named index run the same trust guard as `search` first and exit 3 when it refuses.
 """
 import argparse
 import json
@@ -93,21 +93,30 @@ class Refused(IndexesError):
     """The trust guard refused the calling session this index (exit 3, as `search` does)."""
 
 
-def _guard(reg, name):
-    """Raise Refused unless the calling session may read index `name`. Every command that
-    names an index runs this first: each one reads its content, and triage prints names."""
+def _require_direct_caller(verb):
+    caller = indexes.classify_caller()
+    if caller.kind in ("untrusted", "delegated"):
+        raise Refused("refused: index %s requires a Claude session or the owner at a terminal (%s)"
+                      % (verb, caller.sign))
+
+
+def _guard(reg, name, caller=None):
+    """Raise Refused unless the caller may read index `name`. Triage prints raw names."""
     why = indexes.refresh().index_name_problem(name)
     if why:
         raise IndexesError(why)
     if name in reg.get("indexes", {}):
-        why = indexes.read_refusal(reg, indexes.calling_session(), name)
+        why = indexes.read_refusal(reg, caller if caller is not None else indexes.classify_caller(), name)
         if why:
             raise Refused(why)
     return name
 
 
 def _own_or(name, reg):
-    return _guard(reg, name) if name else indexes.own_index(reg, indexes.calling_session())
+    if name:
+        return _guard(reg, name)
+    caller = indexes.classify_caller()
+    return _guard(reg, indexes.own_index(reg, caller.session), caller)
 
 
 def cmd_list(reg, args):
@@ -133,10 +142,10 @@ def cmd_status(reg, args):
             raise IndexesError("no index %r in the registry (see `fleetwatch index list`)" % name)
         reg = dict(reg, indexes={name: reg["indexes"][name]})
     else:
-        # Every index the calling session may read; outside a session, every index.
-        session = indexes.calling_session()
+        # Show only indexes the caller may read.
+        caller = indexes.classify_caller()
         shown = {n: e for n, e in reg["indexes"].items()
-                 if indexes.read_refusal(reg, session, n) is None}
+                 if indexes.read_refusal(reg, caller, n) is None}
         hidden = len(reg["indexes"]) - len(shown)
         reg = dict(reg, indexes=shown)
         if hidden:
@@ -180,7 +189,17 @@ def cmd_build(reg, args):
         return _fail("usage: fleetwatch index build NAME")
     from .search import cli, engine
     os.umask(indexes.refresh().PRIVATE_UMASK)
-    loc = indexes.locate(reg, _guard(reg, args[0]))
+    # A refresh launches this writer without a terminal. It emits build counts, not index
+    # content. Recognized Claude sessions still use their existing named-index guard.
+    caller = indexes.classify_caller()
+    name = args[0]
+    if caller.kind != "untrusted":
+        name = _guard(reg, name)
+    else:
+        why = indexes.refresh().index_name_problem(name)
+        if why:
+            raise IndexesError(why)
+    loc = indexes.locate(reg, name)
     ix = engine.Index(loc.cfg_dir, indexes.search_config(loc))
     cli.set_env_defaults()
     cli.cmd_build(ix, None)
@@ -188,6 +207,7 @@ def cmd_build(reg, args):
 
 
 def cmd_add(reg, args):
+    _require_direct_caller("add")
     ap = argparse.ArgumentParser(prog="fleetwatch index add")
     ap.add_argument("--session", help="session name (default: the calling session)")
     ap.add_argument("--session-id", help="session id when --session names none that is running")
@@ -323,6 +343,8 @@ def cmd_migrate(reg, args):
     ap.add_argument("--from", dest="old", required=True, metavar="OLD_ROOT")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args(args)
+    if a.force:
+        _require_direct_caller("migrate --force")
     # The live registry's entry first: an index already here is overwritten only by a
     # session the guard lets read it (--force included). The old entry is checked too.
     _guard(reg, a.name)

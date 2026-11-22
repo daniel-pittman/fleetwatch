@@ -1043,7 +1043,7 @@ def guard(reg, name):
     than through `fleetwatch index`."""
     from fleetwatch import indexes
     why = indexes.read_refusal(dict(reg, groups=reg.get("groups") or {}),
-                               indexes.calling_session(), name, SETTINGS.protected_groups)
+                               indexes.classify_caller(), name, SETTINGS.protected_groups)
     if why:
         print(why, file=sys.stderr)
         sys.exit(3)
@@ -1051,12 +1051,16 @@ def guard(reg, name):
 
 def owner_refusal(reg, name):
     """Why the calling session may not change index `name` destructively, or None. Reading
-    is not enough: only the owner at a terminal (no calling session) or the session that
+    is not enough: only the owner at an interactive terminal or the session that
     owns the index may."""
     from fleetwatch import indexes
-    session = indexes.calling_session()
-    if session is None or name in indexes.owned_by(reg, *session):
+    caller = indexes.classify_caller()
+    if caller.kind == "owner" or (caller.kind == "session" and
+                                   name in indexes.owned_by(reg, *caller.session)):
         return None
+    if caller.kind in ("untrusted", "delegated"):
+        return ("refused: index %r cannot be changed because the caller was not identified "
+                "as a Claude session or the owner (%s)" % (name, caller.sign))
     return ("refused: index %r is not owned by this session; only its owner session, or the "
             "owner at a terminal, may remove sessions from it" % name)
 
@@ -1128,7 +1132,11 @@ def _main(argv):
     if argv and argv[0] == "discover":
         return cmd_discover(reg)
     if argv and argv[0] == "status":
-        return cmd_status(reg)
+        from fleetwatch import indexes
+        caller = indexes.classify_caller()
+        visible = {name: entry for name, entry in reg["indexes"].items()
+                   if indexes.read_refusal(reg, caller, name, SETTINGS.protected_groups) is None}
+        return cmd_status(dict(reg, indexes=visible))
     if argv and argv[0] == "triage":
         if len(argv) < 2:
             sys.exit("usage: refresh_all.py triage NAME")
