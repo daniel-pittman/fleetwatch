@@ -190,6 +190,12 @@ class Deliver(unittest.TestCase):
         self.rig.registry("b.json", status="busy", session=None)
         self.sent(sid_=None)
 
+    def test_the_last_row_carrying_the_id_decides_the_state(self):
+        os.remove(os.path.join(self.rig.sessions, "r.json"))
+        self.rig.registry("a.json", status="idle")
+        self.rig.registry("b.json", status=None)
+        self.refused(containing="cannot tell whether Alpha is at a prompt")
+
     def test_another_sessions_row_on_the_same_pid_at_a_prompt_refuses(self):
         self.rig.registry("z.json", status="waiting", session=OTHER_SID)
         self.refused(containing="is at a prompt")
@@ -664,6 +670,23 @@ class Board(AppWorld):
             await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
         self.drive_needs(body)
         self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY2, "picked"])
+
+    def test_an_item_one_of_two_same_name_sessions_holds_tells_that_one(self):
+        self.status_file("live.json", "Live One", self.s, "only the first has this")
+        self.add_second("Live One", "elsewhere", "only the second has this")
+
+        async def body(app, pilot):
+            await pilot.press("2")
+            await settle(pilot, lambda: app.active == 1, "the to-dos tab")
+            item = next(n for n in all_nodes(app.current.nodes) if n.todo and n.owners
+                        and n.owners[0][1] == self.s)
+            self.assertIsNone(item.sid)
+            await self.open_box(app, pilot, item)
+            self.assertIn("work", self.box_texts(app)[1])
+            await self.send_text(app, pilot, "first")
+            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+        self.drive_needs(body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "first"])
 
     def test_an_item_two_sessions_share_asks_which_one(self):
         self.add_second("Other One", "elsewhere")
