@@ -437,17 +437,38 @@ class ClaudeWorkflowTests(unittest.TestCase):
         extract = jobs["verdict-extract"]
         clear = jobs["clear-stale-ack"]
         self.assertEqual(review["outputs"]["review_attempt"], "${{ steps.attempt.outputs.value }}")
+        self.assertEqual(review["outputs"]["split_parts"], "${{ steps.context.outputs.split_parts }}")
         self.assertIn("GITHUB_RUN_ATTEMPT", step_by_id(review, "attempt")["run"])
         self.assertEqual(extract["outputs"]["review_id"], "${{ steps.fetch.outputs.review_id }}")
         fetch = step_by_id(extract, "fetch")["run"]
+        self.assertEqual(step_by_id(extract, "fetch")["env"]["SPLIT_PARTS"],
+                         "${{ needs.claude-review.outputs.split_parts }}")
         self.assertIn('review_id=$(printf \'%s\' "$review"', fetch)
         self.assertIn("review_id=%s", fetch)
+        self.assertIn("unchecked checklist item", fetch)
+        self.assertIn("no Test coverage section", fetch)
+        self.assertIn("split diff's $SPLIT_PARTS parts", fetch)
         clear_step = step_by_name(clear, "Remove a review-ack applied before this push")
         self.assertIs(clear_step["continue-on-error"], True)
         self.assertIn("github.run_attempt == 1", clear_step["if"])
         gate = step_by_name(jobs["review-gate"], GATE_STEP)
         self.assertEqual(gate["env"]["REVIEW_COMMENT_ID"], "${{ needs.verdict-extract.outputs.review_id }}")
         self.assertEqual(gate["env"]["REVIEW_ATTEMPT"], "${{ needs.claude-review.outputs.review_attempt }}")
+
+    def test_didakt_refusal_and_extractor_retry_remain_available(self):
+        if os.path.basename(WF) != "didakt":
+            self.skipTest("didakt-specific recovery steps")
+        jobs = load("claude-code-review.yml")["jobs"]
+        refusal = step_by_name(jobs["claude-review"], "Refuse a review that never ran")
+        self.assertIn("EXECUTION_FILE", refusal["env"])
+        self.assertIn("total_cost_usd", refusal["run"])
+        extract = step_by_id(jobs["verdict-extract"], "extract")
+        retry = step_by_id(jobs["verdict-extract"], "extract_retry")
+        self.assertIs(extract["continue-on-error"], True)
+        self.assertIs(retry["continue-on-error"], True)
+        self.assertEqual(retry["if"], "steps.extract.outcome == 'failure'")
+        parsed = step_by_id(jobs["verdict-extract"], "parse")
+        self.assertIn("steps.extract_retry.outputs.structured_output", parsed["env"]["STRUCTURED"])
 
     def test_diff_uses_git_and_failure_logs_use_job_logs(self):
         jobs = load("claude-code-review.yml")["jobs"]
@@ -461,6 +482,7 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertIn(' -z ', context)
         self.assertIn("git merge-base", context)
         self.assertIn("diff-parts/INDEX.md", context)
+        self.assertIn("split_parts=%s", context)
         prompt = step_by_id(jobs["claude-review"], "claude-review")["with"]["prompt"]
         self.assertIn("${{ steps.context.outputs.dir }}/diff-parts/INDEX.md", prompt)
         self.assertNotIn("gh pr diff", context)
@@ -758,6 +780,7 @@ class ReviewContextStepTests(unittest.TestCase):
         r, outputs, ctx = self.run_step()
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(outputs["dir"], ctx)
+        self.assertEqual(outputs["split_parts"], "0")
         self.assertEqual(sorted(os.listdir(ctx)), ["changed-files.txt", "changed-files.z", "comments.md", "diff.patch", "pr.json"])
         with open(os.path.join(ctx, "comments.md")) as fh:
             comments = fh.read()
@@ -786,6 +809,7 @@ class ReviewContextStepTests(unittest.TestCase):
     def test_a_large_diff_is_split_and_indexed(self):
         r, outputs, ctx = self.run_step(FAKE_LARGE="1")
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(outputs["split_parts"], "1")
         parts = os.path.join(ctx, "diff-parts")
         with open(os.path.join(parts, "INDEX.md")) as fh:
             index = fh.read()
@@ -1071,7 +1095,20 @@ def bot_comment(run_id, text, created="2026-01-01T10:01:00Z", updated=None, iden
     return {"id": ident, "created_at": created, "updated_at": updated or created,
             "user": user("claude[bot]", "Bot"),
             "body": f"**Claude finished @maint's task** [View job](https://github.com/o/r/actions/runs/{run_id})"
-                    f"\n\n{text}\n\n" + "Detail. " * 60}
+                    f"\n\n{text}\n\n" + "Detail. " * 60 +
+                    "\n\n### Test coverage\nNo test changes needed.\n"}
+
+
+def observed_review(name, fallback, original_run):
+    # The suite must run with or without the scratch evidence files.
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if os.path.basename(root) == "template":
+        root = os.path.dirname(root)
+    path = os.path.join(root, "_build-work", name)
+    if os.path.isfile(path):
+        with open(path) as fh:
+            return fh.read().replace(f"/actions/runs/{original_run}", "/actions/runs/1234")
+    return fallback
 
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("jq"), "needs bash and jq")
@@ -1104,7 +1141,7 @@ class GateStepTests(unittest.TestCase):
                    RUN_ID="1234", GH_TOKEN="unused", REVIEW_BOT="claude[bot]", ACK_LABEL="review-ack",
                    MARKER="### Review Gate", REVIEW_RESULT="success", EXTRACT_RESULT="success",
                    PR_AUTHOR="alice", PR_AUTHOR_ID="10", IS_FORK="false",
-                   GITHUB_OUTPUT=os.path.join(tmp, "out"), **paths)
+                   GITHUB_OUTPUT=os.path.join(tmp, "out"), SPLIT_PARTS="0", **paths)
         env.update(env_extra)
         r = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", path],
                            env=env, capture_output=True, text=True, cwd=tmp)
@@ -1116,9 +1153,10 @@ class GateStepTests(unittest.TestCase):
             body = ""
         return r, body
 
-    def fetch(self, *pages):
+    def fetch(self, *pages, split_parts="0"):
         job = gated_job(self, "verdict-extract")
-        return self.run_script(step_by_name(job, FETCH_STEP)["run"], {}, comments=pages)
+        return self.run_script(step_by_name(job, FETCH_STEP)["run"],
+                               {"SPLIT_PARTS": split_parts}, comments=pages)
 
     def gate(self, line, **env):
         job = gated_job(self, "review-gate")
@@ -1161,6 +1199,67 @@ class GateStepTests(unittest.TestCase):
         # An earlier run's review is never graded as this run's.
         r, _ = self.fetch([bot_comment(1111, "## Review\nNo findings.")], [bot_comment(12345, "## Review")])
         self.assertNotEqual(r.returncode, 0)
+
+    def test_the_didakt_early_end_comment_is_refused(self):
+        fallback = ("**Claude finished task** [View job](https://github.com/o/r/actions/runs/1234)\n\n"
+                    "### Reviewing PR\n- [x] Read the split diff index (6 parts)\n"
+                    "- [ ] Review the changed source, in progress\n- [ ] Post the findings\n"
+                    + "Progress detail. " * 30)
+        body = observed_review("early-end-comment.md", fallback, "45080647932")
+        review = bot_comment(1234, "", ident=82)
+        review["body"] = body
+        r, text = self.fetch([review], split_parts="6")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unchecked checklist item", r.stderr)
+        self.assertEqual(text, "")
+
+    def test_an_unchecked_item_refuses_even_with_coverage_and_part_count(self):
+        review = bot_comment(1234, "- [ ] Post the findings\nI reviewed a split diff in 6 parts.")
+        r, text = self.fetch([review], split_parts="6")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unchecked checklist item", r.stderr)
+        self.assertEqual(text, "")
+
+    def test_missing_test_coverage_refuses_a_checked_review(self):
+        review = bot_comment(1234, "- [x] Posted findings\nI reviewed a split diff in 6 parts.")
+        review["body"] = review["body"].replace("### Test coverage\nNo test changes needed.\n", "")
+        r, text = self.fetch([review], split_parts="6")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no Test coverage section", r.stderr)
+        self.assertEqual(text, "")
+
+    def test_missing_split_part_count_refuses_a_checked_review(self):
+        review = bot_comment(1234, "- [x] Posted findings\nI reviewed the split diff.")
+        r, text = self.fetch([review], split_parts="6")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("split diff's 6 parts", r.stderr)
+        self.assertEqual(text, "")
+
+    def test_unavailable_split_count_refuses_a_review(self):
+        review = bot_comment(1234, "- [x] Posted findings\nI reviewed a split diff in 6 parts.")
+        r, text = self.fetch([review], split_parts="")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("split-diff part count is unavailable", r.stderr)
+        self.assertEqual(text, "")
+
+    def test_complete_fleetwatch_review_passes(self):
+        fallback = ("**Claude finished task** [View job](https://github.com/o/r/actions/runs/1234)\n\n"
+                    "- [x] Read the split diff (5 parts)\n- [x] Posted the review\n"
+                    "### Summary\nI reviewed a split diff in 5 parts.\n"
+                    "### Findings\nNo new findings.\n### Test coverage\nCI passed.\n"
+                    + "Review detail. " * 30)
+        body = observed_review("complete-example.md", fallback, "45080545477")
+        review = bot_comment(1234, "", ident=83)
+        review["body"] = body
+        r, text = self.fetch([review], split_parts="5")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("### Test coverage", text)
+
+    def test_a_bold_test_coverage_line_passes(self):
+        review = bot_comment(1234, "- [x] Posted findings\n**Test coverage:** CI passed.")
+        review["body"] = review["body"].replace("### Test coverage\nNo test changes needed.\n", "")
+        r, _ = self.fetch([review])
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 

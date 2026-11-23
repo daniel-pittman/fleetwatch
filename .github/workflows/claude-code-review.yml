@@ -197,6 +197,7 @@ jobs:
       actions: read
     outputs:
       review_attempt: ${{ steps.attempt.outputs.value }}
+      split_parts: ${{ steps.context.outputs.split_parts }}
     steps:
       - name: Record this review attempt
         id: attempt
@@ -295,6 +296,7 @@ jobs:
           printf '%s\n' "${changed_files[@]}" > "$dir/changed-files.txt"
           bytes=$(wc -c < "$dir/diff.patch")
           lines=$(wc -l < "$dir/diff.patch")
+          index=0
           if [ "$bytes" -gt 200000 ] || [ "$lines" -gt 6000 ]; then
             mkdir -p "$dir/diff-parts"
             printf '| Part | Files | Bytes |\n|---|---:|---:|\n' > "$dir/diff-parts/INDEX.md"
@@ -310,7 +312,6 @@ jobs:
               fi
             done
             indexed_files=()
-            index=0
             for part in "${parts[@]}"; do
               index=$((index + 1))
               safe=$(printf '%s' "$part" | tr -c 'A-Za-z0-9._-' '_')
@@ -383,8 +384,7 @@ jobs:
               + "\n\n\(.body)\n"' "$RUNNER_TEMP/trusted-comments.json" > "$dir/comments.md"
           actors=$(jq -r '[.[].user.login] + ["github-actions[bot]", "claude[bot]"] | unique | join(",")' \
             "$RUNNER_TEMP/trusted-comments.json")
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-          echo "actors=$actors" >> "$GITHUB_OUTPUT"
+          printf 'dir=%s\nactors=%s\nsplit_parts=%s\n' "$dir" "$actors" "$index" >> "$GITHUB_OUTPUT"
 
       # SHA-pinned anthropics/claude-code-action v1.0.280. Bump by re-resolving
       # the tag's commit (the tag is annotated, so peel it):
