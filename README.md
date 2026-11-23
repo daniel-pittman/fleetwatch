@@ -58,7 +58,7 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 
 | Program | Used for | Without it |
 |---|---|---|
-| iTerm2 (macOS) | the hotkey window, and Enter jumping to a session's tab | the board runs in any terminal; Enter says it cannot reach iTerm2 |
+| iTerm2 (macOS) | the hotkey window, Enter jumping to a session's tab, and `t` typing into it | the board runs in any terminal; Enter and `t` say they cannot reach iTerm2 |
 | `claude` (the Claude Code CLI) | Resume reopening a session; the session tagger during an index refresh | Resume cannot reopen; run refresh with `--no-tag` |
 | `gh`, logged in (`gh auth login`) | watches (read-only GitHub calls with your login) | watches report a lookup error |
 | `terminal-notifier` (macOS, `brew install terminal-notifier`) | a click on a notification raising that session's tab | banners still appear through `osascript`; a click does nothing |
@@ -152,7 +152,7 @@ Tabs (switch with `1` to `5`, Tab, Shift-Tab or the mouse; each label carries a 
 
 Mouse: a single click selects a row, a double click does what Enter does (a section header folds, a session row jumps), a click on a row's fold arrow (`▸` or `▾`) folds or unfolds it, and a click on a tab label switches to that tab.
 
-Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder (on Your to-dos it cycles by day, by project folder and no groups), `m` moves the highlighted session to another group, `/` finds a row on the current tab and Ctrl-K finds a live session from any tab (see Find a row), `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `S` snoozes and `x` marks done the highlighted to-do (and on a to-do `u` shows or hides the snoozed and done items instead, see Snooze and done), `i` shows a Resume row's details, `r` refreshes now, `y` copies a command on the Indexes tab (the row's next step, or a search command for a healthy index), `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
+Keys: up/down or `j`/`k` move, PgUp/PgDn and the wheel scroll, Enter (or `g`) jumps to the row's session in iTerm2 (an item shared by several sessions first asks which one), `t` types a message into that session's prompt (see Tell a session), Space toggles a row open or closed (right arrow opens, left arrow closes), `e` and `c` open and close every row in the tab, `z` flips between all open and all closed, `s` changes the tab's sort order, `G` groups every tab by project folder (on Your to-dos it cycles by day, by project folder and no groups), `m` moves the highlighted session to another group, `/` finds a row on the current tab and Ctrl-K finds a live session from any tab (see Find a row), `P` prunes finished sessions' status files (see Prune), `p` parks the highlighted session and `u` unparks it, `S` snoozes and `x` marks done the highlighted to-do (and on a to-do `u` shows or hides the snoozed and done items instead, see Snooze and done), `i` shows a Resume row's details, `r` refreshes now, `y` copies a command on the Indexes tab (the row's next step, or a search command for a healthy index), `?` shows help, `q` or Ctrl-C quits. In the hotkey window, Control-Shift-F hides the window and `q` quits fleetwatch (Ctrl-C quits too, and the next hotkey press opens a fresh window).
 
 `?` opens the key list reflowed to the terminal: it wraps each description under its key and scrolls (arrows, `j`/`k`, PgUp/PgDn, Home/End), so every line is reachable at 80 by 24. Esc, `q` or `?` closes it.
 
@@ -232,6 +232,19 @@ Press Enter (or `g`), or double click, on any row in any tab: a session, a quest
 - `FLEETWATCH_OSASCRIPT` and `FLEETWATCH_TTY_CMD` override the two commands (used by the tests).
 
 On a Resume row, Enter resumes instead (see Resume and park); `g` jumps when that session is running.
+
+### Tell a session
+
+Press `t` on a row you could jump to (the same rows and the same target as Enter, including the picker when several sessions share an item) to type a message into that session's Claude Code prompt without leaving the board. A box names the session and its folder; Enter sends and Esc cancels. The text arrives as input typed at the session's own terminal, so it carries your authority ("yes, go ahead with the merge", "move this to-do to tomorrow"); a message passed between sessions never does. The tab is not raised, so the board keeps focus, and the footer says `sent to <name>`. fleetwatch never stores or logs the message. A session that is working receives it as a message typed mid-turn. A session that ended offers to reopen, as Enter does.
+
+Because the text is typed, the target is checked again at the moment you press Enter, from fresh reads and never from the last refresh. A refusal appears in the box and keeps your text, and nothing is typed:
+
+- The session is at a prompt (registry status `blocked` or `waiting`, the Needs you "stuck on a prompt" group). Typed text would answer the prompt instead of reaching Claude, so the box says `<name> is at a prompt; answer it in its tab`.
+- What the terminal is running is not that session's Claude Code. The terminal's foreground process must be the session's own `claude` process; a shell, `less`, `vim` or `ssh` is refused and named, for example after Ctrl-Z put the session in the background. Text typed into a shell would run as a command.
+- The terminal no longer belongs to the session (a reused terminal never receives the text), or iTerm2 is not running or has no tab on it.
+- The message is empty, longer than 2,000 characters, or holds a newline, tab or other control character. One line only: a pasted line break is refused with a note in the box rather than trimmed.
+
+Delivery is AppleScript `write text` through `osascript`, with the terminal and the message passed as arguments and never inside the script text, so quotes, backslashes and script-looking text arrive as plain characters. The message is typed with `newline no` and the return follows as a second write, because Claude Code treats a single `write text` as a paste and the return that ends a paste can land inside the input box without submitting it. Limits: a half-typed draft in the session's prompt is submitted together with the message; the checks and the typing are two steps a few milliseconds apart; and non-iTerm2 terminals are not supported. In `--demo`, `t` only says `demo: t would send to <name>`. `FLEETWATCH_FG_CMD` overrides the command that reads a terminal's foreground process (the tests use it, as they use `FLEETWATCH_OSASCRIPT` and `FLEETWATCH_TTY_CMD`).
 
 ### Hotkey window
 
