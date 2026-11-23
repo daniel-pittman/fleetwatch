@@ -22,7 +22,8 @@
       "HotKey Characters Ignoring Modifiers": "F",
       "HotKey Window AutoHides": true,
       "HotKey Window Animates": false,
-      "HotKey Window Dock Click Action": 1
+      "HotKey Window Dock Click Action": 1,
+      "Triggers": []
     }
   ]
 }

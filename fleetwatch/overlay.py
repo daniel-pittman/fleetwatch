@@ -54,6 +54,11 @@ def profile(cmd):
         "HotKey Characters": "\u0006", "HotKey Characters Ignoring Modifiers": "F",
         "HotKey Window AutoHides": True, "HotKey Window Animates": False,
         "HotKey Window Dock Click Action": 1,
+        # An empty trigger list replaces the triggers the profile would inherit from Default.
+        # iTerm2's Claude Code integration adds triggers there that show its agent toolbar
+        # by the session's running program; fleetwatch's refresh starts short helper
+        # processes, so the toolbar opened and closed every few seconds over the board.
+        "Triggers": [],
     }
 
 
