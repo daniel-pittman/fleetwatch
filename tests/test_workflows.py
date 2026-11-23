@@ -501,6 +501,20 @@ class ClaudeWorkflowTests(unittest.TestCase):
             # It reads this run's jobs; a private repository's token needs actions: read.
             self.assertEqual(jobs["verdict-extract"]["permissions"].get("actions"), "read")
 
+    def test_every_action_step_keeps_subagents_in_the_foreground(self):
+        # The job ends when the agent's turn ends; a background lane never reports, and the
+        # review then posts only its checklist.
+        for name in ("claude-code-review.yml", "claude.yml"):
+            for job_name, job in load(name)["jobs"].items():
+                for step in job.get("steps", []):
+                    if "anthropics/claude-code-action" in str(step.get("uses", "")):
+                        if "--tools \"Read\"" in str(step.get("with", {}).get("claude_args", "")):
+                            continue
+                        self.assertEqual((step.get("env") or {}).get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"), "1",
+                                         "%s/%s" % (job_name, step.get("name")))
+        prompt = step_by_id(load("claude-code-review.yml")["jobs"]["claude-review"], "claude-review")["with"]["prompt"]
+        self.assertIn("never end your turn while a lane is still running", prompt)
+
     def test_every_action_step_pins_the_permission_mode(self):
         # From claude-code-action v1.0.273 a session without a mode starts in auto
         # mode, where a safety review can approve a tool no allow rule covers.
