@@ -178,14 +178,19 @@ class Snapshot:
         self.view = data.build_view(self.sections, now, self.horizon, stale, holds)
         self.counts = views.tab_counts(self.view, stale)
         self.warnings = self.base_warnings + self.view["up_warnings"]
-        self.records, self.helpers = {}, {}
+        self.records, self.helpers, self.by_sid = {}, {}, {}
+        self.live_names, self.live_helpers = {}, {}     # name -> how many live sessions carry it
         self.gone = {x["name"]: x["r"] for x in self.view["for_you"] if x.get("gone")}
         for x in self.view["rows"]:
             self.records.setdefault(x["name"], x["r"])
+            if x["r"].get("sessionId"):
+                self.by_sid.setdefault(x["r"]["sessionId"], x["r"])
+            if x["r"].get("pid_alive"):
+                self.live_names[x["name"]] = self.live_names.get(x["name"], 0) + 1
             for c in x["r"]["children"]:
-                self.helpers.setdefault(data.clean(c["name"]), c)
+                self._add_helper(c)
         for r in list(self.view["orphans"]) + list(stale):
-            self.helpers.setdefault(data.clean(r["name"]), r)
+            self._add_helper(r)
         self.grouping = views.Grouping(
             {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
             self.groups.names(), fallback=lambda name: self.groups.of(
@@ -196,6 +201,12 @@ class Snapshot:
                                             len(self.watches), stamp=False)
         self.header_short = views.header_text(self.view, self.counts, now, self.warnings, True, bad,
                                               len(self.watches))
+
+    def _add_helper(self, r):
+        name = data.clean(r["name"])
+        self.helpers.setdefault(name, r)
+        if r.get("pid_alive"):
+            self.live_helpers[name] = self.live_helpers.get(name, 0) + 1
 
     def _tty(self, rec, name):
         """(tty, None) when the record has an iTerm2 tab, else (None, reason)."""
@@ -214,17 +225,28 @@ class Snapshot:
         """(tty, None) for a running session on the Resume tab, by ID since names can repeat."""
         return self._tty(self.held.get(sid), name)
 
-    def target_record(self, session, helper=None):
+    def target_record(self, session, helper=None, sid=None, unique=False):
         """(tty, None, name raised, its record) or (None, reason, None, None). A helper's own tab comes
-        first, then its parent session's."""
+        first, then its parent session's. With `unique` the session is found by sid when one is given, and
+        a name that more than one live session carries is refused rather than resolved to either: names
+        can repeat, and the record found is where `t` types."""
         if helper:
             rec = self.helpers.get(helper)
-            tty, reason = self._tty(rec, helper)
+            if unique and self.live_helpers.get(helper, 0) > 1:
+                tty, reason = None, "more than one running helper is named %s" % helper
+            else:
+                tty, reason = self._tty(rec, helper)
             if tty is not None:
                 return tty, None, helper, rec
             if not session:
                 return None, reason, None, None
-        rec = self.records.get(session)
+        if unique and sid:
+            rec = self.by_sid.get(sid)
+        elif unique and self.live_names.get(session, 0) > 1:
+            return (None, "more than one running session is named %s; press t on its row on the Sessions tab"
+                    % session, None, None)
+        else:
+            rec = self.records.get(session)
         tty, reason = self._tty(rec, session)
         return (tty, None, session, rec) if tty is not None else (None, reason, None, None)
 
@@ -990,9 +1012,10 @@ class SessionPicker(ModalScreen):
     """
     BINDINGS = [Binding("escape", "cancel", show=False)]
 
-    def __init__(self, names, title="Go to which session?"):
+    def __init__(self, names, title="Go to which session?", values=None):
         super().__init__()
         self.names, self.title_text = names, title
+        self.values = values if values is not None else names
 
     def compose(self):
         with Vertical(id="picker"):
@@ -1005,7 +1028,7 @@ class SessionPicker(ModalScreen):
 
     def on_option_list_option_selected(self, event):
         event.stop()
-        self.dismiss(self.names[int(event.option.id.split(":")[1])])
+        self.dismiss(self.values[int(event.option.id.split(":")[1])])
 
     def action_cancel(self):
         self.dismiss(None)
@@ -1019,7 +1042,7 @@ class OneLineInput(Input):
         if send.has_break(event.text or ""):
             event.stop()
             event.prevent_default()
-            self.screen.problem(send.check_text(event.text))
+            self.screen.problem(send.ONE_LINE)
 
 
 class SendScreen(ModalScreen):
@@ -1068,15 +1091,22 @@ class SendScreen(ModalScreen):
         self.run_worker(lambda: self._deliver(text), thread=True, group="send")
 
     def _deliver(self, text):
-        ok, reason = self.deliver(text)
+        try:
+            ok, reason = self.deliver(text)
+        except Exception as exc:
+            # The type only: an exception's text can quote the command line, which holds the message.
+            ok, reason = False, "could not send (%s)" % type(exc).__name__
         self.app.call_from_thread(self._delivered, ok, reason)
 
     def _delivered(self, ok, reason):
         self.sending = False
         if ok:
             self.dismiss(True)
-        else:
-            self.problem(reason)
+            return
+        if reason.startswith(send.TYPED):
+            # The text is in the session's box already; a second Enter would type it twice.
+            self.query_one("#message", Input).value = ""
+        self.problem(reason)
 
     def action_cancel(self):
         if not self.sending:
@@ -1735,17 +1765,30 @@ class FleetwatchApp(App):
         if os.environ.get("FLEETWATCH_DEMO"):
             self.say("demo: t would send to %s" % (node.helper or node.session))
             return
-        if (node.session in self.snapshot.gone and node.helper is None and len(node.sessions) <= 1):
+        owners = node.owners or [(node.session, node.sid)]
+        if node.session in self.snapshot.gone and node.helper is None and len(owners) <= 1:
             self.offer_reopen(node.session)
             return
-        if len(node.sessions) > 1:
-            self.push_screen(SessionPicker(node.sessions, "Tell which session?"), self._tell_picked)
+        if len(owners) > 1:
+            self.push_screen(SessionPicker(self._owner_labels(owners), "Tell which session?", owners),
+                             self._tell_picked)
             return
-        self._tell(node.session, node.helper)
+        self._tell(node.session, node.helper, node.sid or owners[0][1])
 
-    def _tell_picked(self, name):
-        if name is not None and self.snapshot is not None:
-            self._tell(name)
+    def _owner_labels(self, owners):
+        """Picker labels: the name, and the folder too when two choices share a name."""
+        names = [n for n, _ in owners]
+        out = []
+        for name, sid in owners:
+            rec = self.snapshot.by_sid.get(sid) or self.snapshot.gone.get(name) or {}
+            folder = resume.short_folder(rec.get("cwd"), 40) if names.count(name) > 1 else ""
+            out.append("%s  %s" % (name, folder) if folder else name)
+        return out
+
+    def _tell_picked(self, owner):
+        if owner is not None and self.snapshot is not None:
+            name, sid = owner
+            self._tell(name, None, sid)
 
     def _tell_held(self, sid):
         e = self.resume_rows.get(sid)
@@ -1761,19 +1804,19 @@ class FleetwatchApp(App):
             else:
                 self._ask_message(name, tty, self.snapshot.held[sid])
 
-    def _tell(self, session, helper=None):
-        tty, reason, name, rec = self.snapshot.target_record(session, helper)
+    def _tell(self, session, helper=None, sid=None):
+        tty, reason, name, rec = self.snapshot.target_record(session, helper, sid, unique=True)
         if tty is None:
             self.say(reason)
         else:
             self._ask_message(name, tty, rec)
 
     def _ask_message(self, name, tty, rec):
-        sessions = (self.paths or data.default_paths())["sessions"]
+        paths = self.paths or data.default_paths()
         pid, sid = rec["pid"], rec.get("sessionId")
         self.push_screen(
             SendScreen(name, resume.short_folder(rec.get("cwd"), 70),
-                       lambda text: send.deliver(name, pid, sid, tty, text, sessions)),
+                       lambda text: send.deliver(name, pid, sid, tty, text, paths)),
             lambda sent: self.say("sent to %s" % name) if sent else None)
 
     def offer_reopen(self, name):

@@ -47,24 +47,31 @@ ITERM_JUMP_SCRIPT = """on run argv
 end run
 """
 
-# The tty is argv item 1 and the message item 2, never in the script text: the message is untrusted
-# text that may hold quotes, backslashes or AppleScript source. The text goes in with `newline no` and the
-# return as a second write: Claude Code reads one `write text` as a paste, and the return that ends a paste
-# lands inside the input box instead of submitting it. The delay lets the paste finish before the return
-# arrives. The tab is neither selected nor activated, so the board keeps focus.
-ITERM_SEND_SCRIPT = """on run argv
+# The send scripts find the session with one bulk read of every tty, then address it by its window, tab
+# and session index and read its tty once more before writing: windows reorder as focus moves, so an index
+# that no longer holds the target refuses rather than types into another tab. The tty and the message
+# arrive as argv, never in the script text: the message is untrusted text that may hold quotes,
+# backslashes or AppleScript source. The text and the return are two scripts, so send.py can check the
+# session again between them; the text goes in with `newline no`, since Claude Code reads one
+# `write text` as a paste and the return that ends a paste lands inside the box instead of submitting it.
+# The tab is neither selected nor activated, so the board keeps focus.
+_FIND_SESSION = """on run argv
     set target to item 1 of argv
-    set msg to item 2 of argv
     if application "iTerm2" is not running then error "iTerm2 is not running"
     tell application "iTerm2"
-        repeat with w in windows
-            repeat with t in tabs of w
-                repeat with s in sessions of t
-                    if (tty of s) is target then
-                        tell s to write text msg newline no
-                        delay 0.2
-                        tell s to write text (ASCII character 13) newline no
-                        return "ok"
+        set ttyLists to tty of sessions of tabs of windows
+        repeat with w from 1 to count of ttyLists
+            set perWindow to item w of ttyLists
+            if class of perWindow is not list then set perWindow to {perWindow}
+            repeat with t from 1 to count of perWindow
+                set perTab to item t of perWindow
+                if class of perTab is not list then set perTab to {perTab}
+                repeat with s from 1 to count of perTab
+                    if (item s of perTab as text) is target then
+                        set found to session s of tab t of window w
+                        if (tty of found) is not target then error "the iTerm2 tab moved; try again"
+"""
+_FIND_END = """                        return "ok"
                     end if
                 end repeat
             end repeat
@@ -73,6 +80,13 @@ ITERM_SEND_SCRIPT = """on run argv
     error "no iTerm2 session on that terminal"
 end run
 """
+ITERM_TYPE_SCRIPT = (_FIND_SESSION
+                     + "                        tell found to write text (item 2 of argv) newline no\n"
+                     + _FIND_END)
+ITERM_SUBMIT_SCRIPT = (_FIND_SESSION
+                       + "                        tell found to write text (ASCII character 13) newline no\n"
+                       + _FIND_END)
+SEND_SCRIPTS = (ITERM_TYPE_SCRIPT, ITERM_SUBMIT_SCRIPT)
 
 # The command arrives as argv item 1, never in the script text. It runs as the window's process rather
 # than through `write text`: typed text races the shell's startup and any key pressed as the window
@@ -115,6 +129,9 @@ def osascript(script, args=()):
     argv = shlex.split(os.environ.get("FLEETWATCH_OSASCRIPT", "osascript")) + ["-"] + list(args)
     try:
         out = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        # Not str(exc): it quotes the command line, and a send's command line holds the message.
+        return False, "timed out talking to iTerm2"
     except Exception as exc:
         return False, clean(str(exc))[:80] or "osascript failed"
     if out.returncode != 0:
@@ -140,14 +157,21 @@ def jump_to_tty(tty):
     return (True, "") if ok else (False, out)
 
 
-def send_to_tty(tty, text):
-    """(ok, reason). Types text and a return into the iTerm2 session on tty. The caller has already
+def type_into_tty(tty, text):
+    """(ok, reason). Types text, without a return, into the iTerm2 session on tty. The caller has already
     checked what is running there (see send.py); this only delivers."""
     if not valid_tty(tty):
         return False, "not a terminal device"
-    ok, out = osascript(ITERM_SEND_SCRIPT, [tty, text])
+    ok, out = osascript(ITERM_TYPE_SCRIPT, [tty, text])
     return (True, "") if ok else (False, out)
 
+
+def submit_tty(tty):
+    """(ok, reason). Sends a return to the iTerm2 session on tty."""
+    if not valid_tty(tty):
+        return False, "not a terminal device"
+    ok, out = osascript(ITERM_SUBMIT_SCRIPT, [tty])
+    return (True, "") if ok else (False, out)
 
 
 def open_window(command):

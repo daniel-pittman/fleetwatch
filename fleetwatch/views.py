@@ -85,6 +85,8 @@ class Node:
     session: str = None                            # cleaned name of the owning top-level session
     helper: str = None                             # a helper session this row is about; its own tab first
     sessions: list = field(default_factory=list)   # every session holding a merged item (a picker when > 1)
+    sid: str = None                                # sessionId of the owning top-level session, when known
+    owners: list = field(default_factory=list)     # an item row: (name, sessionId) of every session holding it
     section: bool = False                          # a header: Enter folds it, nothing to jump to
     sort: tuple = ()                               # coarse rank that stabilise() keeps rows within
     hang: int = 0                                  # continuation lines of the head indent this much more
@@ -202,12 +204,13 @@ def needs_nodes(view, now, sort="oldest"):
             cname = clean(c["name"])
             kids.append(Node("%s:h:%s" % (base, cname), _row_text(
                 [("! ", RED), ("helper %s stuck on a prompt %s" % (cname, ago(secs)), RED)]),
-                session=x["name"], helper=cname, hang=2))
+                session=x["name"], sid=x["r"].get("sessionId"), helper=cname, hang=2))
         for i, t in enumerate(x["tasks"], 1):
             label, red = task_label(t)
             kid = _row_text([(label + ": ", RED if red else DIM if t["kind"] == "undated" else ""),
                              (t["what"], RED if red else DIM if t["kind"] == "undated" else "")])
-            kids.append(Node("%s:t:%d:%s" % (base, i, t["what"]), kid, session=x["name"], hang=2,
+            kids.append(Node("%s:t:%d:%s" % (base, i, t["what"]), kid, session=x["name"],
+                             sid=x["r"].get("sessionId"), hang=2,
                              todo=(tuple(t["keys"]), t["what"])))
         width = len(str(n_q))
         for i, (text, since, tag) in enumerate(x["qs"], 1):
@@ -217,8 +220,10 @@ def needs_nodes(view, now, sort="oldest"):
                 t.append(" · %s" % ago(now - since), style=DIM)
             if tag:
                 t.append(" [%s]" % tag, style=DIM)
-            kids.append(Node("%s:q:%d" % (base, i), t, session=x["name"], helper=tag, hang=len(lead)))
-        node = Node(base, _row_text(head), children=kids, session=x["name"], sort=_needs_key(sort, x))
+            kids.append(Node("%s:q:%d" % (base, i), t, session=x["name"], sid=x["r"].get("sessionId"),
+                             helper=tag, hang=len(lead)))
+        node = Node(base, _row_text(head), children=kids, session=x["name"], sid=x["r"].get("sessionId"),
+                    sort=_needs_key(sort, x))
         preview = question_preview(x, now)
         if preview:
             node.head_shut = _row_text(head + [("\n" + preview, "")])
@@ -249,7 +254,7 @@ def _item_node(prefix, row, now, datew):
     parts += [(row["what"], red), ("  " + names, DIM)]
     return Node("%s:%s:%s" % (prefix, row["bucket"], "|".join(map(str, _dedup(row)))), _row_text(parts),
                 session=row["sessions"][0], sessions=list(row["sessions"]), hang=len(lead),
-                todo=(tuple(row.get("keys", ())), row["what"]))
+                owners=list(row.get("owners", ())), todo=(tuple(row.get("keys", ())), row["what"]))
 
 
 def held_node(row, hold, now, datew):
@@ -261,8 +266,8 @@ def held_node(row, hold, now, datew):
     lead = _due(row, now).ljust(datew) + " " + _marker(row) + " "
     t = _row_text([(lead + row["what"] + "  " + names + "  · " + when, DIM)])
     return Node("held:%s" % "|".join(map(str, _dedup(row))), t, session=row["sessions"][0],
-                sessions=list(row["sessions"]), hang=len(lead), todo=(tuple(row["keys"]), row["what"]),
-                held=kind)
+                sessions=list(row["sessions"]), owners=list(row.get("owners", ())), hang=len(lead),
+                todo=(tuple(row["keys"]), row["what"]), held=kind)
 
 
 def held_group(view, holds, now):
@@ -469,8 +474,9 @@ def session_node(x, now, prefix="ses:"):
         cname = clean(c["name"])
         t = Text("↳ ", style=DIM)
         t.append("%s  %s" % (cname, clean(c["state"])))
-        children.append(Node("%s:k:%s" % (key, cname), t, session=x["name"], helper=cname, hang=2))
-    return Node(key, _row_text(head), body, children, session=x["name"])
+        children.append(Node("%s:k:%s" % (key, cname), t, session=x["name"], sid=r.get("sessionId"),
+                             helper=cname, hang=2))
+    return Node(key, _row_text(head), body, children, session=x["name"], sid=r.get("sessionId"))
 
 
 def _session_key(sort):

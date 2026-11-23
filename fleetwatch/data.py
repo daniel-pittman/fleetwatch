@@ -584,6 +584,7 @@ def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=(), holds
             for i in session_upcoming(src["status"] or {}, label, up_warnings):
                 if i["yours"] or not only_yours:
                     i["key"] = item_key(r.get("sessionId") or "name-" + label, i)
+                    i["sid"] = r.get("sessionId")
                     out.append(i)
         return out
     for r in rows:
@@ -790,9 +791,12 @@ def build_timeline(items, now, horizon_days=DEFAULT_HORIZON_DAYS):
     for it in items:
         key = dedup_key(it)
         if key not in merged:
-            merged[key] = dict(it, sessions=[it["session"]], keys=[it["key"]] if it.get("key") else [])
+            merged[key] = dict(it, sessions=[it["session"]], keys=[it["key"]] if it.get("key") else [],
+                               owners=[(it["session"], it.get("sid"))])
             continue
         row = merged[key]
+        if (it["session"], it.get("sid")) not in row["owners"]:
+            row["owners"].append((it["session"], it.get("sid")))
         if it.get("key") and it["key"] not in row["keys"]:
             row["keys"].append(it["key"])
         if it["session"] not in row["sessions"]:

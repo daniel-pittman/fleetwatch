@@ -3,8 +3,10 @@ import asyncio
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import timedelta
 from unittest import mock
@@ -16,18 +18,26 @@ import standin  # noqa: E402
 from test_app import TTY, boot  # noqa: E402
 from test_resume import AppWorld, sid  # noqa: E402
 from waiting import settle  # noqa: E402
-from fleetwatch import data, iterm, send  # noqa: E402
+from fleetwatch import app as fapp, data, iterm, park, send, views  # noqa: E402
 from textual import events  # noqa: E402
 from textual.widgets import Input, Static  # noqa: E402
 
 FAKE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_send_tools.py")
 PID = 4242
 SID = "aa11bb22-0000-4000-8000-0000000000aa"
+OTHER_SID = "bb22cc33-0000-4000-8000-0000000000bb"
 HOSTILE = 'say "hi" \\ back; do shell script "touch /tmp/never"\'; end tell -- `x` $(y)'
 
 
 def py(*args):
     return " ".join(shlex.quote(a) for a in (sys.executable, FAKE) + args)
+
+
+def claude_rows(pid, *members):
+    """`ps -t` rows for a terminal whose foreground group Claude (pid) leads, with members in it."""
+    rows = ["%d %d %d S+ claude" % (pid, pid, pid)]
+    rows += ["%d %d %d S+ %s" % (pid + 1 + i, pid, pid, m) for i, m in enumerate(members)]
+    return "\n".join(rows)
 
 
 class Rig:
@@ -37,34 +47,48 @@ class Rig:
         self.root = root
         self.sessions = os.path.join(root, "sessions")
         os.makedirs(self.sessions, exist_ok=True)
-        self.ttys, self.fg = os.path.join(root, "ttys.txt"), os.path.join(root, "fg.txt")
+        self.fg, self.agents_file = os.path.join(root, "fg.txt"), os.path.join(root, "rig-agents.json")
         self.log, self.fail = os.path.join(root, "osascript.log"), os.path.join(root, "fail.txt")
+        self.then = os.path.join(root, "then.json")
         self.tty_path, self.pid = tty_path, pid
+        self.paths = {"sessions": self.sessions, "command": py("show", self.agents_file)}
         self.registry(status=status)
-        self.map_tty(pid, tty_path)
-        self.foreground(fg_row or "%d %d %d S+ claude" % (pid, pid, pid))
+        self.foreground(fg_row or claude_rows(pid))
+        self.agents([])
         open(self.fail, "w").close()
         self.env = mock.patch.dict(os.environ, {
-            "FLEETWATCH_OSASCRIPT": py("osascript", self.log, self.fail, "--"),
-            "FLEETWATCH_TTY_CMD": py("show", self.ttys),
-            "FLEETWATCH_FG_CMD": py("show", self.fg)})
+            "FLEETWATCH_OSASCRIPT": py("osascript", self.log, self.fail, self.then, "--"),
+            "FLEETWATCH_FG_CMD": py("show", self.fg, "-t")})
         self.env.start()
+        self.settle = mock.patch.object(send, "SETTLE_S", 0)
+        self.settle.start()
 
     def stop(self):
+        self.settle.stop()
         self.env.stop()
 
-    def registry(self, status="idle", pid=None, session=SID, name="Alpha"):
-        with open(os.path.join(self.sessions, "r.json"), "w") as fh:
-            json.dump({"name": name, "sessionId": session, "pid": pid or self.pid, "kind": "interactive",
-                       "cwd": "/x", "status": status, "statusUpdatedAt": 1, "updatedAt": 1}, fh)
+    def registry_row(self, status="idle", pid=None, session=SID, name="Alpha"):
+        return json.dumps({"name": name, "sessionId": session, "pid": pid or self.pid, "kind": "interactive",
+                           "cwd": "/x", "status": status, "statusUpdatedAt": 1, "updatedAt": 1})
 
-    def map_tty(self, pid, tty):
-        with open(self.ttys, "w") as fh:
-            fh.write("%d %s\n" % (pid, tty[len("/dev/"):]))
+    def registry(self, fname="r.json", **row):
+        with open(os.path.join(self.sessions, fname), "w") as fh:
+            fh.write(self.registry_row(**row))
 
-    def foreground(self, row):
+    def foreground(self, rows, tty=None):
         with open(self.fg, "w") as fh:
-            fh.write(row + "\n")
+            fh.write(rows + "\n")
+        with open(self.fg + ".tty", "w") as fh:
+            fh.write((tty or self.tty_path)[len("/dev/"):])
+
+    def agents(self, rows):
+        with open(self.agents_file, "w") as fh:
+            json.dump(rows, fh)
+
+    def after_first_call(self, changes):
+        """Files to rewrite once the first osascript call (the typing) has run."""
+        with open(self.then, "w") as fh:
+            json.dump(changes, fh)
 
     def calls(self):
         if not os.path.exists(self.log):
@@ -81,40 +105,53 @@ class Deliver(unittest.TestCase):
         self.addCleanup(self.rig.stop)
         self.addCleanup(self.tmp.cleanup)
 
-    def go(self, text="please move that to-do to tomorrow"):
-        return send.deliver("Alpha", PID, SID, "/dev/ttys007", text, self.rig.sessions)
+    def go(self, text="please move that to-do to tomorrow", sid_=SID, tty="/dev/ttys007"):
+        return send.deliver("Alpha", PID, sid_, tty, text, self.rig.paths)
 
-    def refused(self, text="hello", containing=None):
-        ok, reason = self.go(text)
+    def sent(self, text="please move that to-do to tomorrow", **kw):
+        ok, reason = self.go(text, **kw)
+        self.assertTrue(ok, reason)
+        calls = self.rig.calls()
+        self.assertEqual(len(calls), 2, calls)
+        os.remove(self.rig.log)
+        return calls
+
+    def refused(self, text="hello", containing=None, **kw):
+        ok, reason = self.go(text, **kw)
         self.assertFalse(ok, reason)
         self.assertEqual(self.rig.calls(), [], "nothing may reach osascript")
         if containing:
             self.assertIn(containing, reason)
         return reason
 
-    def test_a_clean_send_calls_osascript_once_with_the_tty_and_text(self):
-        ok, reason = self.go("Reply with the single word pong.")
-        self.assertTrue(ok, reason)
-        calls = self.rig.calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["argv"], ["-", "/dev/ttys007", "Reply with the single word pong."])
-        self.assertEqual(calls[0]["script"], iterm.ITERM_SEND_SCRIPT)
+    def test_a_clean_send_types_the_text_then_sends_the_return(self):
+        typed, submitted = self.sent("Reply with the single word pong.")
+        self.assertEqual(typed["argv"], ["-", "/dev/ttys007", "Reply with the single word pong."])
+        self.assertEqual(typed["script"], iterm.ITERM_TYPE_SCRIPT)
+        self.assertEqual(submitted["argv"], ["-", "/dev/ttys007"])
+        self.assertEqual(submitted["script"], iterm.ITERM_SUBMIT_SCRIPT)
 
     def test_hostile_text_reaches_osascript_only_as_an_argument(self):
-        ok, reason = self.go(HOSTILE)
-        self.assertTrue(ok, reason)
-        (call,) = self.rig.calls()
-        self.assertEqual(call["argv"], ["-", "/dev/ttys007", HOSTILE])
-        self.assertEqual(call["script"], iterm.ITERM_SEND_SCRIPT)
-        self.assertNotIn("touch /tmp/never", call["script"])
+        typed, submitted = self.sent(HOSTILE)
+        self.assertEqual(typed["argv"], ["-", "/dev/ttys007", HOSTILE])
+        for call in (typed, submitted):
+            self.assertIn(call["script"], iterm.SEND_SCRIPTS)
+            self.assertNotIn("touch /tmp/never", call["script"])
+        self.assertNotIn(HOSTILE, submitted["argv"])
 
-    def test_the_script_is_constant_and_does_not_steal_focus(self):
-        script = iterm.ITERM_SEND_SCRIPT
-        self.assertNotIn("%", script)
-        for word in ("activate", "select ", "create window", "create tab", "launch"):
-            self.assertNotIn(word, script)
-        self.assertIn("write text msg newline no", script)
-        self.assertIn("(ASCII character 13) newline no", script)
+    def test_the_scripts_are_constant_and_do_not_steal_focus(self):
+        self.assertEqual(len(iterm.SEND_SCRIPTS), 2)
+        for script in iterm.SEND_SCRIPTS:
+            with self.subTest(script=script[-120:]):
+                self.assertNotIn("%", script)
+                for word in ("activate", "select ", "create window", "create tab", "launch"):
+                    self.assertNotIn(word, script)
+                self.assertIn("newline no", script)
+                self.assertEqual(script.count("tty of sessions of tabs of windows"), 1, "one bulk read")
+                self.assertIn("if (tty of found) is not target then error", script)
+        self.assertIn("write text (item 2 of argv) newline no", iterm.ITERM_TYPE_SCRIPT)
+        self.assertIn("(ASCII character 13) newline no", iterm.ITERM_SUBMIT_SCRIPT)
+        self.assertNotIn("item 2 of argv", iterm.ITERM_SUBMIT_SCRIPT)
 
     def test_a_session_at_a_prompt_is_refused_whichever_word_the_registry_uses(self):
         for status in ("blocked", "waiting"):
@@ -124,7 +161,38 @@ class Deliver(unittest.TestCase):
     def test_working_and_idle_sessions_are_sent_to(self):
         for status in ("idle", "busy", "shell"):
             self.rig.registry(status=status)
-            self.assertTrue(self.go()[0], status)
+            self.sent()
+
+    def test_a_state_that_is_missing_or_not_known_to_be_safe_is_refused(self):
+        for status in (None, "", "compacting", "unknown"):
+            with self.subTest(status=status):
+                self.rig.registry(status=status)
+                self.refused(containing="cannot tell whether Alpha is at a prompt")
+
+    def test_a_missing_registry_status_falls_back_to_the_agents_state(self):
+        self.rig.registry(status=None)
+        self.rig.agents([{"name": "Alpha", "sessionId": SID, "state": "waiting"}])
+        self.refused(containing="is at a prompt")
+        self.rig.agents([{"name": "Alpha", "sessionId": OTHER_SID, "state": "idle"},
+                         {"name": "Alpha", "sessionId": SID, "status": "idle"}])
+        self.sent()
+
+    def test_the_registry_status_wins_over_the_agents_state(self):
+        self.rig.registry(status="blocked")
+        self.rig.agents([{"name": "Alpha", "sessionId": SID, "state": "idle"}])
+        self.refused(containing="is at a prompt")
+
+    def test_two_rows_on_one_pid_without_ids_take_the_last_and_any_prompt_refuses(self):
+        self.rig.registry("a.json", status="idle", session=None)
+        self.rig.registry("b.json", status="blocked", session=None)
+        os.remove(os.path.join(self.rig.sessions, "r.json"))
+        self.refused(containing="is at a prompt", sid_=None)
+        self.rig.registry("b.json", status="busy", session=None)
+        self.sent(sid_=None)
+
+    def test_another_sessions_row_on_the_same_pid_at_a_prompt_refuses(self):
+        self.rig.registry("z.json", status="waiting", session=OTHER_SID)
+        self.refused(containing="is at a prompt")
 
     def test_a_terminal_running_something_else_is_refused_and_named(self):
         for row, shown in (("4242 4242 4242 S+ /bin/zsh", "zsh"), ("4242 4242 4242 S+ -zsh", "zsh"),
@@ -135,55 +203,120 @@ class Deliver(unittest.TestCase):
             reason = self.refused(containing="not Claude Code")
             self.assertIn("running " + shown, reason)
 
+    def test_an_editor_or_pager_claude_started_is_refused_and_named(self):
+        for member, shown in (("vim", "vim"), ("/usr/bin/nvim", "nvim"), ("nvim --embed", "nvim"),
+                              ("/usr/bin/less -R", "less"), ("man", "man"), ("nano", "nano")):
+            with self.subTest(member=member):
+                self.rig.foreground(claude_rows(PID, "caffeinate", member))
+                self.assertEqual(self.refused(containing="finish there first"),
+                                 "Alpha is in %s; finish there first" % shown)
+
+    def test_the_editor_named_in_the_environment_is_refused(self):
+        self.rig.foreground(claude_rows(PID, "/opt/bin/myedit"))
+        self.sent()
+        for var in ("EDITOR", "VISUAL"):
+            with self.subTest(var=var), mock.patch.dict(os.environ, {var: "/opt/bin/myedit --wait"}):
+                self.refused(containing="Alpha is in myedit")
+
+    def test_a_login_shell_in_the_group_is_refused(self):
+        self.rig.foreground(claude_rows(PID, "-bash"))
+        self.assertEqual(self.refused(), "Alpha is in bash; finish there first")
+
+    def test_helpers_in_the_group_do_not_refuse(self):
+        self.rig.foreground(claude_rows(PID, "caffeinate", "/opt/tools/venv/bin/python", "node",
+                                        "npm exec @scope/mcp@latest", "/bin/bash", "bash", "/bin/zsh"))
+        self.sent()
+
+    def test_an_editor_outside_the_foreground_group_does_not_refuse(self):
+        self.rig.foreground(claude_rows(PID) + "\n5000 5000 %d Ss vim" % PID)
+        self.sent()
+
+    def test_a_stopped_or_exited_claude_is_refused(self):
+        for stat, why in (("T+", "is stopped"), ("Z+", "has exited")):
+            self.rig.foreground("4242 4242 4242 %s claude" % stat)
+            self.refused(containing="Alpha's Claude Code " + why)
+
     def test_a_foreground_group_led_by_another_claude_is_refused(self):
-        self.rig.foreground("9999 9999 9999 S+ claude")
+        self.rig.foreground("4242 4242 9999 S claude\n9999 9999 9999 S+ claude")
         self.refused(containing="another Claude Code")
 
     def test_a_claude_path_is_accepted(self):
         self.rig.foreground("4242 4242 4242 Ss+ /home/someone/.local/bin/claude")
-        self.assertTrue(self.go()[0])
+        self.sent()
 
     def test_no_foreground_group_is_refused(self):
         self.rig.foreground("4242 4242 0 S 4242")
         self.refused(containing="nothing is running in the foreground")
 
-    def test_a_terminal_that_changed_hands_is_refused(self):
-        self.rig.map_tty(PID, "/dev/ttys009")
+    def test_a_session_that_left_the_terminal_is_refused(self):
+        self.rig.foreground("5555 5555 5555 S+ claude")
         self.refused(containing="no longer on that terminal")
 
-    def test_a_session_that_left_the_terminal_is_refused(self):
-        self.rig.map_tty(PID + 1, "/dev/ttys007")
+    def test_the_terminal_read_names_the_tty(self):
+        self.rig.foreground(claude_rows(PID), tty="/dev/ttys009")
         self.refused(containing="no longer on that terminal")
 
     def test_a_registry_row_for_another_session_is_refused(self):
-        self.rig.registry(session="bb22cc33-0000-4000-8000-0000000000bb")
+        self.rig.registry(session=OTHER_SID)
         self.refused(containing="no longer registered")
 
     def test_a_missing_registry_row_is_refused(self):
         os.remove(os.path.join(self.rig.sessions, "r.json"))
         self.refused(containing="no longer registered")
 
+    def test_the_terminal_is_checked_before_the_prompt_state(self):
+        self.rig.foreground("4242 4242 4242 S+ /bin/zsh")
+        self.rig.registry(status="blocked")
+        self.refused(containing="running zsh")
+
+    def test_a_prompt_that_opens_while_the_text_is_typed_stops_the_return(self):
+        self.rig.after_first_call({os.path.join(self.rig.sessions, "r.json"): self.rig.registry_row(status="waiting")})
+        ok, reason = self.go("yes")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "typed but not submitted: Alpha is at a prompt; answer it in its tab; check its tab")
+        self.assertEqual([c["script"] for c in self.rig.calls()], [iterm.ITERM_TYPE_SCRIPT])
+
+    def test_an_editor_that_opens_while_the_text_is_typed_stops_the_return(self):
+        self.rig.after_first_call({self.rig.fg: claude_rows(PID, "vim") + "\n"})
+        ok, reason = self.go("yes")
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith(send.TYPED + ": Alpha is in vim"), reason)
+        self.assertEqual(len(self.rig.calls()), 1)
+
+    def test_a_failed_return_says_the_text_was_typed(self):
+        self.rig.after_first_call({self.rig.fail: "0:20: execution error: no iTerm2 session on that terminal (-2700)\n"})
+        ok, reason = self.go("yes")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "typed but not submitted: no iTerm2 session on that terminal (-2700); check its tab")
+        self.assertEqual(len(self.rig.calls()), 2)
+
     def test_iterm_not_running_is_refused_with_its_reason(self):
         with open(self.rig.fail, "w") as fh:
             fh.write("0:20: execution error: iTerm2 is not running (-2700)\n")
         ok, reason = self.go()
         self.assertFalse(ok)
-        self.assertIn("iTerm2 is not running", reason)
+        self.assertEqual(reason, "iTerm2 is not running (-2700)")
+        self.assertEqual(len(self.rig.calls()), 1, "no return after a failed typing")
 
-    def test_no_iterm_session_on_the_terminal_is_refused_with_its_reason(self):
-        with open(self.rig.fail, "w") as fh:
-            fh.write("0:20: execution error: no iTerm2 session on that terminal (-2700)\n")
-        ok, reason = self.go()
+    def test_a_timeout_never_quotes_the_command_line(self):
+        def slow(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 10)
+        with mock.patch.object(iterm.subprocess, "run", slow):
+            ok, reason = iterm.type_into_tty("/dev/ttys007", "the secret plan")
         self.assertFalse(ok)
-        self.assertIn("no iTerm2 session", reason)
+        self.assertEqual(reason, "timed out talking to iTerm2")
 
     def test_a_tty_that_is_not_a_terminal_device_never_reaches_osascript(self):
-        ok, reason = iterm.send_to_tty("/dev/ttys1; rm -rf", "hi")
-        self.assertFalse(ok)
+        for call in (lambda: iterm.type_into_tty("/dev/ttys1; rm -rf", "hi"),
+                     lambda: iterm.submit_tty("/dev/ttys1; rm -rf"),
+                     lambda: self.go(tty="/dev/ttys1; rm -rf")):
+            ok, reason = call()
+            self.assertFalse(ok)
+            self.assertEqual(reason, "not a terminal device")
         self.assertEqual(self.rig.calls(), [])
 
     def test_text_that_may_not_be_sent(self):
-        cases = {"": "type a message first", "   ": "type a message first",
+        cases = {"": "type a message first", "   ": "type a message first", "  \t ": "one line only",
                  "two\nlines": "one line only", "a\rb": "one line only", "a\tb": "one line only",
                  "esc\x1b[201~": "one line only", "del\x7f": "one line only", "next\x85line": "one line only",
                  "sep x": "one line only", "para x": "one line only",
@@ -193,96 +326,143 @@ class Deliver(unittest.TestCase):
                 self.refused(text, containing=why)
 
     def test_the_limit_itself_is_allowed(self):
-        self.assertTrue(self.go("x" * send.MAX_LEN)[0])
+        self.sent("x" * send.MAX_LEN)
 
     def test_accented_and_wide_text_is_allowed(self):
-        self.assertTrue(self.go("déjà vu 日本語 🙂")[0])
-        self.assertEqual(self.rig.calls()[0]["argv"][2], "déjà vu 日本語 🙂")
+        self.assertEqual(self.sent("déjà vu 日本語 🙂")[0]["argv"][2], "déjà vu 日本語 🙂")
 
 
-class Foreground(unittest.TestCase):
+class Terminal(unittest.TestCase):
     PS_CLAUDE = """ 37482 46022 46022 S+   caffeinate
  45743 45743 46022 Ss   /opt/homebrew/bin/bash
  46022 46022 46022 R+   claude
  46119 46022 46022 S+   /opt/tools/venv/bin/python
+ 46120 46022 46022 S+   vim
 """
     PS_SHELL_AFTER_CLAUDE = """ 45743 45743 45743 Ss+  /opt/homebrew/bin/bash
+ 46022 46022 45743 T    claude
 """
     PS_SPACES = " 700 700 700 S+ /Applications/My App.app/Contents/MacOS/claude\n"
 
-    def test_the_leader_of_the_foreground_group_is_the_foreground_process(self):
-        self.assertEqual(send.parse_foreground(self.PS_CLAUDE), (46022, "claude"))
+    def test_the_leader_and_the_other_members_of_the_foreground_group(self):
+        term = send.parse_terminal(self.PS_CLAUDE)
+        self.assertEqual(term["pids"], {37482, 45743, 46022, 46119, 46120})
+        fg = term["fg"]
+        self.assertEqual((fg["leader"], fg["stat"], fg["command"]), (46022, "R+", "claude"))
+        self.assertEqual(fg["members"], [(37482, "caffeinate"), (46119, "/opt/tools/venv/bin/python"),
+                                         (46120, "vim")])
+        self.assertEqual(send.interactive_member(fg["members"]), "vim")
 
     def test_a_shell_at_its_prompt(self):
-        self.assertEqual(send.parse_foreground(self.PS_SHELL_AFTER_CLAUDE), (45743, "/opt/homebrew/bin/bash"))
+        fg = send.parse_terminal(self.PS_SHELL_AFTER_CLAUDE)["fg"]
+        self.assertEqual((fg["leader"], fg["command"], fg["members"]), (45743, "/opt/homebrew/bin/bash", []))
 
     def test_a_command_with_spaces_stays_whole(self):
-        self.assertEqual(send.parse_foreground(self.PS_SPACES)[1], "/Applications/My App.app/Contents/MacOS/claude")
+        fg = send.parse_terminal(self.PS_SPACES)["fg"]
+        self.assertEqual(fg["command"], "/Applications/My App.app/Contents/MacOS/claude")
 
     def test_nothing_in_the_foreground(self):
-        self.assertIsNone(send.parse_foreground(""))
-        self.assertIsNone(send.parse_foreground(" 12 12 0 Ss bash\n"))
-        self.assertIsNone(send.parse_foreground("garbage\n"))
+        self.assertIsNone(send.parse_terminal("")["fg"])
+        self.assertIsNone(send.parse_terminal(" 12 12 0 Ss bash\n")["fg"])
+        self.assertIsNone(send.parse_terminal("garbage\n")["fg"])
+        self.assertEqual(send.parse_terminal(" 12 12 0 Ss bash\n")["pids"], {12})
+
+
+def all_nodes(nodes):
+    for n in nodes:
+        yield n
+        yield from all_nodes(n.children)
 
 
 class Board(AppWorld):
     """`t` on the board, with the same fake commands under it."""
 
+    TTY2, TTY3 = "/dev/ttys098", "/dev/ttys097"
+
     def setUp(self):
         super().setUp()
+        self.extra_ttys = {}
         self.rig = Rig()
         self.rig.start(self.root, standin.PARENT_PID, TTY)
         os.remove(os.path.join(self.rig.sessions, "r.json"))     # the board's own registry row stands in
         self.s = sid()
         self.reg("Live One", self.s, pid=standin.PARENT_PID, cwd=self.folder)
-        d = data.datetime.fromtimestamp(standin.NOW, data.LOCAL_TZ).date()
-        with open(os.path.join(self.paths["status"], "live.json"), "w") as fh:
-            json.dump({"session": "Live One", "sessionId": self.s, "updated": standin.iso(-60),
-                       "upcoming": [{"what": "send the form", "due": (d - timedelta(days=1)).isoformat(),
-                                     "yours": True}]}, fh)
+        self.due = (data.datetime.fromtimestamp(standin.NOW, data.LOCAL_TZ).date() - timedelta(days=1)).isoformat()
+        self.status_file("live.json", "Live One", self.s)
         self.addCleanup(self.rig.stop)
 
-    def reg_status(self, status):
-        path = os.path.join(self.paths["sessions"], "%s.json" % self.s)
+    def status_file(self, fname, name, session, what="send the form"):
+        with open(os.path.join(self.paths["status"], fname), "w") as fh:
+            json.dump({"session": name, "sessionId": session, "updated": standin.iso(-60),
+                       "upcoming": [{"what": what, "due": self.due, "yours": True}]}, fh)
+
+    def snapshot(self):
+        snap = super().snapshot()
+        snap.jump["ttys"].update(self.extra_ttys)
+        snap.jump["iterm"] |= set(self.extra_ttys.values())
+        return snap
+
+    def reg_status(self, status, session=None):
+        path = os.path.join(self.paths["sessions"], "%s.json" % (session or self.s))
         with open(path) as fh:
             row = json.load(fh)
         row["status"] = status
         with open(path, "w") as fh:
             json.dump(row, fh)
 
-    def drive_needs(self, body):
+    def drive_tab(self, key, body):
         async def go():
             app = self.app()
             async with app.run_test(size=(120, 30)) as pilot:
                 await boot(app, pilot)
                 await settle(pilot, lambda: app.resume_data is not None, "the resume data to load")
-                await pilot.press("1")
-                await settle(pilot, lambda: app.active == 0, "the needs tab")
+                await pilot.press(key)
+                await settle(pilot, lambda: app.active == int(key) - 1, "tab " + key)
                 await body(app, pilot)
         asyncio.run(go())
+
+    def drive_needs(self, body):
+        self.drive_tab("1", body)
 
     def screen_name(self, app):
         return type(app.screen).__name__
 
-    def test_t_types_a_message_and_enter_sends_it(self):
-        async def body(app, pilot):
+    def box_texts(self, app):
+        return [str(w.render()) for w in app.screen.query(Static)]
+
+    def problem(self, app):
+        return str(app.screen.query_one("#problem").render())
+
+    async def open_box(self, app, pilot, node=None):
+        if node is None:
             await pilot.press("t")
             await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
-            title = [str(w.render()) for w in app.screen.query(Static)]
+            return
+        with mock.patch.object(app.current, "current", return_value=node):
+            await pilot.press("t")
+            await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
+
+    async def send_text(self, app, pilot, text):
+        await pilot.press(*text)
+        await pilot.press("enter")
+
+    def test_t_types_a_message_and_enter_sends_it(self):
+        async def body(app, pilot):
+            await self.open_box(app, pilot)
+            title = self.box_texts(app)
             self.assertIn("Tell Live One", title[0])
             self.assertIn(self.folder.split(os.sep)[-1], title[1])
-            await pilot.press(*"hello there")
-            await pilot.press("enter")
+            await self.send_text(app, pilot, "hello there")
             await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
             self.assertNotEqual(self.screen_name(app), "SendScreen")
         self.drive_needs(body)
-        (call,) = self.rig.calls()
-        self.assertEqual(call["argv"], ["-", TTY, "hello there"])
+        typed, submitted = self.rig.calls()
+        self.assertEqual(typed["argv"], ["-", TTY, "hello there"])
+        self.assertEqual(submitted["argv"], ["-", TTY])
 
     def test_esc_cancels_and_sends_nothing(self):
         async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen")
+            await self.open_box(app, pilot)
             await pilot.press(*"never sent")
             await pilot.press("escape")
             await settle(pilot, lambda: self.screen_name(app) != "SendScreen")
@@ -292,10 +472,9 @@ class Board(AppWorld):
 
     def test_an_empty_message_is_refused_in_the_box(self):
         async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen")
+            await self.open_box(app, pilot)
             await pilot.press("enter")
-            await settle(pilot, lambda: "type a message first" in str(app.screen.query_one("#problem").render()))
+            await settle(pilot, lambda: "type a message first" in self.problem(app))
             self.assertEqual(self.screen_name(app), "SendScreen")
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
@@ -304,11 +483,9 @@ class Board(AppWorld):
         self.rig.foreground("%d %d %d S+ /bin/zsh" % ((standin.PARENT_PID,) * 3))
 
         async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen")
-            await pilot.press(*"rm everything")
-            await pilot.press("enter")
-            await settle(pilot, lambda: "running zsh, not Claude Code" in str(app.screen.query_one("#problem").render()))
+            await self.open_box(app, pilot)
+            await self.send_text(app, pilot, "rm everything")
+            await settle(pilot, lambda: "running zsh, not Claude Code" in self.problem(app))
             self.assertEqual(self.screen_name(app), "SendScreen")
             self.assertEqual(app.screen.query_one("#message", Input).value, "rm everything")
             self.assertNotIn("sent to", app.status_text or "")
@@ -317,27 +494,77 @@ class Board(AppWorld):
 
     def test_a_session_that_went_to_a_prompt_after_the_last_refresh_is_refused(self):
         async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen")
+            await self.open_box(app, pilot)
             self.reg_status("blocked")     # the board's snapshot still says idle
-            await pilot.press(*"yes")
-            await pilot.press("enter")
-            await settle(pilot, lambda: "is at a prompt; answer it in its tab" in str(
-                app.screen.query_one("#problem").render()))
+            await self.send_text(app, pilot, "yes")
+            await settle(pilot, lambda: "is at a prompt; answer it in its tab" in self.problem(app))
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
 
+    def test_typed_but_not_submitted_clears_the_box_and_says_so(self):
+        path = os.path.join(self.paths["sessions"], "%s.json" % self.s)
+        with open(path) as fh:
+            row = json.load(fh)
+        self.rig.after_first_call({path: json.dumps(dict(row, status="waiting"))})
+
+        async def body(app, pilot):
+            await self.open_box(app, pilot)
+            await self.send_text(app, pilot, "yes")
+            await settle(pilot, lambda: "typed but not submitted" in self.problem(app))
+            self.assertIn("check its tab", self.problem(app))
+            self.assertEqual(app.screen.query_one("#message", Input).value, "")
+            self.assertFalse(app.screen.sending)
+        self.drive_needs(body)
+        self.assertEqual(len(self.rig.calls()), 1)
+
     def test_a_pasted_line_break_is_refused_not_trimmed(self):
         async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen")
+            await self.open_box(app, pilot)
             box = app.screen.query_one("#message", Input)
-            box.post_message(events.Paste("first line\nsecond line"))
-            await settle(pilot, lambda: "one line only" in str(app.screen.query_one("#problem").render()))
-            self.assertEqual(box.value, "")
-            box.post_message(events.Paste("one clean line"))
-            await settle(pilot, lambda: box.value == "one clean line", "the clean paste")
+            await pilot.press(*"typed")
+            box.post_message(events.Paste("  \n"))
+            await settle(pilot, lambda: "one line only" in self.problem(app))
+            self.assertEqual(box.value, "typed")
+            box.post_message(events.Paste(" one clean line"))
+            await settle(pilot, lambda: box.value == "typed one clean line", "the clean paste")
         self.drive_needs(body)
+
+    def test_esc_and_a_second_enter_wait_while_a_send_is_in_flight(self):
+        release, calls = threading.Event(), []
+
+        def slow(name, pid, sid_, tty, text, paths):
+            calls.append(text)
+            release.wait(10)
+            return True, ""
+
+        async def body(app, pilot):
+            await self.open_box(app, pilot)
+            await self.send_text(app, pilot, "once")
+            await settle(pilot, lambda: calls and "sending" in self.problem(app), "the send to start")
+            await pilot.press("escape")
+            await pilot.press("enter")
+            await pilot.pause(0.2)   # asserts a non-event: nothing signals that the box ignored the keys
+            self.assertEqual(self.screen_name(app), "SendScreen")
+            self.assertEqual(calls, ["once"])
+            release.set()
+            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+        with mock.patch.object(send, "deliver", slow):
+            self.drive_needs(body)
+
+    def test_an_error_while_sending_unlocks_the_box_without_quoting_the_text(self):
+        def broken(*args):
+            raise RuntimeError("osascript - /dev/ttys099 the secret plan")
+
+        async def body(app, pilot):
+            await self.open_box(app, pilot)
+            await self.send_text(app, pilot, "the secret plan")
+            await settle(pilot, lambda: "could not send" in self.problem(app))
+            self.assertNotIn("secret", self.problem(app))
+            self.assertFalse(app.screen.sending)
+            await pilot.press("escape")
+            await settle(pilot, lambda: self.screen_name(app) != "SendScreen", "Esc to close the box")
+        with mock.patch.object(send, "deliver", broken):
+            self.drive_needs(body)
 
     def test_the_demo_only_says_what_t_would_do(self):
         async def body(app, pilot):
@@ -351,11 +578,7 @@ class Board(AppWorld):
     def test_t_on_a_session_that_ended_offers_the_reopen_not_a_box(self):
         os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
         s, _ = self.transcript("Live One")
-        with open(os.path.join(self.paths["status"], "live.json")) as fh:
-            row = json.load(fh)
-        row["sessionId"] = s
-        with open(os.path.join(self.paths["status"], "live.json"), "w") as fh:
-            json.dump(row, fh)
+        self.status_file("live.json", "Live One", s)
 
         async def body(app, pilot):
             await pilot.press("t")
@@ -364,9 +587,6 @@ class Board(AppWorld):
         self.assertEqual(self.rig.calls(), [])
 
     def test_t_on_a_session_outside_iterm_says_so(self):
-        with open(self.rig.ttys, "w") as fh:
-            fh.write("")
-
         async def body(app, pilot):
             app.snapshot.jump["iterm"] = set()
             await pilot.press("t")
@@ -376,9 +596,158 @@ class Board(AppWorld):
         self.assertEqual(self.rig.calls(), [])
 
     def test_help_and_binding_list_the_key(self):
-        from fleetwatch import app as fapp
         self.assertTrue(any(keys == "t" for keys, _ in fapp.HELP_KEYS))
         self.assertTrue(any(b.key == "t" and b.action == "tell" for b in fapp.FleetwatchApp.BINDINGS))
+
+    # Same-name sessions, pickers, helpers and the Resume tab.
+
+    def add_second(self, name, cwd_name, what="send the form"):
+        """A second live session on the test runner's parent process, in its own iTerm2 tab."""
+        other = sid()
+        folder = self.mkdir(cwd_name)
+        self.reg(name, other, pid=os.getppid(), cwd=folder)
+        self.status_file("second.json", name, other, what)
+        self.extra_ttys[os.getppid()] = self.TTY2
+        return other, folder
+
+    def aim_rig_at(self, pid, tty):
+        self.rig.pid, self.rig.tty_path = pid, tty
+        self.rig.foreground(claude_rows(pid), tty=tty)
+
+    def test_same_name_sessions_each_row_tells_its_own_session(self):
+        self.reg("Live One", self.s, pid=standin.PARENT_PID, cwd=self.folder)
+        self.status_file("live.json", "Live One", self.s, "first item")
+        other, folder = self.add_second("Live One", "elsewhere", "second item")
+
+        async def body(app, pilot):
+            rows = [n for n in all_nodes(app.lists[views.SESSIONS_TAB].nodes) if n.key == "ses:Live One"]
+            self.assertEqual(sorted(n.sid for n in rows), sorted([self.s, other]))
+            for node in rows:
+                mine = node.sid == other
+                self.aim_rig_at(os.getppid() if mine else standin.PARENT_PID, self.TTY2 if mine else TTY)
+                await self.open_box(app, pilot, node)
+                self.assertIn("elsewhere" if mine else "work", self.box_texts(app)[1])
+                await self.send_text(app, pilot, "for you")
+                await settle(pilot, lambda: self.screen_name(app) != "SendScreen", "the send")
+        self.drive_tab("3", body)
+        calls = self.rig.calls()
+        self.assertEqual(sorted(c["argv"][1] for c in calls[::2]), sorted([TTY, self.TTY2]))
+
+    def test_a_name_two_live_sessions_share_is_refused_when_only_the_name_is_known(self):
+        other, _ = self.add_second("Live One", "elsewhere")
+
+        async def body(app, pilot):
+            tty, reason, _n, _r = app.snapshot.target_record("Live One", unique=True)
+            self.assertIsNone(tty)
+            self.assertIn("more than one running session is named Live One", reason)
+            self.assertEqual(app.snapshot.target_record("Live One", sid=other, unique=True)[0], self.TTY2)
+        self.drive_needs(body)
+
+    def test_an_item_two_same_name_sessions_share_asks_with_the_folder(self):
+        other, _ = self.add_second("Live One", "elsewhere")
+        self.aim_rig_at(os.getppid(), self.TTY2)
+
+        async def body(app, pilot):
+            await pilot.press("2")
+            await settle(pilot, lambda: app.active == 1, "the to-dos tab")
+            item = next(n for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 2)
+            with mock.patch.object(app.current, "current", return_value=item):
+                await pilot.press("t")
+                await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
+            labels = app.screen.names
+            self.assertEqual(len(labels), 2)
+            self.assertTrue(any("elsewhere" in x for x in labels), labels)
+            await pilot.press(*(["down"] if "elsewhere" in labels[1] else []), "enter")
+            await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
+            self.assertIn("elsewhere", self.box_texts(app)[1])
+            await self.send_text(app, pilot, "picked")
+            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+        self.drive_needs(body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY2, "picked"])
+
+    def test_an_item_two_sessions_share_asks_which_one(self):
+        self.add_second("Other One", "elsewhere")
+        self.aim_rig_at(os.getppid(), self.TTY2)
+
+        async def body(app, pilot):
+            await pilot.press("2")
+            await settle(pilot, lambda: app.active == 1, "the to-dos tab")
+            item = next(n for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 2)
+            app.current.move_to(item.key)
+            await pilot.press("t")
+            await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
+            self.assertEqual(sorted(app.screen.names), ["Live One", "Other One"])
+            await pilot.press(*(["down"] if app.screen.names[1] == "Other One" else []), "enter")
+            await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
+            self.assertIn("Tell Other One", self.box_texts(app)[0])
+            await self.send_text(app, pilot, "picked")
+            await settle(pilot, lambda: "sent to Other One" in (app.status_text or ""), "the footer")
+        self.drive_needs(body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY2, "picked"])
+
+    def add_helper(self, own_tab):
+        h = sid()
+        self.reg("wt-send-helper", h, pid=standin.CHILD_PID, cwd=self.folder)
+        if own_tab:
+            self.extra_ttys[standin.CHILD_PID] = self.TTY3
+        return h
+
+    async def tell_helper(self, app, pilot):
+        app.current.set_open("ses:Live One", True)
+        await settle(pilot, lambda: "ses:Live One:k:wt-send-helper" in app.current._order, "the helper row")
+        app.current.move_to("ses:Live One:k:wt-send-helper")
+        await self.open_box(app, pilot)
+
+    def test_a_helper_row_tells_the_helper_in_its_own_tab(self):
+        self.add_helper(own_tab=True)
+        self.aim_rig_at(standin.CHILD_PID, self.TTY3)
+
+        async def body(app, pilot):
+            await self.tell_helper(app, pilot)
+            self.assertIn("Tell wt-send-helper", self.box_texts(app)[0])
+            await self.send_text(app, pilot, "helper")
+            await settle(pilot, lambda: "sent to wt-send-helper" in (app.status_text or ""), "the footer")
+        self.drive_tab("3", body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY3, "helper"])
+
+    def test_a_helper_without_a_tab_falls_back_to_its_parent(self):
+        self.add_helper(own_tab=False)
+
+        async def body(app, pilot):
+            await self.tell_helper(app, pilot)
+            self.assertIn("Tell Live One", self.box_texts(app)[0])
+            await self.send_text(app, pilot, "parent")
+            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+        self.drive_tab("3", body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "parent"])
+
+    def test_a_helper_name_two_live_helpers_share_is_refused(self):
+        self.add_helper(own_tab=True)
+        self.reg("wt-send-helper", sid(), pid=os.getppid(), cwd=self.folder)   # an unattached one
+
+        async def body(app, pilot):
+            tty, reason, _n, _r = app.snapshot.target_record(None, "wt-send-helper", unique=True)
+            self.assertIsNone(tty)
+            self.assertEqual(reason, "more than one running helper is named wt-send-helper")
+            self.assertEqual(app.snapshot.target_record(None, "wt-send-helper")[0], self.TTY3, "the jump is unchanged")
+        self.drive_needs(body)
+
+    def test_a_running_row_on_the_resume_tab_tells_that_session_by_its_id(self):
+        os.remove(os.path.join(self.paths["status"], "live.json"))
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        s, _ = self.transcript("Live Parked")
+        self.reg("Live Parked", s, pid=standin.PARENT_PID, cwd=self.folder)
+        park.park(s, "Live Parked", "note")
+
+        async def body(app, pilot):
+            await settle(pilot, lambda: app.current.current() is not None and app.current.current().resume == s,
+                         "the parked row")
+            await self.open_box(app, pilot)
+            self.assertIn("Tell Live Parked", self.box_texts(app)[0])
+            await self.send_text(app, pilot, "from resume")
+            await settle(pilot, lambda: "sent to Live Parked" in (app.status_text or ""), "the footer")
+        self.drive_tab("4", body)
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "from resume"])
 
 
 if __name__ == "__main__":
