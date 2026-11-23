@@ -161,6 +161,8 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(prof["Command"].startswith("/bin/zsh -ilc "))
         self.assertIn("fleetwatch", prof["Command"])
         self.assertNotIn("/opt/homebrew/bin/bash", prof["Command"])
+        # No inherited triggers: iTerm2's Claude Code integration toggles its toolbar through them.
+        self.assertEqual(prof["Triggers"], [])
 
     def test_command_uses_the_login_shell_and_the_running_entry(self):
         cmd = overlay.command("/bin/fish", ["/opt/x y/fleetwatch"])

@@ -455,10 +455,11 @@ class ClaudeWorkflowTests(unittest.TestCase):
         self.assertEqual(gate["env"]["REVIEW_COMMENT_ID"], "${{ needs.verdict-extract.outputs.review_id }}")
         self.assertEqual(gate["env"]["REVIEW_ATTEMPT"], "${{ needs.claude-review.outputs.review_attempt }}")
 
-    def test_didakt_refusal_and_extractor_retry_remain_available(self):
-        if os.path.basename(WF) != "didakt":
-            self.skipTest("didakt-specific recovery steps")
+    def test_a_review_refusal_step_and_extractor_retry_remain_available(self):
         jobs = load("claude-code-review.yml")["jobs"]
+        names = [s.get("name") for s in jobs["claude-review"].get("steps", [])]
+        if "Refuse a review that never ran" not in names:
+            self.skipTest("this repo has no review-refusal step")
         refusal = step_by_name(jobs["claude-review"], "Refuse a review that never ran")
         self.assertIn("EXECUTION_FILE", refusal["env"])
         self.assertIn("total_cost_usd", refusal["run"])
@@ -1200,7 +1201,7 @@ class GateStepTests(unittest.TestCase):
         r, _ = self.fetch([bot_comment(1111, "## Review\nNo findings.")], [bot_comment(12345, "## Review")])
         self.assertNotEqual(r.returncode, 0)
 
-    def test_the_didakt_early_end_comment_is_refused(self):
+    def test_a_review_that_ended_after_its_checklist_is_refused(self):
         fallback = ("**Claude finished task** [View job](https://github.com/o/r/actions/runs/1234)\n\n"
                     "### Reviewing PR\n- [x] Read the split diff index (6 parts)\n"
                     "- [ ] Review the changed source, in progress\n- [ ] Post the findings\n"
