@@ -111,7 +111,7 @@ class Deliver(unittest.TestCase):
     def test_the_script_is_constant_and_does_not_steal_focus(self):
         script = iterm.ITERM_SEND_SCRIPT
         self.assertNotIn("%", script)
-        for word in ("activate", "select "):
+        for word in ("activate", "select ", "create window", "create tab", "launch"):
             self.assertNotIn(word, script)
         self.assertIn("write text msg newline no", script)
         self.assertIn("(ASCII character 13) newline no", script)
