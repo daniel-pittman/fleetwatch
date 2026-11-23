@@ -1,4 +1,4 @@
-"""fleetwatch iTerm2 tab map and jump. The tty reaches AppleScript as argv only."""
+"""fleetwatch iTerm2 tab map, jump and send. The tty and the message reach AppleScript as argv only."""
 import os
 import re
 import shlex
@@ -37,6 +37,33 @@ ITERM_JUMP_SCRIPT = """on run argv
                         select t
                         select s
                         activate
+                        return "ok"
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    error "no iTerm2 session on that terminal"
+end run
+"""
+
+# The tty is argv item 1 and the message item 2, never in the script text: the message is untrusted
+# text that may hold quotes, backslashes or AppleScript source. The text goes in with `newline no` and the
+# return as a second write: Claude Code reads one `write text` as a paste, and the return that ends a paste
+# lands inside the input box instead of submitting it. The delay lets the paste finish before the return
+# arrives. The tab is neither selected nor activated, so the board keeps focus.
+ITERM_SEND_SCRIPT = """on run argv
+    set target to item 1 of argv
+    set msg to item 2 of argv
+    if application "iTerm2" is not running then error "iTerm2 is not running"
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if (tty of s) is target then
+                        tell s to write text msg newline no
+                        delay 0.2
+                        tell s to write text (ASCII character 13) newline no
                         return "ok"
                     end if
                 end repeat
@@ -110,6 +137,15 @@ def jump_to_tty(tty):
     if not valid_tty(tty):
         return False, "not a terminal device"
     ok, out = osascript(ITERM_JUMP_SCRIPT, [tty])
+    return (True, "") if ok else (False, out)
+
+
+def send_to_tty(tty, text):
+    """(ok, reason). Types text and a return into the iTerm2 session on tty. The caller has already
+    checked what is running there (see send.py); this only delivers."""
+    if not valid_tty(tty):
+        return False, "not a terminal device"
+    ok, out = osascript(ITERM_SEND_SCRIPT, [tty, text])
     return (True, "") if ok else (False, out)
 
 

@@ -19,7 +19,7 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, holds, index_health, iterm, park, prune, radar, resume, views, watches
+from . import config, data, find, holds, index_health, iterm, park, prune, radar, resume, send, views, watches
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
@@ -43,6 +43,9 @@ HELP_KEYS = [
     ("up/down, j/k", "move the cursor; PgUp/PgDn and the wheel scroll"),
     ("Enter, g", "jump to the row's session in iTerm2 (helpers: their own tab, else the parent's); on a "
                  "section header, fold it; on a row tagged 'not running', offer to reopen it"),
+    ("t", "tell: type a message into the highlighted session's Claude Code prompt in iTerm2 (one line, "
+          "2,000 characters at most); refused when the session is at a prompt or its tab is not running "
+          "Claude Code"),
     ("click", "select the row; click a tab to switch to it; click the ▸ or ▾ arrow to fold"),
     ("double click", "jump like Enter"),
     ("/", "find a row on this tab by part of its text; Enter does what Enter does on that row"),
@@ -211,17 +214,24 @@ class Snapshot:
         """(tty, None) for a running session on the Resume tab, by ID since names can repeat."""
         return self._tty(self.held.get(sid), name)
 
-    def target(self, session, helper=None):
-        """(tty, None, name raised) or (None, reason, None). A helper's own tab comes first,
-        then its parent session's."""
+    def target_record(self, session, helper=None):
+        """(tty, None, name raised, its record) or (None, reason, None, None). A helper's own tab comes
+        first, then its parent session's."""
         if helper:
-            tty, reason = self._tty(self.helpers.get(helper), helper)
+            rec = self.helpers.get(helper)
+            tty, reason = self._tty(rec, helper)
             if tty is not None:
-                return tty, None, helper
+                return tty, None, helper, rec
             if not session:
-                return None, reason, None
-        tty, reason = self._tty(self.records.get(session), session)
-        return (tty, None, session) if tty is not None else (None, reason, None)
+                return None, reason, None, None
+        rec = self.records.get(session)
+        tty, reason = self._tty(rec, session)
+        return (tty, None, session, rec) if tty is not None else (None, reason, None, None)
+
+    def target(self, session, helper=None):
+        """(tty, None, name raised) or (None, reason, None)."""
+        tty, reason, name, _ = self.target_record(session, helper)
+        return tty, reason, name
 
 
 def gather(paths, window_s, horizon):
@@ -980,13 +990,13 @@ class SessionPicker(ModalScreen):
     """
     BINDINGS = [Binding("escape", "cancel", show=False)]
 
-    def __init__(self, names):
+    def __init__(self, names, title="Go to which session?"):
         super().__init__()
-        self.names = names
+        self.names, self.title_text = names, title
 
     def compose(self):
         with Vertical(id="picker"):
-            yield Static(Text("Go to which session?", style="bold", no_wrap=True))
+            yield Static(Text(self.title_text, style="bold", no_wrap=True))
             yield OptionList(*[Option(Text(n, no_wrap=True, overflow="ellipsis"), id="s:%d" % i)
                                for i, n in enumerate(self.names)], id="choices")
 
@@ -999,6 +1009,78 @@ class SessionPicker(ModalScreen):
 
     def action_cancel(self):
         self.dismiss(None)
+
+
+class OneLineInput(Input):
+    """A box that refuses a paste holding a line break or control character, so nothing is cut or
+    changed without saying so: Input's own paste keeps only the first line."""
+
+    def _on_paste(self, event):
+        if send.has_break(event.text or ""):
+            event.stop()
+            event.prevent_default()
+            self.screen.problem(send.check_text(event.text))
+
+
+class SendScreen(ModalScreen):
+    """Type one line for a session. Enter delivers it through `deliver(text) -> (ok, reason)`, which
+    runs off the UI thread; a refusal shows here and keeps the text. Dismisses True once it was sent."""
+
+    DEFAULT_CSS = """
+    SendScreen { align: center middle; }
+    SendScreen #sender { width: 76; max-width: 96%; height: auto; border: round $primary;
+                         padding: 0 1; background: $surface; }
+    SendScreen Input { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False, priority=True)]
+
+    def __init__(self, name, folder, deliver):
+        super().__init__()
+        self.session_name, self.folder, self.deliver = name, folder, deliver
+        self.sending = False
+
+    def compose(self):
+        with Vertical(id="sender"):
+            yield Static(Text("Tell %s" % self.session_name, style="bold", no_wrap=True, overflow="ellipsis"))
+            yield Static(Text(self.folder, style="dim", no_wrap=True, overflow="ellipsis"))
+            yield OneLineInput(placeholder="Message for its Claude Code prompt", id="message")
+            yield Static("", id="problem")
+            yield Static(Text("Enter sends, Esc cancels. One line, up to %s characters." % format(send.MAX_LEN, ","),
+                              style="dim"))
+
+    def on_mount(self):
+        self.query_one("#message", Input).focus()
+
+    def problem(self, text):
+        self.query_one("#problem", Static).update(Text(text or "", style="bold"))
+
+    def on_input_submitted(self, event):
+        event.stop()
+        if self.sending:
+            return
+        text = event.value
+        reason = send.check_text(text)
+        if reason:
+            self.problem(reason)
+            return
+        self.sending = True
+        self.problem("sending…")
+        self.run_worker(lambda: self._deliver(text), thread=True, group="send")
+
+    def _deliver(self, text):
+        ok, reason = self.deliver(text)
+        self.app.call_from_thread(self._delivered, ok, reason)
+
+    def _delivered(self, ok, reason):
+        self.sending = False
+        if ok:
+            self.dismiss(True)
+        else:
+            self.problem(reason)
+
+    def action_cancel(self):
+        if not self.sending:
+            self.dismiss(False)
 
 
 class FleetwatchApp(App):
@@ -1032,6 +1114,7 @@ class FleetwatchApp(App):
         Binding("pagedown", "page(1)", show=False),
         Binding("enter", "enter", show=False),
         Binding("g", "jump", show=False),
+        Binding("t", "tell", show=False),
         Binding("slash", "find", show=False),
         Binding("ctrl+k", "find_sessions", show=False),
         Binding("space", "toggle", show=False),
@@ -1636,6 +1719,62 @@ class FleetwatchApp(App):
             self.say(reason)
             return
         self.run_worker(lambda: self._do_jump(name, tty), thread=True, group="jump")
+
+    def action_tell(self):
+        """Type a message into the highlighted session's Claude Code prompt. The target resolves as
+        Enter's jump does; what is running in that tab is checked again at send time (send.deliver)."""
+        node = self.current.current()
+        if node is not None and node.resume:
+            self._tell_held(node.resume)
+            return
+        if node is None or (node.session is None and node.helper is None):
+            self.say("no session is highlighted")
+            return
+        if self.snapshot is None:
+            return
+        if os.environ.get("FLEETWATCH_DEMO"):
+            self.say("demo: t would send to %s" % (node.helper or node.session))
+            return
+        if (node.session in self.snapshot.gone and node.helper is None and len(node.sessions) <= 1):
+            self.offer_reopen(node.session)
+            return
+        if len(node.sessions) > 1:
+            self.push_screen(SessionPicker(node.sessions, "Tell which session?"), self._tell_picked)
+            return
+        self._tell(node.session, node.helper)
+
+    def _tell_picked(self, name):
+        if name is not None and self.snapshot is not None:
+            self._tell(name)
+
+    def _tell_held(self, sid):
+        e = self.resume_rows.get(sid)
+        name = e["name"] if e else sid
+        if self.snapshot is None or sid not in self.snapshot.held:
+            self.say("%s is not running; Enter resumes it" % name)
+        elif os.environ.get("FLEETWATCH_DEMO"):
+            self.say("demo: t would send to %s" % name)
+        else:
+            tty, reason = self.snapshot.held_target(sid, name)
+            if tty is None:
+                self.say(reason)
+            else:
+                self._ask_message(name, tty, self.snapshot.held[sid])
+
+    def _tell(self, session, helper=None):
+        tty, reason, name, rec = self.snapshot.target_record(session, helper)
+        if tty is None:
+            self.say(reason)
+        else:
+            self._ask_message(name, tty, rec)
+
+    def _ask_message(self, name, tty, rec):
+        sessions = (self.paths or data.default_paths())["sessions"]
+        pid, sid = rec["pid"], rec.get("sessionId")
+        self.push_screen(
+            SendScreen(name, resume.short_folder(rec.get("cwd"), 70),
+                       lambda text: send.deliver(name, pid, sid, tty, text, sessions)),
+            lambda sent: self.say("sent to %s" % name) if sent else None)
 
     def offer_reopen(self, name):
         """Enter on a session that has ended: confirm, then open it as `o` does on the Resume tab."""
