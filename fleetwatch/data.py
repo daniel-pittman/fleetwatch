@@ -313,6 +313,16 @@ def _file_only(r):
     return r
 
 
+def ident(r):
+    """A record's stable identity: ("s", its session ID), or ("n", its name) when it has no ID.
+
+    build_records keeps one record per session ID and one per name among those without an ID, so no two
+    records share an identity. Board row keys are built from it, never from a display name."""
+    if r.get("ident"):
+        return r["ident"]
+    return ("s", r["sessionId"]) if r.get("sessionId") else ("n", r["name"])
+
+
 def build_records(paths, now, warnings, ppids=None, failed=None):
     """failed, when given, collects the sources that could not be read ("agents")."""
     agents = read_agents(paths["command"], warnings)
@@ -541,10 +551,13 @@ def make_row(r, now):
         ((c, now - (c["state_since"] or now)) for c in live_kids if c["state"] in NEEDS_STATES),
         key=lambda t: -t[1])
     qs = [(t, s, None) for t, s in items_of(sf.get("questions"))]
+    q_helpers = [None] * len(qs)
     for c in r["children"]:
         csf = c["status"] or {}
         tag = clean(c["name"])
-        qs += [(t, s, tag) for t, s in items_of(csf.get("questions"))]
+        asked = [(t, s, tag) for t, s in items_of(csf.get("questions"))]
+        qs += asked
+        q_helpers += [c] * len(asked)
     busy_kids = [c for c in live_kids if c["state"] in WORKING_STATES]
     cad, upd = sf.get("cadence_min"), to_epoch(sf.get("updated"))
     quiet = None
@@ -554,6 +567,7 @@ def make_row(r, now):
     return {
         "r": r, "name": clean(r["name"]), "persona": clean(sf["persona"]) if sf.get("persona") else None,
         "stuck": stuck, "helper_stuck": helper_stuck, "qs": qs,
+        "q_helpers": q_helpers,    # per question: the helper record that asked it, None for the session's own
         "working": bool((r["live"] and r["state"] in WORKING_STATES) or busy_kids),
         "busy_helpers": len(busy_kids), "quiet": quiet,
         "updated": upd if upd is not None else r["last"],
@@ -578,20 +592,20 @@ def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=(), holds
         (orphans if looks_generated(r) else rows).append(r)
     up_warnings, up_items = [], []
 
-    def reported(r, label, only_yours):
+    def reported(r, label, only_yours, sid):
         out = []
         for src in [r] + r["children"]:
             for i in session_upcoming(src["status"] or {}, label, up_warnings):
                 if i["yours"] or not only_yours:
                     i["key"] = item_key(r.get("sessionId") or "name-" + label, i)
-                    i["sid"] = r.get("sessionId")
+                    i["sid"] = sid
                     out.append(i)
         return out
     for r in rows:
-        up_items += reported(r, clean(r["name"]), False)
+        up_items += reported(r, clean(r["name"]), False, r.get("sessionId"))
     gone = [r for r in stale if r.get("parent") is None and not looks_generated(r)]
     for r in gone:
-        up_items += reported(r, clean(r["name"]), True)
+        up_items += reported(r, clean(r["name"]), True, gone_sid(r))
     item_keys = {i["key"] for i in up_items}
     held_items = [i for i in up_items if holds and holds.status(i["key"], now)] if holds else []
     held_ids = {id(i) for i in held_items}
@@ -631,18 +645,24 @@ def build_view(sections, now, horizon_days=DEFAULT_HORIZON_DAYS, stale=(), holds
 TASK_KINDS = ("overdue", "today", "undated")
 
 
+def gone_sid(r):
+    """The session ID of a record that is not running: its own, else the one its status file names. A
+    file-only record carries none of its own, and a group pin written while the session ran is keyed by
+    the file's."""
+    sf = r["status"] or {}
+    return r.get("sessionId") or (sf.get("sessionId") if isinstance(sf.get("sessionId"), str) else None)
+
+
 def gone_row(r, name, now):
     """A Needs-you row for a session with no live row, so its due items stay visible."""
     sf = r["status"] or {}
     upd = to_epoch(sf.get("updated"))
-    # A file-only record carries no session id; the status file names it, and a
-    # group pin written while the session ran is keyed by it.
-    sid = r.get("sessionId") or (sf.get("sessionId") if isinstance(sf.get("sessionId"), str) else None)
+    sid = gone_sid(r)
     return {
         "r": {"name": r["name"], "status": None, "children": [], "live": False, "state": "gone",
-              "cwd": r.get("cwd"), "sessionId": sid, "last": r.get("last")},
+              "cwd": r.get("cwd"), "sessionId": sid, "last": r.get("last"), "ident": ident(r)},
         "name": name, "persona": clean(sf["persona"]) if sf.get("persona") else None,
-        "stuck": None, "helper_stuck": [], "qs": [], "working": False, "busy_helpers": 0,
+        "stuck": None, "helper_stuck": [], "qs": [], "q_helpers": [], "working": False, "busy_helpers": 0,
         "quiet": None, "updated": upd if upd is not None else r.get("last"), "renamed_from": None,
         "working_on": "", "tasks": [], "for_you": False, "gone": True,
     }
@@ -662,7 +682,11 @@ def task_kind(row, now):
 
 
 def attach_tasks(timeline, by_name, now):
-    """Put each qualifying item on every session that holds it; returns {kind: unique item count}."""
+    """Put each qualifying item on every session that holds it; returns {kind: unique item count}.
+
+    An item lands on the row that carries its session's name, which can be another session of that name.
+    So each task keeps its own owners, (name, session ID) of the sessions under that name that reported
+    it: the session a task belongs to is read from there, never from the row it sits under."""
     counts = dict.fromkeys(TASK_KINDS, 0)
     for row in timeline_rows(timeline):
         kind = task_kind(row, now)
@@ -670,11 +694,13 @@ def attach_tasks(timeline, by_name, now):
             continue
         counts[kind] += 1
         for name in row["sessions"]:
-            x = by_name.get(clean(name))
+            label = clean(name)
+            x = by_name.get(label)
             if x is not None:
                 x["tasks"].append({"kind": kind, "what": row["what"], "due": row["due"],
                                    "has_time": row["has_time"], "item": row["kind"],
-                                   "keys": list(row.get("keys", ()))})
+                                   "keys": list(row.get("keys", ())), "id": dedup_key(row),
+                                   "owners": [o for o in row.get("owners", ()) if clean(o[0]) == label]})
     order = {k: i for i, k in enumerate(TASK_KINDS)}
     for x in by_name.values():
         x["tasks"].sort(key=lambda t: (order[t["kind"]], t["due"].timestamp() if t["due"] else 0,

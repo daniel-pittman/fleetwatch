@@ -9,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import rowkeys  # noqa: E402
 import standin  # noqa: E402
 from waiting import settle  # noqa: E402
 import test_app  # noqa: E402,F401  (points FLEETWATCH_CONFIG_DIR at a temp folder before fleetwatch loads)
@@ -100,18 +101,18 @@ class EnterTests(Env):
                 await pilot.press("e")
                 # Needs you: the session row, its own question, a helper's question, a stuck-helper line
                 needs = app.lists[0]
-                self.assertEqual(await self.enter_on(app, pilot, 0, "needs:Stuck Session"), [TTY])
-                self.assertEqual(await self.enter_on(app, pilot, 0, "needs:Stuck Session:q:1"), [TTY])
+                self.assertEqual(await self.enter_on(app, pilot, 0, rowkeys.needs("s1")), [TTY])
+                self.assertEqual(await self.enter_on(app, pilot, 0, rowkeys.needs("s1", "q", "1")), [TTY])
                 # question 2 belongs to helper wt-helper-1, which has its own iTerm tab
-                self.assertEqual(await self.enter_on(app, pilot, 0, "needs:Stuck Session:q:2"), [HELPER_TTY])
+                self.assertEqual(await self.enter_on(app, pilot, 0, rowkeys.needs("s1", "q", "2")), [HELPER_TTY])
                 # dated and undated to-do rows go to their session
                 up = next(k for k in app.lists[1]._order if "Mine for stuck" in app.lists[1]._by_key[k].head.plain)
                 self.assertEqual(await self.enter_on(app, pilot, 1, up), [TTY])
                 todo = next(k for k in app.lists[1]._order if "Todo for stuck" in app.lists[1]._by_key[k].head.plain)
                 self.assertEqual(await self.enter_on(app, pilot, 1, todo), [TTY])
                 # Sessions tab: the session row, then its helper row (own tab)
-                self.assertEqual(await self.enter_on(app, pilot, 2, "ses:Stuck Session"), [TTY])
-                self.assertEqual(await self.enter_on(app, pilot, 2, "ses:Stuck Session:k:wt-helper-1"),
+                self.assertEqual(await self.enter_on(app, pilot, 2, rowkeys.ses("s1")), [TTY])
+                self.assertEqual(await self.enter_on(app, pilot, 2, rowkeys.ses("s1", "s6")),
                                  [HELPER_TTY])
                 for script, args in self.calls:
                     self.assertNotIn("/dev/ttys", script)
@@ -125,7 +126,7 @@ class EnterTests(Env):
             async with app.run_test(size=(120, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("e")
-                self.assertEqual(await self.enter_on(app, pilot, 2, "ses:Stuck Session:k:wt-helper-1"), [TTY])
+                self.assertEqual(await self.enter_on(app, pilot, 2, rowkeys.ses("s1", "s6")), [TTY])
                 self.assertEqual(app.status_text, "jumped to Stuck Session")
         run(go())
 
@@ -140,7 +141,7 @@ class EnterTests(Env):
                 await settle(pilot, lambda: "not in an iTerm2 tab" in (app.status_text or ""), "the toast")
                 self.assertEqual(self.calls, [])
                 self.assertIn("not in an iTerm2 tab", app.status_text)
-                app.current.move_to("needs:Stuck Session:q:1")
+                app.current.move_to(rowkeys.needs("s1", "q", "1"))
                 await pilot.press("enter")
                 self.assertIn("not in an iTerm2 tab", app.status_text)
         run(go())
@@ -153,15 +154,15 @@ class EnterTests(Env):
                 await pilot.press("3")
                 lst = app.current
                 lst.move_to("sesg:working")
-                self.assertIn("ses:Stuck Session", lst._order)
+                self.assertIn(rowkeys.ses("s1"), lst._order)
                 await pilot.press("enter")
-                self.assertNotIn("ses:Stuck Session", lst._order)
+                self.assertNotIn(rowkeys.ses("s1"), lst._order)
                 await pilot.press("enter")
-                self.assertIn("ses:Stuck Session", lst._order)
+                self.assertIn(rowkeys.ses("s1"), lst._order)
                 self.assertEqual(self.calls, [])
                 await pilot.press("g")
                 self.assertEqual(app.status_text, "no session is highlighted")
-                lst.move_to("ses:Stuck Session")
+                lst.move_to(rowkeys.ses("s1"))
                 await pilot.press("g")
                 await self.jumps(app, pilot, 1)
                 self.assertEqual(self.calls[0][1], [TTY])
@@ -201,7 +202,7 @@ class SortTests(Env):
         self.w.status("b1.json", session="Beta", updated=standin.iso(-100), questions=["q?", "r?", "s?"])
 
     def order(self, app, tab, prefix):
-        return [k[len(prefix):] for k in app.lists[tab]._order if k.startswith(prefix)]
+        return rowkeys.names(app.lists[tab], prefix.rstrip(":"))
 
     async def cycle(self, app, pilot, tab, want):
         await pilot.press(str(tab + 1))
@@ -372,7 +373,7 @@ class GroupTests(Env):
             async with app.run_test(size=(100, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("G", "3")
-                app.current.move_to("ses:Sleeper")
+                app.current.move_to(rowkeys.ses("s5"))
                 await pilot.press("m")
                 self.assertEqual(type(app.screen).__name__, "GroupPicker")
                 # keys typed in the picker belong to it, not to the tabs behind
@@ -401,7 +402,7 @@ class GroupTests(Env):
             async with app.run_test(size=(100, 40)) as pilot:
                 await boot(app, pilot)
                 await pilot.press("G", "3")
-                app.current.move_to("ses:Sleeper")
+                app.current.move_to(rowkeys.ses("s5"))
                 await pilot.press("m")
                 picker = app.screen.query_one("#choices")
                 picker.highlighted = picker.option_count - 1          # New group...
@@ -428,7 +429,7 @@ class GroupTests(Env):
                 app.current.move_to("sesg:working")
                 await pilot.press("m")
                 self.assertEqual(app.status_text, "no session is highlighted")
-                app.current.move_to("ses:Sleeper")
+                app.current.move_to(rowkeys.ses("s5"))
                 before = open(self.groups).read()
                 await pilot.press("m", "escape")
                 self.assertEqual(type(app.screen).__name__, "Screen")
@@ -447,7 +448,7 @@ class GroupTests(Env):
                 text = app.current.visible_text()
                 self.assertIn("▾ Other · 5", text)
                 self.assertNotIn("▾ Work", text)
-                app.current.move_to("ses:Sleeper")
+                app.current.move_to(rowkeys.ses("s5"))
                 await pilot.press("m", "enter")                       # pick the only group, Other
                 await settle(pilot, lambda: "could not save the group" in (app.status_text or ""), "the failure message")
                 self.assertIn("could not save the group", app.status_text)
@@ -665,7 +666,7 @@ class FooterTests(Env):
                 await pilot.press("3")
                 app.current.move_to("sesg:working")
                 self.assertNotIn("m move", app.footer_plain)
-                app.current.move_to("ses:Stuck Session")
+                app.current.move_to(rowkeys.ses("s1"))
                 self.assertIn("m move", app.footer_plain)
         run(go())
 

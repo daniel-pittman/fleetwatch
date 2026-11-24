@@ -15,7 +15,7 @@ os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import standin  # noqa: E402
-from test_app import TTY, boot  # noqa: E402
+from test_app import TTY, boot, refresh  # noqa: E402
 from test_resume import AppWorld, sid  # noqa: E402
 from waiting import settle  # noqa: E402
 from fleetwatch import app as fapp, data, iterm, park, send, views  # noqa: E402
@@ -450,10 +450,10 @@ class Board(AppWorld):
         self.status_file("live.json", "Live One", self.s)
         self.addCleanup(self.rig.stop)
 
-    def status_file(self, fname, name, session, what="send the form"):
+    def status_file(self, fname, name, session, what="send the form", **more):
         with open(os.path.join(self.paths["status"], fname), "w") as fh:
-            json.dump({"session": name, "sessionId": session, "updated": standin.iso(-60),
-                       "upcoming": [{"what": what, "due": self.due, "yours": True}]}, fh)
+            json.dump(dict({"session": name, "sessionId": session, "updated": standin.iso(-60),
+                            "upcoming": [{"what": what, "due": self.due, "yours": True}]}, **more), fh)
 
     def snapshot(self):
         snap = super().snapshot()
@@ -634,17 +634,6 @@ class Board(AppWorld):
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
 
-    def test_t_on_a_session_that_ended_offers_the_reopen_not_a_box(self):
-        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
-        s, _ = self.transcript("Live One")
-        self.status_file("live.json", "Live One", s)
-
-        async def body(app, pilot):
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "ReopenScreen", "the reopen offer")
-        self.drive_needs(body)
-        self.assertEqual(self.rig.calls(), [])
-
     def test_t_on_a_session_outside_iterm_says_so(self):
         async def body(app, pilot):
             app.snapshot.jump["iterm"] = set()
@@ -658,14 +647,62 @@ class Board(AppWorld):
         self.assertTrue(any(keys == "t" for keys, _ in fapp.HELP_KEYS))
         self.assertTrue(any(b.key == "t" and b.action == "tell" for b in fapp.FleetwatchApp.BINDINGS))
 
-    # Same-name sessions, pickers, helpers and the Resume tab.
+    # Which session a row is: every row is found with the real cursor, moved by the arrow keys.
 
-    def add_second(self, name, cwd_name, what="send the form"):
+    def cursor_text(self, app):
+        """What the highlighted lines say: the row the user sees the cursor on."""
+        return " ".join(line.plain.strip() for key, line in app.current._lines if key == app.current.cursor)
+
+    async def walk_to(self, app, pilot, pick, what):
+        """Open every row, then move the cursor from the top row down, one arrow key at a time, onto the
+        first row pick() takes."""
+        app.current.set_all(True)
+        return await self.walk_to_next(app, pilot, pick, what)
+
+    async def walk_to_next(self, app, pilot, pick, what):
+        app.current.move_to(app.current._order[0])
+        self.assertEqual(len(set(app.current._order)), len(app.current._order), "two rows share a key")
+        for _ in range(len(app.current._order)):
+            node = app.current.current()
+            if node is not None and pick(node):
+                self.assertIn(node.head.plain.strip().split("\n")[0], self.cursor_text(app), "the cursor is drawn elsewhere")
+                return node
+            await pilot.press("down")
+        self.fail("no row for " + what)
+
+    async def refused(self, app, pilot, pick, what, expect):
+        """t on the row pick() takes says `expect` in the footer and opens nothing."""
+        await self.walk_to(app, pilot, pick, what)
+        app.status_text = ""
+        await pilot.press("t")
+        await settle(pilot, lambda: bool(app.status_text), "a footer for " + what)
+        self.assertEqual(app.status_text, expect, what)
+        self.assertEqual(self.screen_name(app), "Screen", what)
+
+    async def tells(self, app, pilot, pick, what, name, folder, pid, tty):
+        """t on the row pick() takes opens the box for `name` in `folder`, and the text lands on `tty`."""
+        await self.walk_to(app, pilot, pick, what)
+        self.aim_rig_at(pid, tty)
+        before = len(self.rig.calls())
+        app.status_text = ""
+        await pilot.press("t")
+        await settle(pilot, lambda: self.screen_name(app) == "SendScreen" or app.status_text, "the send box for " + what)
+        self.assertEqual(self.screen_name(app), "SendScreen", "%s: %s" % (what, app.status_text))
+        title = self.box_texts(app)
+        self.assertEqual(title[0], "Tell " + name, what)
+        self.assertTrue(title[1].endswith(os.sep + folder), "%s: the folder line says %s" % (what, title[1]))
+        await self.send_text(app, pilot, "for " + what)
+        await settle(pilot, lambda: "sent to " + name in (app.status_text or ""), "the footer for " + what)
+        typed, submitted = self.rig.calls()[before:]
+        self.assertEqual(typed["argv"], ["-", tty, "for " + what])
+        self.assertEqual(submitted["argv"], ["-", tty])
+
+    def add_second(self, name, cwd_name, what="send the form", **more):
         """A second live session on the test runner's parent process, in its own iTerm2 tab."""
         other = sid()
         folder = self.mkdir(cwd_name)
         self.reg(name, other, pid=os.getppid(), cwd=folder)
-        self.status_file("second.json", name, other, what)
+        self.status_file("second.json", name, other, what, **more)
         self.extra_ttys[os.getppid()] = self.TTY2
         return other, folder
 
@@ -673,243 +710,368 @@ class Board(AppWorld):
         self.rig.pid, self.rig.tty_path = pid, tty
         self.rig.foreground(claude_rows(pid), tty=tty)
 
-    SHARED = "two running sessions are named Live One; rename one first"
+    def two_named_alike(self):
+        """Two running sessions named Live One, in different folders and tabs. Each has its own status
+        line, question and item, which is how a test tells their rows apart."""
+        self.status_file("live.json", "Live One", self.s, "first item", questions=["first question?"],
+                         working_on="first work")
+        other, _ = self.add_second("Live One", "elsewhere", "second item", questions=["second question?"],
+                                   working_on="second work")
+        return other
 
-    async def refused_on_every_row(self, app, pilot, pick, expect):
-        """Put the real cursor on every row pick() accepts, by key and then with the arrow keys, press t
-        and expect the refusal in the footer. Nothing mocks the cursor."""
-        keys = [k for k in app.current._order if pick(app.current._by_key[k])]
-        self.assertTrue(keys, "no row to try")
+    FIRST = (standin.PARENT_PID, TTY)
 
-        async def press_t(where):
-            app.status_text = ""
-            await pilot.press("t")
-            await settle(pilot, lambda: expect in (app.status_text or ""), "the refusal on " + where)
-            self.assertNotEqual(self.screen_name(app), "SendScreen")
-        for key in keys:
-            app.current.move_to(key)
-            await press_t(key)
-        app.current.move_to(app.current._order[0])
-        tried = 0
-        for _ in range(len(app.current._order)):
-            node = app.current.current()
-            if node is not None and pick(node):
-                await press_t("the arrow keys at " + node.key)
-                tried += 1
-            await pilot.press("down")
-        self.assertGreater(tried, 0)
-        return keys
+    @property
+    def second(self):
+        return os.getppid(), self.TTY2
 
-    def test_same_name_sessions_are_refused_on_the_sessions_tab(self):
-        self.status_file("live.json", "Live One", self.s, "first item")
-        self.add_second("Live One", "elsewhere", "second item")
-        self.aim_rig_at(os.getppid(), self.TTY2)
+    def test_two_sessions_of_one_name_each_tell_their_own_on_the_sessions_tab(self):
+        self.two_named_alike()
+
+        def row(work):
+            return lambda n: n.session == "Live One" and not n.helper and any(work in t.plain for _l, t in n.body)
 
         async def body(app, pilot):
-            await self.refused_on_every_row(app, pilot, lambda n: n.session == "Live One", self.SHARED)
+            await self.tells(app, pilot, row("second work"), "the second row", "Live One", "elsewhere", *self.second)
+            await self.tells(app, pilot, row("first work"), "the first row", "Live One", "work", *self.FIRST)
         self.drive_tab("3", body)
-        self.assertEqual(self.rig.calls(), [])
+        self.assertEqual(len(self.rig.calls()), 4)
 
-    def test_same_name_sessions_are_refused_on_the_needs_tab_rows_and_tasks(self):
-        self.status_file("live.json", "Live One", self.s, "first item")
-        self.add_second("Live One", "elsewhere", "second item")
-        self.aim_rig_at(os.getppid(), self.TTY2)
+    def test_two_sessions_of_one_name_each_tell_their_own_on_the_needs_tab(self):
+        self.two_named_alike()
+
+        def row(question):
+            return lambda n: n.children and any(question in c.head.plain for c in n.children)
+
+        def line(text):
+            return lambda n: not n.children and text in n.head.plain
 
         async def body(app, pilot):
-            app.current.set_all(True)
-            keys = await self.refused_on_every_row(app, pilot, lambda n: n.session == "Live One", self.SHARED)
-            self.assertTrue(any(":t:" in k for k in keys), keys)
+            await self.tells(app, pilot, row("second question"), "the second row", "Live One", "elsewhere", *self.second)
+            await self.tells(app, pilot, row("first question"), "the first row", "Live One", "work", *self.FIRST)
+            await self.tells(app, pilot, line("second question"), "the second question", "Live One", "elsewhere",
+                             *self.second)
+            await self.tells(app, pilot, line("first question"), "the first question", "Live One", "work", *self.FIRST)
+            # Both items sit under whichever row carries the name first; each still goes to its owner.
+            holder = [n for n in app.current.nodes if any(c.todo for c in n.children)]
+            self.assertEqual([sum(1 for c in n.children if c.todo) for n in holder], [2])
+            await self.tells(app, pilot, line("second item"), "the second item", "Live One", "elsewhere", *self.second)
+            await self.tells(app, pilot, line("first item"), "the first item", "Live One", "work", *self.FIRST)
+        self.drive_needs(body)
+        self.assertEqual(len(self.rig.calls()), 12)
+
+    def test_folding_one_of_two_same_name_rows_leaves_the_other_and_the_cursor_survives_a_refresh(self):
+        other = self.two_named_alike()
+
+        async def body(app, pilot):
+            await self.walk_to(app, pilot, lambda n: n.sid == self.s and not n.helper, "the first row")
+            await pilot.press("space")     # every row is open: this closes the first one only
+            await self.walk_to_next(app, pilot, lambda n: n.sid == other and not n.helper, "the second row")
+            text = app.current.visible_text()
+            self.assertIn("second work", text)
+            self.assertNotIn("first work", text)
+            await refresh(app, pilot)
+            self.assertEqual(app.current.current().sid, other)
+            self.assertIn("second work", app.current.visible_text())
+            self.assertNotIn("first work", app.current.visible_text())
+        self.drive_tab("3", body)
+
+    def test_a_helper_named_like_a_top_level_session_keeps_its_own_row(self):
+        # A key built from names gave this session and Live One's helper the same one, and the cursor
+        # drawn on the helper's line acted on the session.
+        self.add_helper(own_tab=True)
+        twin = "Live One:k:wt-send-helper"
+        self.add_second(twin, "elsewhere")
+
+        async def body(app, pilot):
+            await self.tells(app, pilot, lambda n: n.helper == "wt-send-helper", "the helper", "wt-send-helper", "work",
+                             standin.CHILD_PID, self.TTY3)
+            self.assertTrue(self.cursor_text(app).startswith("↳ wt-send-helper"), self.cursor_text(app))
+            await self.tells(app, pilot, lambda n: n.session == twin and not n.helper, "the session", twin, "elsewhere",
+                             *self.second)
+            self.assertTrue(self.cursor_text(app).startswith(twin + "  "), self.cursor_text(app))
+        self.drive_tab("3", body)
+
+    def test_names_cannot_make_two_rows_share_a_key(self):
+        own = views.node_key("ses", ("n", "A"), "k", ("n", "wt-b"))
+        for other in (views.node_key("ses", ("n", "A:k:n:wt-b")), views.node_key("ses", ("s", "A"), "k", ("n", "wt-b")),
+                      views.node_key("ses", ("n", "A%3Ak"), ("n", "wt-b")), views.node_key("ses", ("n", "A"), "k", "n:wt-b")):
+            self.assertNotEqual(own, other)
+        self.assertNotEqual(views.node_key("ses", ("s", 5)), views.node_key("ses", ("s", "5")))
+        self.assertNotEqual(views.node_key("needs", ("s", "x"), "t", (None, "y")),
+                            views.node_key("needs", ("s", "x"), "t", ("None", "y")))
+        self.assertEqual(views.node_key("ses", ("s", self.s)), "ses:s:" + self.s)
+
+    def test_no_two_rows_of_a_board_share_a_key_whatever_the_sessions_are_named(self):
+        def bare(fname, name, pid):
+            with open(os.path.join(self.paths["sessions"], fname), "w") as fh:
+                json.dump({"name": name, "sessionId": None, "pid": pid, "kind": "interactive", "cwd": "/x",
+                           "status": "idle", "statusUpdatedAt": standin.ms(-60), "updatedAt": standin.ms(-60)}, fh)
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        bare("a.json", "A", standin.PARENT_PID)                  # no IDs at all: the names are the identities
+        bare("b.json", "wt-b", standin.CHILD_PID)
+        bare("c.json", "A:k:n:wt-b", os.getppid())
+        self.reg("A", sid(), pid=standin.DEAD_PID)               # and sessions that share a name
+        self.reg("A", sid(), pid=standin.DEAD_PID)
+        for i, name in enumerate(("A", "A:k:n:wt-b", "wt-b")):
+            self.status_file("s%d.json" % i, name, None, "item of %s" % name, questions=["q?"])
+
+        async def body(app, pilot):
+            for tab in "123":
+                await pilot.press(tab)
+                await settle(pilot, lambda: app.active == int(tab) - 1, "tab " + tab)
+                keys = [n.key for n in all_nodes(app.current.nodes)]
+                self.assertGreater(len(keys), 3)
+                self.assertEqual(len(set(keys)), len(keys), sorted(k for k in keys if keys.count(k) > 1))
+        self.drive_needs(body)
+
+    def test_a_row_with_no_session_id_is_refused(self):
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        with open(os.path.join(self.paths["sessions"], "bare.json"), "w") as fh:
+            json.dump({"name": "Live One", "sessionId": None, "pid": standin.PARENT_PID, "kind": "interactive",
+                       "cwd": self.folder, "status": "idle", "statusUpdatedAt": standin.ms(-60),
+                       "updatedAt": standin.ms(-60)}, fh)
+        self.status_file("live.json", "Live One", None, questions=["which one?"])
+        unknown = "cannot tell which session this row is"
+
+        async def body(app, pilot):
+            self.assertIsNotNone(app.snapshot.target("Live One")[0], "Enter still finds it by name")
+            await self.refused(app, pilot, lambda n: n.session == "Live One" and n.children, "the row", unknown)
+            await self.refused(app, pilot, lambda n: "which one?" in n.head.plain, "its question", unknown)
+            await self.refused(app, pilot, lambda n: n.todo and "send the form" in n.head.plain, "its item", unknown)
+            await pilot.press("3")
+            await settle(pilot, lambda: app.active == 2, "the Sessions tab")
+            await self.refused(app, pilot, lambda n: n.session == "Live One", "its Sessions row", unknown)
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
 
-    def test_a_shared_name_is_refused_even_with_the_session_id(self):
-        other, _ = self.add_second("Live One", "elsewhere")
+    def test_the_target_is_found_by_id_and_a_name_never_finds_one(self):
+        old = sid()
+        self.reg("Live One", old, pid=standin.DEAD_PID)
 
         async def body(app, pilot):
-            for sid_ in (None, self.s, other):
-                tty, reason, _n, _r = app.snapshot.target_record("Live One", sid=sid_, unique=True)
-                self.assertIsNone(tty)
-                self.assertEqual(reason, self.SHARED)
-            self.assertIsNotNone(app.snapshot.target_record("Live One")[0], "the jump is unchanged")
+            snap = app.snapshot
+            self.assertEqual(snap.tell_target(self.s, "x")[:3], (TTY, None, "Live One"))
+            self.assertEqual(snap.tell_target(self.s, "x")[3]["sessionId"], self.s)
+            for sid_ in (None, ""):
+                self.assertEqual(snap.tell_target(sid_, "Live One"), (None, "cannot tell which session this row is",
+                                                                     None, None))
+            for sid_ in (old, sid()):      # one that exited, and one the board has never seen
+                self.assertEqual(snap.tell_target(sid_, "Live One"), (None, "Live One is not running", None, None))
         self.drive_needs(body)
 
-    def test_a_name_alone_that_finds_a_session_with_an_id_is_refused(self):
-        async def body(app, pilot):
-            tty, reason, _n, _r = app.snapshot.target_record("Live One", unique=True)
-            self.assertIsNone(tty)
-            self.assertIn("cannot tell which session Live One is", reason)
-            self.assertEqual(app.snapshot.target_record("Live One", sid=self.s, unique=True)[0], TTY)
-        self.drive_needs(body)
-
-    def test_an_item_two_same_name_sessions_share_is_refused_after_the_pick(self):
-        self.add_second("Live One", "elsewhere")
-        self.aim_rig_at(os.getppid(), self.TTY2)
+    def test_a_task_of_an_exited_session_is_refused_beside_a_live_namesake(self):
+        old = sid()
+        self.reg("Live One", old, pid=standin.DEAD_PID, cwd=self.mkdir("old"))
+        self.status_file("old.json", "Live One", old, "the old reminder")
 
         async def body(app, pilot):
+            await self.refused(app, pilot, lambda n: n.todo and "the old reminder" in n.head.plain, "the old item",
+                               "Live One is not running")
+            await self.tells(app, pilot, lambda n: n.todo and "send the form" in n.head.plain, "the live item",
+                             "Live One", "work", *self.FIRST)
             await pilot.press("2")
             await settle(pilot, lambda: app.active == 1, "the to-dos tab")
-            item = next(n for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 2)
-            app.current.move_to(item.key)
-            await pilot.press("t")
-            await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
-            self.assertTrue(any("elsewhere" in x for x in app.screen.names), app.screen.names)
+            await self.refused(app, pilot, lambda n: n.todo and "the old reminder" in n.head.plain,
+                               "the old item on the to-dos tab", "Live One is not running")
+            await pilot.press("3")
+            await settle(pilot, lambda: app.active == 2, "the Sessions tab")
+            await self.refused(app, pilot, lambda n: n.sid == old, "the exited row", "Live One is not running")
+        self.drive_needs(body)
+        self.assertEqual(len(self.rig.calls()), 2)
+
+    def test_a_task_of_a_session_that_left_only_its_status_file_is_refused_beside_a_live_namesake(self):
+        self.status_file("old.json", "Live One", sid(), "the old reminder")
+
+        async def body(app, pilot):
+            rows = [n for n in app.current.nodes if n.session == "Live One"]
+            self.assertEqual(len(rows), 1, "the item sits under the live session's row")
+            await self.refused(app, pilot, lambda n: n.todo and "the old reminder" in n.head.plain, "the old item",
+                               "Live One is not running")
+            await self.tells(app, pilot, lambda n: n.todo and "send the form" in n.head.plain, "the live item",
+                             "Live One", "work", *self.FIRST)
+        self.drive_needs(body)
+        self.assertEqual(len(self.rig.calls()), 2)
+
+    def test_t_on_a_session_that_ended_says_so_and_opens_nothing(self):
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        s, _ = self.transcript("Live One")
+        self.status_file("live.json", "Live One", s)
+
+        async def body(app, pilot):
+            await self.refused(app, pilot, lambda n: n.session == "Live One" and n.children, "the row",
+                               "Live One is not running")
+            await self.refused(app, pilot, lambda n: n.todo is not None, "its item", "Live One is not running")
             await pilot.press("enter")
-            await settle(pilot, lambda: self.SHARED in (app.status_text or ""), "the refusal")
-            self.assertNotEqual(self.screen_name(app), "SendScreen")
-        self.drive_needs(body)
-        self.assertEqual(self.rig.calls(), [])
-
-    def test_an_item_one_of_two_same_name_sessions_holds_is_refused(self):
-        self.status_file("live.json", "Live One", self.s, "only the first has this")
-        self.add_second("Live One", "elsewhere", "only the second has this")
-
-        async def body(app, pilot):
-            await pilot.press("2")
-            await settle(pilot, lambda: app.active == 1, "the to-dos tab")
-            keys = [n.key for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 1]
-            self.assertEqual(len(keys), 2)
-            for key in keys:
-                app.status_text = ""
-                app.current.move_to(key)
-                await pilot.press("t")
-                await settle(pilot, lambda: self.SHARED in (app.status_text or ""), "the refusal")
+            await settle(pilot, lambda: self.screen_name(app) == "ReopenScreen", "Enter's reopen offer")
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
 
     def test_an_item_two_sessions_share_asks_which_one(self):
         self.add_second("Other One", "elsewhere")
-        self.aim_rig_at(os.getppid(), self.TTY2)
 
         async def body(app, pilot):
-            await pilot.press("2")
-            await settle(pilot, lambda: app.active == 1, "the to-dos tab")
-            item = next(n for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 2)
-            app.current.move_to(item.key)
+            await self.walk_to(app, pilot, lambda n: n.todo and len(n.owners) == 2, "the shared item")
+            self.aim_rig_at(*self.second)
             await pilot.press("t")
             await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
-            self.assertEqual(sorted(app.screen.names), ["Live One", "Other One"])
-            await pilot.press(*(["down"] if app.screen.names[1] == "Other One" else []), "enter")
+            labels = sorted(app.screen.names)
+            self.assertEqual([x.split("  ")[0] for x in labels], ["Live One", "Other One"])
+            self.assertTrue(labels[0].endswith(os.sep + "work") and labels[1].endswith(os.sep + "elsewhere"), labels)
+            await pilot.press(*(["down"] if app.screen.names[1].startswith("Other One") else []), "enter")
             await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
             self.assertIn("Tell Other One", self.box_texts(app)[0])
             await self.send_text(app, pilot, "picked")
             await settle(pilot, lambda: "sent to Other One" in (app.status_text or ""), "the footer")
-        self.drive_needs(body)
+        self.drive_tab("2", body)
         self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY2, "picked"])
 
-    def add_helper(self, own_tab):
+    def test_an_item_two_same_name_sessions_share_lists_both_by_folder_and_tells_the_one_picked(self):
+        self.add_second("Live One", "elsewhere")
+
+        async def body(app, pilot):
+            for folder, where in (("elsewhere", self.second), ("work", self.FIRST)):
+                await self.walk_to(app, pilot, lambda n: n.todo and len(n.owners) == 2, "the shared item")
+                self.aim_rig_at(*where)
+                before = len(self.rig.calls())
+                await pilot.press("t")
+                await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
+                labels = app.screen.names
+                self.assertEqual(sorted(x.rsplit(os.sep, 1)[1] for x in labels), ["elsewhere", "work"], labels)
+                self.assertTrue(all(x.startswith("Live One  ") for x in labels), labels)
+                await pilot.press(*(["down"] if labels[1].endswith(folder) else []), "enter")
+                await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
+                self.assertTrue(self.box_texts(app)[1].endswith(os.sep + folder), self.box_texts(app)[1])
+                app.status_text = ""
+                await self.send_text(app, pilot, "to " + folder)
+                await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+                self.assertEqual(self.rig.calls()[before]["argv"], ["-", where[1], "to " + folder])
+        self.drive_tab("2", body)
+
+    def test_an_item_one_of_two_same_name_sessions_holds_tells_its_owner(self):
+        self.status_file("live.json", "Live One", self.s, "only the first has this")
+        self.add_second("Live One", "elsewhere", "only the second has this")
+
+        async def body(app, pilot):
+            await self.tells(app, pilot, lambda n: n.todo and "only the second" in n.head.plain, "the second's item",
+                             "Live One", "elsewhere", *self.second)
+            await self.tells(app, pilot, lambda n: n.todo and "only the first" in n.head.plain, "the first's item",
+                             "Live One", "work", *self.FIRST)
+        self.drive_tab("2", body)
+
+    def add_helper(self, own_tab, name="wt-send-helper", pid=standin.CHILD_PID):
         h = sid()
-        self.reg("wt-send-helper", h, pid=standin.CHILD_PID, cwd=self.folder)
+        self.reg(name, h, pid=pid, cwd=self.folder)
         if own_tab:
-            self.extra_ttys[standin.CHILD_PID] = self.TTY3
+            self.extra_ttys[pid] = self.TTY3
         return h
 
-    async def tell_helper(self, app, pilot):
-        app.current.set_open("ses:Live One", True)
-        await settle(pilot, lambda: "ses:Live One:k:wt-send-helper" in app.current._order, "the helper row")
-        app.current.move_to("ses:Live One:k:wt-send-helper")
-        await self.open_box(app, pilot)
+    def helper_asks(self, h):
+        with open(os.path.join(self.paths["status"], "helper.json"), "w") as fh:
+            json.dump({"session": "wt-send-helper", "sessionId": h, "updated": standin.iso(-60),
+                       "questions": ["the helper asks?"]}, fh)
+
+    HELPER = (standin.CHILD_PID, "/dev/ttys097")
 
     def test_a_helper_row_tells_the_helper_in_its_own_tab(self):
-        self.add_helper(own_tab=True)
-        self.aim_rig_at(standin.CHILD_PID, self.TTY3)
+        h = self.add_helper(own_tab=True)
+        self.helper_asks(h)
+        self.reg_status("waiting", h)
 
         async def body(app, pilot):
-            await self.tell_helper(app, pilot)
-            self.assertIn("Tell wt-send-helper", self.box_texts(app)[0])
-            await self.send_text(app, pilot, "helper")
-            await settle(pilot, lambda: "sent to wt-send-helper" in (app.status_text or ""), "the footer")
+            self.reg_status("idle", h)     # the board has drawn it stuck; the send checks read the registry fresh
+            await self.tells(app, pilot, lambda n: n.helper == "wt-send-helper", "the helper's row",
+                             "wt-send-helper", "work", *self.HELPER)
+            await pilot.press("1")
+            await settle(pilot, lambda: app.active == 0, "the needs tab")
+            await self.tells(app, pilot, lambda n: "the helper asks?" in n.head.plain, "the helper's question",
+                             "wt-send-helper", "work", *self.HELPER)
+            await self.tells(app, pilot, lambda n: "helper wt-send-helper stuck" in n.head.plain, "the stuck line",
+                             "wt-send-helper", "work", *self.HELPER)
         self.drive_tab("3", body)
-        self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY3, "helper"])
 
-    def test_a_helper_without_a_tab_falls_back_to_its_parent(self):
-        self.add_helper(own_tab=False)
-
-        async def body(app, pilot):
-            await self.tell_helper(app, pilot)
-            self.assertIn("Tell Live One", self.box_texts(app)[0])
-            await self.send_text(app, pilot, "parent")
-            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
-        self.drive_tab("3", body)
-        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "parent"])
-
-    def test_a_helper_name_two_live_helpers_share_is_refused_and_never_falls_back(self):
-        self.add_helper(own_tab=True)
-        self.reg("wt-send-helper", sid(), pid=os.getppid(), cwd=self.folder)   # an unattached one
-        shared = "two running helpers are named wt-send-helper; rename one first"
+    def test_a_helper_with_no_tab_is_refused_and_never_becomes_its_parent(self):
+        h = self.add_helper(own_tab=False)
+        self.helper_asks(h)
+        self.reg_status("waiting", h)
+        no_tab = "wt-send-helper is not in an iTerm2 tab"
 
         async def body(app, pilot):
-            for session in (None, "Live One"):
-                tty, reason, _n, _r = app.snapshot.target_record(session, "wt-send-helper", self.s, unique=True)
-                self.assertIsNone(tty)
-                self.assertEqual(reason, shared)
-            self.assertEqual(app.snapshot.target_record(None, "wt-send-helper")[0], self.TTY3, "the jump is unchanged")
-            app.current.set_open("ses:Live One", True)
-            await settle(pilot, lambda: "ses:Live One:k:wt-send-helper" in app.current._order, "the helper row")
-            app.current.move_to("ses:Live One:k:wt-send-helper")
-            await pilot.press("t")
-            await settle(pilot, lambda: shared in (app.status_text or ""), "the refusal")
-            self.assertNotEqual(self.screen_name(app), "SendScreen")
+            self.assertEqual(app.snapshot.target("Live One", "wt-send-helper")[:2], (TTY, None),
+                             "Enter still goes to the parent's tab")
+            await self.refused(app, pilot, lambda n: n.helper == "wt-send-helper", "the helper's row", no_tab)
+            await pilot.press("1")
+            await settle(pilot, lambda: app.active == 0, "the needs tab")
+            await self.refused(app, pilot, lambda n: "the helper asks?" in n.head.plain, "the helper's question", no_tab)
+            await self.refused(app, pilot, lambda n: "helper wt-send-helper stuck" in n.head.plain, "the stuck line",
+                               no_tab)
         self.drive_tab("3", body)
         self.assertEqual(self.rig.calls(), [])
 
-    def test_a_helper_that_is_not_known_does_not_fall_back_to_its_parent(self):
+    def test_a_helper_with_no_session_id_is_refused_and_never_becomes_its_parent(self):
+        with open(os.path.join(self.paths["sessions"], "bare.json"), "w") as fh:
+            json.dump({"name": "wt-send-helper", "sessionId": None, "pid": standin.CHILD_PID, "kind": "interactive",
+                       "cwd": self.folder, "status": "idle", "statusUpdatedAt": standin.ms(-60),
+                       "updatedAt": standin.ms(-60)}, fh)
+        self.extra_ttys[standin.CHILD_PID] = self.TTY3
+
         async def body(app, pilot):
-            tty, reason, _n, _r = app.snapshot.target_record("Live One", "wt-gone", self.s, unique=True)
-            self.assertIsNone(tty)
-            self.assertEqual(reason, "wt-gone is not a live session")
-            self.assertEqual(app.snapshot.target_record("Live One", "wt-gone")[0], TTY, "the jump is unchanged")
-        self.drive_needs(body)
+            await self.refused(app, pilot, lambda n: n.helper == "wt-send-helper", "the helper's row",
+                               "cannot tell which session this row is")
+        self.drive_tab("3", body)
+        self.assertEqual(self.rig.calls(), [])
+
+    def test_two_helpers_of_one_name_each_tell_their_own(self):
+        self.add_helper(own_tab=True)
+        self.reg("wt-send-helper", sid(), pid=os.getppid(), cwd=self.mkdir("elsewhere"))   # an unattached one
+        self.extra_ttys[os.getppid()] = self.TTY2
+
+        async def body(app, pilot):
+            await self.tells(app, pilot, lambda n: n.helper == "wt-send-helper" and n.session is None,
+                             "the unattached helper", "wt-send-helper", "elsewhere", *self.second)
+            await self.tells(app, pilot, lambda n: n.helper == "wt-send-helper" and n.session == "Live One",
+                             "Live One's helper", "wt-send-helper", "work", *self.HELPER)
+        self.drive_tab("3", body)
 
     def test_a_stale_row_is_refused_as_not_running_even_when_a_live_helper_has_its_name(self):
         self.add_helper(own_tab=True)
-        self.aim_rig_at(standin.CHILD_PID, self.TTY3)
+        self.aim_rig_at(*self.HELPER)
         with open(os.path.join(self.paths["status"], "stale.json"), "w") as fh:
             json.dump({"session": "wt-send-helper", "sessionId": sid(), "updated": standin.iso(-90 * 86400)}, fh)
 
         async def body(app, pilot):
-            app.current.set_open("sesg:stale", True)
-            await settle(pilot, lambda: "stale:wt-send-helper" in app.current._order, "the stale row")
-            app.current.move_to("stale:wt-send-helper")
-            await pilot.press("t")
-            await settle(pilot, lambda: "wt-send-helper is not running" in (app.status_text or ""), "the refusal")
-            self.assertNotEqual(self.screen_name(app), "SendScreen")
+            await self.refused(app, pilot, lambda n: n.ended and n.helper == "wt-send-helper", "the stale row",
+                               "wt-send-helper is not running")
         self.drive_tab("3", body)
         self.assertEqual(self.rig.calls(), [])
 
-    def test_a_running_row_on_the_resume_tab_tells_that_session_by_its_id(self):
+    def parked_and_running(self):
         os.remove(os.path.join(self.paths["status"], "live.json"))
         os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
         s, _ = self.transcript("Live Parked")
         self.reg("Live Parked", s, pid=standin.PARENT_PID, cwd=self.folder)
         park.park(s, "Live Parked", "note")
+        return s
 
-        async def body(app, pilot):
-            await settle(pilot, lambda: app.current.current() is not None and app.current.current().resume == s,
-                         "the parked row")
-            await self.open_box(app, pilot)
-            self.assertIn("Tell Live Parked", self.box_texts(app)[0])
-            await self.send_text(app, pilot, "from resume")
-            await settle(pilot, lambda: "sent to Live Parked" in (app.status_text or ""), "the footer")
-        self.drive_tab("4", body)
+    async def tell_from_resume(self, app, pilot, s):
+        await settle(pilot, lambda: app.current.current() is not None and app.current.current().resume == s,
+                     "the parked row")
+        await self.open_box(app, pilot)
+        self.assertIn("Tell Live Parked", self.box_texts(app)[0])
+        self.assertTrue(self.box_texts(app)[1].endswith(os.sep + "work"))
+        await self.send_text(app, pilot, "from resume")
+        await settle(pilot, lambda: "sent to Live Parked" in (app.status_text or ""), "the footer")
+
+    def test_a_running_row_on_the_resume_tab_tells_that_session_by_its_id(self):
+        s = self.parked_and_running()
+        self.drive_tab("4", lambda app, pilot: self.tell_from_resume(app, pilot, s))
         self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "from resume"])
 
-    def test_a_resume_row_whose_name_two_running_sessions_share_is_refused(self):
-        os.remove(os.path.join(self.paths["status"], "live.json"))
-        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
-        s, _ = self.transcript("Live Parked")
-        self.reg("Live Parked", s, pid=standin.PARENT_PID, cwd=self.folder)
-        park.park(s, "Live Parked", "note")
+    def test_a_resume_row_tells_its_own_session_when_another_running_one_has_its_name(self):
+        s = self.parked_and_running()
         self.add_second("Live Parked", "elsewhere")
-
-        async def body(app, pilot):
-            await settle(pilot, lambda: app.current.current() is not None and app.current.current().resume == s,
-                         "the parked row")
-            await pilot.press("t")
-            await settle(pilot, lambda: "two running sessions are named Live Parked; rename one first"
-                         in (app.status_text or ""), "the refusal")
-            self.assertNotEqual(self.screen_name(app), "SendScreen")
-        self.drive_tab("4", body)
-        self.assertEqual(self.rig.calls(), [])
+        self.drive_tab("4", lambda app, pilot: self.tell_from_resume(app, pilot, s))
+        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "from resume"])
 
 
 if __name__ == "__main__":

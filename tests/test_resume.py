@@ -988,8 +988,9 @@ class AppTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("3")
-            await settle(pilot, lambda: "ses:Live Session" in app.current._order, "the Sessions tab")
-            app.current.move_to("ses:Live Session")
+            key = views.node_key("ses", ("s", s))
+            await settle(pilot, lambda: key in app.current._order, "the Sessions tab")
+            app.current.move_to(key)
             await pilot.press("p")
             await settle(pilot, lambda: isinstance(app.screen, fapp.ParkScreen), "the park dialog")
             self.assertIsInstance(app.screen, fapp.ParkScreen)
