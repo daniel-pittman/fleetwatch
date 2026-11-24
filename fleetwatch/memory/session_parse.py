@@ -463,8 +463,15 @@ def session_list(project_dir, state_dir, automated_prefixes=None,
     return keep, skipped
 
 
+def jsonl_lines(text):
+    """The non-empty lines of JSONL text. Split on \\n only: str.splitlines() also breaks at
+    U+2028, U+2029, U+0085, VT, FF and the FS/GS/RS controls, which json.dumps(ensure_ascii=False)
+    leaves raw inside a string, so a record holding one would be cut in half."""
+    return [x for x in text.split("\n") if x.strip()]
+
+
 def read_records(sp):
-    return [json.loads(x) for x in sp.read_text().splitlines() if x.strip()]
+    return [json.loads(x) for x in jsonl_lines(sp.read_text())]
 
 
 ON_MISSING = ("hold", "remove")

@@ -1023,7 +1023,7 @@ def cmd_status(reg, full_reg=None):
         up = d / "state" / "usage.jsonl"
         if up.exists():
             tot, calls, cost = {}, 0, 0.0
-            for ln in up.read_text().splitlines():
+            for ln in session_parse.jsonl_lines(up.read_text()):
                 u = json.loads(ln)
                 calls += u.get("calls", 0)
                 cost += u.get("total_cost_usd", 0)
