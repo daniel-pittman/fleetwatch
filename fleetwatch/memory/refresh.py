@@ -28,9 +28,13 @@ index folder's own search.py) under settings.toml [paths] build_python (default:
 zone, the heartbeat patterns, the rule packs and the protected groups come from settings.toml
 (fleetwatch.settings.indexer); an invalid settings.toml stops the run before any index is touched.
 Each index has an atomic mkdir lock (broken when older than 60 minutes); one index failing
-never stops the others. The process exits if its resident memory passes 4 GB.
+never stops the others. Only one whole-registry run goes at a time (run_lock), and builds of
+one index file wait for each other (the engine's build_lock). The process exits if its
+resident memory passes 4 GB.
 """
 import argparse
+import contextlib
+import fcntl
 import glob as globmod
 import json
 import os
@@ -55,6 +59,10 @@ from . import antigravity_parse, codex_parse, doc_corpus, routing, session_parse
 from .privacy_scan import RuleSet, Scanner, protected_ready
 
 LOCK_STALE_S = 3600
+# run_one and run_plain return True, False, or SKIPPED when another process holds the index's
+# lock. SKIPPED is truthy, so a caller that only asks whether the index failed reads a skip as
+# no failure; one that counts successes or failure streaks must test for it.
+SKIPPED = "skipped"
 BUILTIN_DEFAULTS = dict(schedule_minutes=30, tag=True, tag_budget_per_run=400)
 MEM_CAP = 4 << 30
 
@@ -804,7 +812,7 @@ def run_plain(name, entry, opts):
     with Lock(state) as lock:
         if lock is None:
             print("[%s] refresh already running; skipped" % name)
-            return True
+            return SKIPPED
         return _run_plain_locked(name, entry, opts, state, lock)
 
 
@@ -847,15 +855,6 @@ def _run_plain_locked(name, entry, opts, state, lock):
     return True
 
 
-def plain_lock_held(name):
-    """Whether another process holds the index's lock and has touched it within the staleness window."""
-    path = ROOT / name / "state" / "refresh.lock.d"
-    try:
-        return time.time() - path.stat().st_mtime <= LOCK_STALE_S
-    except OSError:
-        return False
-
-
 def run_one(reg, name, opts, plan=None):
     if plan is None:
         plan = getattr(opts, "routing_plan", None)
@@ -873,7 +872,7 @@ def run_one(reg, name, opts, plan=None):
     with Lock(ix.state) as lock:
         if lock is None:
             print("[%s] refresh already running; skipping" % name)
-            return True
+            return SKIPPED
         try:
             info = ix.refresh(opts, lock.touch, plan=plan)
         except Exception as e:
@@ -1205,9 +1204,10 @@ def _main(argv):
             # A plain index has no per-document conversion and no privacy block; its
             # refresh commands rebuild the whole corpus, so PATH only names what changed.
             o = argparse.Namespace(full=False, build=True)
-            if plain_lock_held(name):
+            res = run_plain(name, reg["indexes"][name], o)
+            if res == SKIPPED:
                 sys.exit("[%s] refresh already running; try again shortly" % name)
-            sys.exit(0 if run_plain(name, reg["indexes"][name], o) else 1)
+            sys.exit(0 if res else 1)
         else:
             ix = Index(name, reg["indexes"][name], reg["defaults"])
             with Lock(ix.state) as lock:
@@ -1229,29 +1229,47 @@ def _main(argv):
     if indexes.is_agent_caller(caller) and any(fleetwatch_settings.is_protected(reg["indexes"][name].get("group"),
                                                         SETTINGS.protected_groups) for name in names):
         sys.exit(3)
-    opts.routing_plan = resolve_routing(reg)
-    if not opts.index:
-        # One whole-registry run at a time; a lock older than LOCK_STALE_S belongs to a dead run.
-        with Lock(ROOT / "logs") as run_lock:
-            if run_lock is None:
-                print("a refresh run is already in progress; nothing started")
-                sys.exit(0)
-            _run_all(reg, names, opts, run_lock)
-    else:
-        _run_all(reg, names, opts, None)
+    if opts.index:
+        opts.routing_plan = resolve_routing(reg)
+        return _run_all(reg, names, opts)
+    with run_lock() as held:
+        if not held:
+            print("a refresh run is already in progress; nothing started")
+            sys.exit(0)
+        # Routing can write sticky session placements, so it runs under the run lock.
+        opts.routing_plan = resolve_routing(reg)
+        _run_all(reg, names, opts)
 
 
-def _run_all(reg, names, opts, run_lock):
+@contextlib.contextmanager
+def run_lock():
+    """One whole-registry run at a time: an flock on logs/refresh-run.lock, held for the run's
+    lifetime. The kernel drops it when the process exits, however it exits (SIGTERM, the memory
+    cap's os._exit, SIGKILL), so it needs no staleness rule and a run of any length keeps it.
+    open() makes the descriptor non-inheritable, so a child build never holds it past the run."""
+    path = ROOT / "logs" / "refresh-run.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def _run_all(reg, names, opts):
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
-    failed = []
+    failed, skipped = [], []
     t0, done = time.time(), []
     mark = not opts.index
     if mark:
         write_run_marker(t0, None, done)
     for name in names:
-        if run_lock:
-            run_lock.touch()
-        if run_one(reg, name, opts):
+        res = run_one(reg, name, opts)
+        if res == SKIPPED:
+            skipped.append(name)
+        elif res:
             record_streak(name, None)
             if refreshed_since(name, t0):
                 done.append(name)
@@ -1262,8 +1280,8 @@ def _run_all(reg, names, opts, run_lock):
             write_run_marker(t0, None, done)
     if mark:
         write_run_marker(t0, time.time(), done)
-    print("=== run finished %s: %d ok, %d failed%s" % (
-        now_iso(), len(names) - len(failed), len(failed),
+    print("=== run finished %s: %d ok, %d skipped, %d failed%s" % (
+        now_iso(), len(names) - len(failed) - len(skipped), len(skipped), len(failed),
         " (%s)" % ", ".join(failed) if failed else ""), flush=True)
     sys.exit(0 if not failed else 1)
 
