@@ -907,6 +907,28 @@ class Board(AppWorld):
         self.drive_needs(body)
         self.assertEqual(self.rig.calls(), [])
 
+    def test_a_session_that_ended_and_left_no_session_id_is_refused_as_not_running(self):
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        self.status_file("live.json", "Live One", None)
+
+        async def body(app, pilot):
+            await self.refused(app, pilot, lambda n: n.session == "Live One" and n.children, "the row",
+                               "Live One is not running")
+            await self.refused(app, pilot, lambda n: n.todo is not None, "its item", "Live One is not running")
+        self.drive_needs(body)
+        self.assertEqual(self.rig.calls(), [])
+
+    def test_a_needs_task_two_sessions_share_tells_the_session_whose_row_it_is_under(self):
+        self.add_second("Other One", "elsewhere")
+
+        def under(name):
+            return lambda n: n.todo is not None and n.session == name
+
+        async def body(app, pilot):
+            await self.tells(app, pilot, under("Other One"), "Other One's copy", "Other One", "elsewhere", *self.second)
+            await self.tells(app, pilot, under("Live One"), "Live One's copy", "Live One", "work", *self.FIRST)
+        self.drive_needs(body)
+
     def test_an_item_two_sessions_share_asks_which_one(self):
         self.add_second("Other One", "elsewhere")
 
