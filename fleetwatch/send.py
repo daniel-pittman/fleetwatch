@@ -28,13 +28,14 @@ SAFE_STATES = {"idle", "busy", "shell"}
 # Claude Code runs it there as a helper that talks over pipes and never reads the terminal, and only when it
 # was seen doing so in live sessions: caffeinate (keeps the machine awake), the runtimes MCP servers run
 # on, and a server named for MCP. Names are the executable's own (ps `ucomm`), which a process title cannot
-# change. Anything else in the group refuses, so an editor opened with Ctrl-G refuses whatever it is named,
-# unless it runs on one of these runtimes (README, Limits).
+# change. Python is matched in any case and version: a framework build on macOS names its executable
+# `Python`, other builds `python3.11`. Anything else in the group refuses, so an editor opened with Ctrl-G
+# refuses whatever it is named, unless it runs on one of these runtimes (README, Limits).
 HELPERS = {"caffeinate", "node", "uv", "dart"}
-_HELPER_RE = re.compile(r"python[0-9.]*|.*mcp.*")
-# A shell is a helper only when it runs a command string (`bash -c ...`, as Claude's Bash tool does); an
-# interactive or login shell reads the terminal.
-SHELLS = {"bash", "zsh", "sh"}
+_HELPER_RE = re.compile(r"(?i:python[0-9.]*)|.*mcp.*")
+# A shell is never a helper, whatever its arguments: nothing in an argv proves that a shell, or the
+# command it runs, will not read the terminal. These names only choose the wording of the refusal.
+SHELLS = {"bash", "zsh", "sh", "dash", "ksh", "fish", "csh", "tcsh"}
 
 # The pause between typing the text and sending the return: Claude Code reads one `write text` as a
 # paste, and a return that arrives before the paste ends is taken into the box instead of submitting it.
@@ -101,31 +102,10 @@ def _program(args):
     return os.path.basename(words[0]).lstrip("-") if words else ""
 
 
-def _runs_a_command(args):
-    """True for a shell argv that runs a command string: -c among its leading options, none of them -i,
-    and not a login shell."""
-    words = args.split()
-    if not words or words[0].startswith("-"):
-        return False
-    found = False
-    for w in words[1:]:
-        if not w.startswith("-") or w in ("-", "--"):
-            break
-        if w.startswith("--"):
-            continue
-        if "i" in w[1:]:
-            return False
-        found = found or "c" in w[1:]
-    return found
-
-
 def foreign_member(members):
-    """The shown name of the first group member that is not a known helper, else None."""
+    """The executable name of the first group member that is not a known helper, else None."""
     for _pid, ucomm, args in members:
-        if ucomm in SHELLS:
-            if _runs_a_command(args):
-                continue
-        elif ucomm in HELPERS or _HELPER_RE.fullmatch(ucomm):
+        if ucomm in HELPERS or _HELPER_RE.fullmatch(ucomm):
             continue
         return data.clean(ucomm or _program(args)) or "a program"
     return None
@@ -151,6 +131,8 @@ def terminal_problem(name, pid, tty):
     if "Z" in fg["stat"]:
         return "%s's Claude Code has exited" % name
     program = foreign_member(fg["members"])
+    if program in SHELLS:
+        return "%s is running a command; try again when it finishes" % name
     if program:
         return "%s is running in %s; finish there first" % (program, name)
     return None

@@ -231,13 +231,25 @@ class Deliver(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.refused(containing="myedit is running in Alpha")
 
-    def test_a_shell_without_a_command_string_or_a_login_shell_is_refused(self):
-        for member, shown in (("-bash", "bash"), ("/bin/zsh", "zsh"), ("bash -i -c x", "bash"),
-                              ("-bash -i -c claude", "bash"), ("-zsh -c x", "zsh"), ("bash script.sh -c", "bash"),
-                              ("bash -o pipefail -c x", "bash"), ("/bin/zsh -ic x", "zsh")):
+    def test_a_shell_in_the_group_is_refused_whatever_its_arguments(self):
+        # A command string proves nothing: `bash -c 'read x'` reads the terminal, and zsh takes
+        # `-onoclobber` as one option that holds a c.
+        for member in ("-bash", "/bin/zsh", "bash -i -c x", "-bash -i -c claude", "-zsh -c x", "bash script.sh -c",
+                       "bash -o pipefail -c x", "/bin/zsh -ic x", "/bin/bash -c ls", "bash -lc 'x y'",
+                       "/bin/zsh -c -l 'eval x'", "sh -ec x", "bash --norc -c x", "bash -c 'read x'",
+                       "zsh -onoclobber", "zsh -oautocd", "zsh --interactive -c x", ("dash", "sh -c x"),
+                       "fish -c x", ("ksh", "/bin/ksh -c x"), "tcsh -c x"):
             with self.subTest(member=member):
-                self.rig.foreground(claude_rows(PID, member))
-                self.assertEqual(self.refused(), "%s is running in Alpha; finish there first" % shown)
+                self.rig.foreground(claude_rows(PID, "caffeinate -i -t 300", member))
+                self.assertEqual(self.refused(), "Alpha is running a command; try again when it finishes")
+
+    def test_a_shell_that_starts_while_the_text_is_typed_stops_the_return(self):
+        self.rig.after_first_call({self.rig.fg: claude_rows(PID, "/bin/bash -c ls") + "\n"})
+        ok, reason = self.go("yes")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "typed but not submitted: Alpha is running a command; try again when it "
+                                 "finishes; check its tab")
+        self.assertEqual(len(self.rig.calls()), 1)
 
     def test_the_helpers_seen_in_live_sessions_do_not_refuse(self):
         self.rig.foreground(claude_rows(
@@ -245,9 +257,19 @@ class Deliver(unittest.TestCase):
             ("python3.14", "/opt/cache/bin/python"), ("python", "python mcp"),
             ("node", "npm exec @scope/mcp@latest"), ("node", "node /opt/x/index.js --stdio"),
             ("slack-mcp-server", "/opt/x/bin/slack-mcp-server-darwin-arm64 --transport stdio"),
-            ("uv", "/opt/homebrew/bin/uv tool uvx x"), ("dart", "/opt/dart-sdk/bin/dart mcp-server"),
-            "/bin/bash -c ls", "bash -lc 'x y'", "/bin/zsh -c -l 'eval x'", "sh -ec x", "bash --norc -c x"))
+            ("uv", "/opt/homebrew/bin/uv tool uvx x"), ("dart", "/opt/dart-sdk/bin/dart mcp-server")))
         self.sent()
+
+    def test_python_is_a_helper_in_any_case_and_version(self):
+        # A framework build on macOS names its executable Python, with a capital P.
+        for ucomm in ("Python", "python", "python3", "Python3.14", "python3.11", "PYTHON"):
+            with self.subTest(ucomm=ucomm):
+                self.rig.foreground(claude_rows(PID, (ucomm, "/usr/bin/python3 -m server")))
+                self.sent()
+        for ucomm in ("ipython", "bpython", "Pythonista", "python-editor"):
+            with self.subTest(ucomm=ucomm):
+                self.rig.foreground(claude_rows(PID, (ucomm, "/usr/bin/python3 -m server")))
+                self.assertEqual(self.refused(), "%s is running in Alpha; finish there first" % ucomm)
 
     def test_an_editor_outside_the_foreground_group_does_not_refuse(self):
         self.rig.foreground(claude_rows(PID) + "\n" + row(5000, 5000, PID, "Ss", "vim"))
