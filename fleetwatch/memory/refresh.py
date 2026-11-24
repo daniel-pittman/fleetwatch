@@ -801,6 +801,14 @@ def plain_source_files(entry):
 def run_plain(name, entry, opts):
     state = ROOT / name / "state"
     state.mkdir(parents=True, exist_ok=True)
+    with Lock(state) as lock:
+        if lock is None:
+            print("[%s] refresh already running; skipped" % name)
+            return True
+        return _run_plain_locked(name, entry, opts, state, lock)
+
+
+def _run_plain_locked(name, entry, opts, state, lock):
     index_file = Path(os.path.expanduser(entry["index_file"]))
     built_at = index_file.stat().st_mtime if index_file.exists() else 0
     newer = []
@@ -817,6 +825,7 @@ def run_plain(name, entry, opts):
                     changed=[], wall_s=0.0)
     else:
         for cmd in entry["refresh"]:
+            lock.touch()
             argv = plain_argv(cmd)
             r = subprocess.run(argv, cwd=plain_dir(name), capture_output=True, text=True,
                                timeout=1800)
@@ -836,6 +845,15 @@ def run_plain(name, entry, opts):
               % (name, info["wall_s"], len(info["changed"]), ", ".join(info["changed"][:8])))
     (state / "last_run.json").write_text(json.dumps(info, indent=1))
     return True
+
+
+def plain_lock_held(name):
+    """Whether another process holds the index's lock and has touched it within the staleness window."""
+    path = ROOT / name / "state" / "refresh.lock.d"
+    try:
+        return time.time() - path.stat().st_mtime <= LOCK_STALE_S
+    except OSError:
+        return False
 
 
 def run_one(reg, name, opts, plan=None):
@@ -1187,6 +1205,8 @@ def _main(argv):
             # A plain index has no per-document conversion and no privacy block; its
             # refresh commands rebuild the whole corpus, so PATH only names what changed.
             o = argparse.Namespace(full=False, build=True)
+            if plain_lock_held(name):
+                sys.exit("[%s] refresh already running; try again shortly" % name)
             sys.exit(0 if run_plain(name, reg["indexes"][name], o) else 1)
         else:
             ix = Index(name, reg["indexes"][name], reg["defaults"])
@@ -1210,6 +1230,18 @@ def _main(argv):
                                                         SETTINGS.protected_groups) for name in names):
         sys.exit(3)
     opts.routing_plan = resolve_routing(reg)
+    if not opts.index:
+        # One whole-registry run at a time; a lock older than LOCK_STALE_S belongs to a dead run.
+        with Lock(ROOT / "logs") as run_lock:
+            if run_lock is None:
+                print("a refresh run is already in progress; nothing started")
+                sys.exit(0)
+            _run_all(reg, names, opts, run_lock)
+    else:
+        _run_all(reg, names, opts, None)
+
+
+def _run_all(reg, names, opts, run_lock):
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
     failed = []
     t0, done = time.time(), []
@@ -1217,6 +1249,8 @@ def _main(argv):
     if mark:
         write_run_marker(t0, None, done)
     for name in names:
+        if run_lock:
+            run_lock.touch()
         if run_one(reg, name, opts):
             record_streak(name, None)
             if refreshed_since(name, t0):

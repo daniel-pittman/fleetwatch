@@ -839,9 +839,9 @@ def build(ix, progress=None):
 
     db_path = cfg["_index_path"]
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = db_path.with_suffix(".sqlite.tmp")
-    if tmp.exists():
-        tmp.unlink()
+    # One temp file per process: a build that shares a name deletes another build's open file.
+    tmp = db_path.with_suffix(".sqlite.tmp.%d" % os.getpid())
+    tmp.unlink(missing_ok=True)
     con = sqlite3.connect(tmp)
     try:
         con.executescript(SCHEMA)
