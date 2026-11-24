@@ -777,8 +777,8 @@ class Board(AppWorld):
         self.drive_tab("3", body)
 
     def test_a_helper_named_like_a_top_level_session_keeps_its_own_row(self):
-        # A key built from names gave this session and Live One's helper the same one, and the cursor
-        # drawn on the helper's line acted on the session.
+        # A key built from names would be the same for this session and for Live One's helper, and the
+        # cursor drawn on the helper's line would act on the session.
         self.add_helper(own_tab=True)
         twin = "Live One:k:wt-send-helper"
         self.add_second(twin, "elsewhere")
