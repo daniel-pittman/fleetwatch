@@ -44,8 +44,8 @@ HELP_KEYS = [
     ("Enter, g", "jump to the row's session in iTerm2 (helpers: their own tab, else the parent's); on a "
                  "section header, fold it; on a row tagged 'not running', offer to reopen it"),
     ("t", "tell: type a message into the highlighted session's Claude Code prompt in iTerm2 (one line, "
-          "2,000 characters at most); refused when the session is at a prompt or its tab is not running "
-          "Claude Code"),
+          "2,000 characters at most); refused when the session is at a prompt, its tab is not running "
+          "Claude Code alone, or another running session has its name"),
     ("click", "select the row; click a tab to switch to it; click the ▸ or ▾ arrow to fold"),
     ("double click", "jump like Enter"),
     ("/", "find a row on this tab by part of its text; Enter does what Enter does on that row"),
@@ -179,18 +179,20 @@ class Snapshot:
         self.counts = views.tab_counts(self.view, stale)
         self.warnings = self.base_warnings + self.view["up_warnings"]
         self.records, self.helpers, self.by_sid = {}, {}, {}
-        self.live_names, self.live_helpers = {}, {}     # name -> how many live sessions carry it
+        # name -> how many board rows carry it: rows are keyed by name, so `t` refuses a shared one
+        self.name_count, self.helper_count = {}, {}
         self.gone = {x["name"]: x["r"] for x in self.view["for_you"] if x.get("gone")}
         for x in self.view["rows"]:
             self.records.setdefault(x["name"], x["r"])
             if x["r"].get("sessionId"):
                 self.by_sid.setdefault(x["r"]["sessionId"], x["r"])
-            if x["r"].get("pid_alive"):
-                self.live_names[x["name"]] = self.live_names.get(x["name"], 0) + 1
+            self.name_count[x["name"]] = self.name_count.get(x["name"], 0) + 1
             for c in x["r"]["children"]:
-                self._add_helper(c)
-        for r in list(self.view["orphans"]) + list(stale):
-            self._add_helper(r)
+                self._add_helper(c, True)
+        for r in self.view["orphans"]:
+            self._add_helper(r, True)
+        for r in stale:
+            self._add_helper(r, False)
         self.grouping = views.Grouping(
             {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
             self.groups.names(), fallback=lambda name: self.groups.of(
@@ -202,11 +204,20 @@ class Snapshot:
         self.header_short = views.header_text(self.view, self.counts, now, self.warnings, True, bad,
                                               len(self.watches))
 
-    def _add_helper(self, r):
+    def _add_helper(self, r, counted):
         name = data.clean(r["name"])
         self.helpers.setdefault(name, r)
-        if r.get("pid_alive"):
-            self.live_helpers[name] = self.live_helpers.get(name, 0) + 1
+        if counted:
+            self.helper_count[name] = self.helper_count.get(name, 0) + 1
+
+    def shared_name(self, session, helper=None):
+        """The refusal for a session or helper name more than one board row carries, else None. Rows are
+        keyed by name, so the cursor reaches only one of them, and a name finds only the first."""
+        for what, name, counts in (("helpers", helper, self.helper_count), ("sessions", session, self.name_count)):
+            n = counts.get(name, 0) if name else 0
+            if n > 1:
+                return "%s running %s are named %s; rename one first" % ("two" if n == 2 else n, what, name)
+        return None
 
     def _tty(self, rec, name):
         """(tty, None) when the record has an iTerm2 tab, else (None, reason)."""
@@ -227,26 +238,28 @@ class Snapshot:
 
     def target_record(self, session, helper=None, sid=None, unique=False):
         """(tty, None, name raised, its record) or (None, reason, None, None). A helper's own tab comes
-        first, then its parent session's. With `unique` the session is found by sid when one is given, and
-        a name that more than one live session carries is refused rather than resolved to either: names
-        can repeat, and the record found is where `t` types."""
+        first, then its parent session's. `unique` is for `t`, where the record found is where the text
+        is typed: a name more than one row carries refuses, a helper that is not running or not known
+        refuses rather than falls back to its parent, and the session is found by sid. With no sid, a name
+        that finds a session carrying one refuses, since the row did not say which session it meant."""
+        if unique:
+            reason = self.shared_name(session, helper)
+            if reason:
+                return None, reason, None, None
         if helper:
             rec = self.helpers.get(helper)
-            if unique and self.live_helpers.get(helper, 0) > 1:
-                tty, reason = None, "more than one running helper is named %s" % helper
-            else:
-                tty, reason = self._tty(rec, helper)
+            tty, reason = self._tty(rec, helper)
             if tty is not None:
                 return tty, None, helper, rec
-            if not session:
+            if not session or (unique and (rec is None or not rec["pid_alive"])):
                 return None, reason, None, None
         if unique and sid:
             rec = self.by_sid.get(sid)
-        elif unique and self.live_names.get(session, 0) > 1:
-            return (None, "more than one running session is named %s; press t on its row on the Sessions tab"
-                    % session, None, None)
         else:
             rec = self.records.get(session)
+            if unique and rec is not None and rec.get("sessionId"):
+                return (None, "cannot tell which session %s is; press t on its row on the Sessions tab" % session,
+                        None, None)
         tty, reason = self._tty(rec, session)
         return (tty, None, session, rec) if tty is not None else (None, reason, None, None)
 
@@ -1752,7 +1765,8 @@ class FleetwatchApp(App):
 
     def action_tell(self):
         """Type a message into the highlighted session's Claude Code prompt. The target resolves as
-        Enter's jump does; what is running in that tab is checked again at send time (send.deliver)."""
+        Enter's jump does, except that what Snapshot.target_record(unique=True) cannot tell apart refuses,
+        as does a Stale row; what is running in that tab is checked again at send time (send.deliver)."""
         node = self.current.current()
         if node is not None and node.resume:
             self._tell_held(node.resume)
@@ -1761,6 +1775,9 @@ class FleetwatchApp(App):
             self.say("no session is highlighted")
             return
         if self.snapshot is None:
+            return
+        if node.ended:
+            self.say("%s is not running" % (node.helper or node.session))
             return
         if os.environ.get("FLEETWATCH_DEMO"):
             self.say("demo: t would send to %s" % (node.helper or node.session))
@@ -1793,10 +1810,13 @@ class FleetwatchApp(App):
     def _tell_held(self, sid):
         e = self.resume_rows.get(sid)
         name = e["name"] if e else sid
+        shared = self.snapshot.shared_name(data.clean(name)) if self.snapshot is not None else None
         if self.snapshot is None or sid not in self.snapshot.held:
             self.say("%s is not running; Enter resumes it" % name)
         elif os.environ.get("FLEETWATCH_DEMO"):
             self.say("demo: t would send to %s" % name)
+        elif shared:
+            self.say(shared)
         else:
             tty, reason = self.snapshot.held_target(sid, name)
             if tty is None:

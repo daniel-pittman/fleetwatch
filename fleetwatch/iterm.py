@@ -7,6 +7,7 @@ import subprocess
 from .data import clean, trunc
 
 TTY_RE = re.compile(r"/dev/ttys[0-9]+")
+TIMED_OUT = "timed out talking to iTerm2"
 
 # The tty arrives as argv item 1, never in the script text. `is running` is checked
 # outside any `tell` so that a closed iTerm2 is reported rather than launched. The list
@@ -131,7 +132,7 @@ def osascript(script, args=()):
         out = subprocess.run(argv, input=script, capture_output=True, text=True, timeout=10)
     except subprocess.TimeoutExpired:
         # Not str(exc): it quotes the command line, and a send's command line holds the message.
-        return False, "timed out talking to iTerm2"
+        return False, TIMED_OUT
     except Exception as exc:
         return False, clean(str(exc))[:80] or "osascript failed"
     if out.returncode != 0:

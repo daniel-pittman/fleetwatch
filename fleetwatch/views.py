@@ -87,6 +87,7 @@ class Node:
     sessions: list = field(default_factory=list)   # every session holding a merged item (a picker when > 1)
     sid: str = None                                # sessionId of the owning top-level session, when known
     owners: list = field(default_factory=list)     # an item row: (name, sessionId) of every session holding it
+    ended: bool = False                            # a Stale row: `t` refuses it, never finds a running one by name
     section: bool = False                          # a header: Enter folds it, nothing to jump to
     sort: tuple = ()                               # coarse rank that stabilise() keeps rows within
     hang: int = 0                                  # continuation lines of the head indent this much more
@@ -516,7 +517,7 @@ def sessions_nodes(view, stale, now, sort="recent", grouping=None, ready=0):
         node = Node("sesg:stale", _row_text(label), section=True)
         node.children = [Node("stale:" + clean(r["name"]), _row_text(
             [(clean(r["name"]), ""), ("  %s, last active %s" % ("status file only" if r.get("file_only") else clean(r["state"]), day(r["last"])), DIM)]),
-            helper=clean(r["name"]))
+            helper=clean(r["name"]), ended=True)
             for r in stale]
         out.append(node)
     return out

@@ -4,10 +4,11 @@ The text reaches Claude as input typed at its own terminal, so it carries the ow
 message between sessions never does. That makes the target the whole safety question: text typed into
 a shell runs as a command, text typed into an editor runs as editor commands, and text typed into a
 permission prompt answers it. Every check here runs at send time against fresh reads (the tty's
-processes, the registry, `claude agents`), never against the last board refresh, and a check that cannot
-tell refuses. fleetwatch never stores or logs the message.
+processes and the registry), never against the last board refresh, and a check that cannot tell refuses.
+fleetwatch never stores or logs the message.
 """
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -23,9 +24,17 @@ CLAUDE_COMM = "claude"
 # Anything else, a missing or unknown state included, is refused.
 SAFE_STATES = {"idle", "busy", "shell"}
 
-# Programs that read the terminal when Claude starts them in its own foreground group (Ctrl-G opens
-# $EDITOR there). Helpers such as MCP servers, caffeinate or a Bash tool's `bash -c` do not read it.
-INTERACTIVE = {"vi", "vim", "nvim", "nano", "emacs", "micro", "hx", "kak", "less", "more", "most", "man"}
+# What may share Claude Code's foreground process group besides Claude itself. A name qualifies only when
+# Claude Code runs it there as a helper that talks over pipes and never reads the terminal, and only when it
+# was seen doing so in live sessions: caffeinate (keeps the machine awake), the runtimes MCP servers run
+# on, and a server named for MCP. Names are the executable's own (ps `ucomm`), which a process title cannot
+# change. Anything else in the group refuses, so an editor opened with Ctrl-G refuses whatever it is named,
+# unless it runs on one of these runtimes (README, Limits).
+HELPERS = {"caffeinate", "node", "uv", "dart"}
+_HELPER_RE = re.compile(r"python[0-9.]*|.*mcp.*")
+# A shell is a helper only when it runs a command string (`bash -c ...`, as Claude's Bash tool does); an
+# interactive or login shell reads the terminal.
+SHELLS = {"bash", "zsh", "sh"}
 
 # The pause between typing the text and sending the return: Claude Code reads one `write text` as a
 # paste, and a return that arrives before the paste ends is taken into the box instead of submitting it.
@@ -55,27 +64,30 @@ def has_break(text):
 
 
 def parse_terminal(text):
-    """What `ps -o pid=,pgid=,tpgid=,stat=,comm= -t TTY` says about a terminal: {"pids": every pid on it,
-    "fg": the foreground group or None}. The group is {"leader", "stat", "command", "members"}, members
-    being (pid, command) for the group's other processes; None when the terminal has no foreground group
-    or no process leads it. A command may hold spaces."""
-    rows = []
+    """What `ps -o pid=,pgid=,tpgid=,stat=,ucomm=,args= -t TTY` says about a terminal: {"pids": every pid
+    on it, "fg": the foreground group or None, "bad": a line that did not parse}. The group is {"leader",
+    "stat", "command", "members"}: command is the leader's argv, members are (pid, ucomm, argv) for the
+    group's other processes. fg is None when the terminal has no foreground group or no process leads it.
+    The argv may hold spaces."""
+    rows, bad = [], False
     for line in text.splitlines():
-        parts = line.split(None, 4)
-        if len(parts) == 5 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
-            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3], parts[4].strip()))
-    out = {"pids": {r[0] for r in rows}, "fg": None}
-    for pid, _pgid, tpgid, stat, command in rows:
+        parts = line.split(None, 5)
+        if len(parts) == 6 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
+            rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3], parts[4], parts[5].strip()))
+        elif line.strip():
+            bad = True
+    out = {"pids": {r[0] for r in rows}, "fg": None, "bad": bad}
+    for pid, _pgid, tpgid, stat, _ucomm, args in rows:
         if pid == tpgid != 0:
-            members = [(p, c) for p, g, _t, _s, c in rows if g == tpgid and p != pid]
-            out["fg"] = {"leader": pid, "stat": stat, "command": command, "members": members}
+            members = [(p, u, a) for p, g, _t, _s, u, a in rows if g == tpgid and p != pid]
+            out["fg"] = {"leader": pid, "stat": stat, "command": args, "members": members}
             break
     return out
 
 
 def read_terminal(tty):
     """parse_terminal for a tty, or None when it cannot be read."""
-    cmd = shlex.split(os.environ.get("FLEETWATCH_FG_CMD", "ps -o pid=,pgid=,tpgid=,stat=,comm= -t"))
+    cmd = shlex.split(os.environ.get("FLEETWATCH_FG_CMD", "ps -o pid=,pgid=,tpgid=,stat=,ucomm=,args= -t"))
     try:
         out = subprocess.run(cmd + [tty[len("/dev/"):]], capture_output=True, text=True, timeout=10)
     except Exception:
@@ -83,39 +95,39 @@ def read_terminal(tty):
     return parse_terminal(out.stdout) if out.returncode == 0 else None
 
 
-def _names(command):
-    """The program names a ps command field may stand for: its basename, and the basename of its first
-    word when ps shows arguments after the program."""
-    command = command.strip()
-    names = {os.path.basename(command)}
-    if command.split():
-        names.add(os.path.basename(command.split()[0]))
-    return {n for n in names if n}
+def _program(args):
+    """The program name an argv stands for: the basename of its first word, without a login shell's -."""
+    words = args.split()
+    return os.path.basename(words[0]).lstrip("-") if words else ""
 
 
-def _editors():
-    names = set(INTERACTIVE)
-    for var in ("VISUAL", "EDITOR"):
-        try:
-            words = shlex.split(os.environ.get(var) or "")
-        except ValueError:
+def _runs_a_command(args):
+    """True for a shell argv that runs a command string: -c among its leading options, none of them -i,
+    and not a login shell."""
+    words = args.split()
+    if not words or words[0].startswith("-"):
+        return False
+    found = False
+    for w in words[1:]:
+        if not w.startswith("-") or w in ("-", "--"):
+            break
+        if w.startswith("--"):
             continue
-        if words:
-            names.add(os.path.basename(words[0]))
-    return names
+        if "i" in w[1:]:
+            return False
+        found = found or "c" in w[1:]
+    return found
 
 
-def interactive_member(members):
-    """The shown name of the first group member that reads the terminal (an editor, a pager, a login
-    shell), else None."""
-    editors = _editors()
-    for _pid, command in members:
-        bare = command.strip()
-        if bare.startswith("-"):
-            return data.clean(bare.lstrip("-").split()[0]) if bare.lstrip("-").split() else "a shell"
-        hit = _names(bare) & editors
-        if hit:
-            return data.clean(sorted(hit)[0])
+def foreign_member(members):
+    """The shown name of the first group member that is not a known helper, else None."""
+    for _pid, ucomm, args in members:
+        if ucomm in SHELLS:
+            if _runs_a_command(args):
+                continue
+        elif ucomm in HELPERS or _HELPER_RE.fullmatch(ucomm):
+            continue
+        return data.clean(ucomm or _program(args)) or "a program"
     return None
 
 
@@ -124,11 +136,13 @@ def terminal_problem(name, pid, tty):
     term = read_terminal(tty)
     if term is None or pid not in term["pids"]:
         return "%s is no longer on that terminal" % name
+    if term["bad"]:
+        return "cannot read what is running on %s's terminal" % name
     fg = term["fg"]
     if fg is None:
         return "nothing is running in the foreground of %s's terminal" % name
-    if os.path.basename(fg["command"]) != CLAUDE_COMM:
-        shown = data.clean(os.path.basename(fg["command"])).lstrip("-")
+    if _program(fg["command"]) != CLAUDE_COMM:
+        shown = data.clean(_program(fg["command"]))
         return "%s's terminal is running %s, not Claude Code" % (name, shown or "something else")
     if fg["leader"] != pid:
         return "%s's terminal is running another Claude Code, not this session" % name
@@ -136,27 +150,20 @@ def terminal_problem(name, pid, tty):
         return "%s's Claude Code is stopped" % name
     if "Z" in fg["stat"]:
         return "%s's Claude Code has exited" % name
-    program = interactive_member(fg["members"])
+    program = foreign_member(fg["members"])
     if program:
-        return "%s is in %s; finish there first" % (name, program)
+        return "%s is running in %s; finish there first" % (program, name)
     return None
 
 
-def _agent_state(paths, pid, sid):
-    """The `claude agents` state of the session, the last matching row winning as in data.build_records."""
-    state = None
-    for a in data.read_agents(paths["command"], []) or []:
-        if (a.get("sessionId") == sid) if sid else (not a.get("sessionId") and a.get("pid") == pid):
-            state = a.get("state") or a.get("status")
-    return state
-
-
 def fresh_state(paths, pid, sid):
-    """The session's prompt state now, or None when no registry row is the session's.
+    """The session's prompt state now: its registry status, "" when that is empty, or None when no
+    registry row is the session's.
 
-    The precedence is data.build_records': the registry status of the session's row (the last one when
-    several carry its ID), else its `claude agents` state, else "unknown". Another registry row on the
-    same pid that is at a prompt wins, since its prompt would be on the same terminal."""
+    The row is data.build_records': the last one carrying the session's ID, else the last ID-less row on
+    its pid. Another registry row on the same pid that is at a prompt wins, since its prompt would be on
+    the same terminal. An empty status is not filled in from `claude agents`: that read is slow and older
+    than the terminal checks it would follow."""
     rows = data.read_registry(paths["sessions"])
     mine = [r for r in rows if ((r["sessionId"] == sid) if sid else (not r["sessionId"] and r["pid"] == pid))]
     if not mine or mine[-1]["pid"] != pid:
@@ -164,13 +171,15 @@ def fresh_state(paths, pid, sid):
     for r in rows:
         if r["pid"] == pid and r["status"] in data.NEEDS_STATES:
             return r["status"]
-    return mine[-1]["status"] or _agent_state(paths, pid, sid) or "unknown"
+    return mine[-1]["status"] or ""
 
 
 def state_problem(name, paths, pid, sid):
     state = fresh_state(paths, pid, sid)
     if state is None:
         return "%s is no longer registered as running" % name
+    if not state:
+        return "cannot tell whether %s is at a prompt: its status is unknown; check its tab" % name
     if state in data.NEEDS_STATES:
         return "%s is at a prompt; answer it in its tab" % name
     if state not in SAFE_STATES:
@@ -194,6 +203,9 @@ def deliver(name, pid, sid, tty, text, paths):
         return False, problem
     ok, reason = iterm.type_into_tty(tty, text)
     if not ok:
+        if reason == iterm.TIMED_OUT:
+            # The text may have landed before the stall; another Enter would type it a second time.
+            return False, "%s: %s; check its tab" % (TYPED, reason)
         return False, reason
     time.sleep(SETTLE_S)
     problem = terminal_problem(name, pid, tty) or state_problem(name, paths, pid, sid)

@@ -33,10 +33,24 @@ def py(*args):
     return " ".join(shlex.quote(a) for a in (sys.executable, FAKE) + args)
 
 
+# Claude Code's executable is named for its version, so its ucomm is a version and only its argv says claude.
+CLAUDE_UCOMM = "2.1.330"
+
+
+def row(pid, pgid, tpgid, stat, args, ucomm=None):
+    """One `ps -o pid=,pgid=,tpgid=,stat=,ucomm=,args=` row; ucomm defaults to the argv's program."""
+    if ucomm is None:
+        ucomm = os.path.basename(args.split()[0]).lstrip("-")
+    return "%d %d %d %s %s %s" % (pid, pgid, tpgid, stat, ucomm, args)
+
+
 def claude_rows(pid, *members):
-    """`ps -t` rows for a terminal whose foreground group Claude (pid) leads, with members in it."""
-    rows = ["%d %d %d S+ claude" % (pid, pid, pid)]
-    rows += ["%d %d %d S+ %s" % (pid + 1 + i, pid, pid, m) for i, m in enumerate(members)]
+    """`ps -t` rows for a terminal whose foreground group Claude (pid) leads, with members in it. A member
+    is its argv, or (ucomm, argv) when the executable's own name differs from the argv's."""
+    rows = [row(pid, pid, pid, "S+", "claude --resume x", CLAUDE_UCOMM)]
+    for i, m in enumerate(members):
+        ucomm, args = m if isinstance(m, tuple) else (None, m)
+        rows.append(row(pid + 1 + i, pid, pid, "S+", args, ucomm))
     return "\n".join(rows)
 
 
@@ -47,14 +61,15 @@ class Rig:
         self.root = root
         self.sessions = os.path.join(root, "sessions")
         os.makedirs(self.sessions, exist_ok=True)
-        self.fg, self.agents_file = os.path.join(root, "fg.txt"), os.path.join(root, "rig-agents.json")
+        self.fg = os.path.join(root, "fg.txt")
         self.log, self.fail = os.path.join(root, "osascript.log"), os.path.join(root, "fail.txt")
         self.then = os.path.join(root, "then.json")
         self.tty_path, self.pid = tty_path, pid
-        self.paths = {"sessions": self.sessions, "command": py("show", self.agents_file)}
+        self.agents_ran = os.path.join(root, "agents-ran")
+        # `claude agents` is never read at send time; this one leaves a mark if it is.
+        self.paths = {"sessions": self.sessions, "command": py("osascript", self.agents_ran, self.fail, self.then, "--")}
         self.registry(status=status)
         self.foreground(fg_row or claude_rows(pid))
-        self.agents([])
         open(self.fail, "w").close()
         self.env = mock.patch.dict(os.environ, {
             "FLEETWATCH_OSASCRIPT": py("osascript", self.log, self.fail, self.then, "--"),
@@ -80,10 +95,6 @@ class Rig:
             fh.write(rows + "\n")
         with open(self.fg + ".tty", "w") as fh:
             fh.write((tty or self.tty_path)[len("/dev/"):])
-
-    def agents(self, rows):
-        with open(self.agents_file, "w") as fh:
-            json.dump(rows, fh)
 
     def after_first_call(self, changes):
         """Files to rewrite once the first osascript call (the typing) has run."""
@@ -163,24 +174,19 @@ class Deliver(unittest.TestCase):
             self.rig.registry(status=status)
             self.sent()
 
-    def test_a_state_that_is_missing_or_not_known_to_be_safe_is_refused(self):
-        for status in (None, "", "compacting", "unknown"):
+    def test_a_state_that_is_not_known_to_be_safe_is_refused(self):
+        for status in ("compacting", "unknown"):
             with self.subTest(status=status):
                 self.rig.registry(status=status)
-                self.refused(containing="cannot tell whether Alpha is at a prompt")
+                self.refused(containing="cannot tell whether Alpha is at a prompt (state %s)" % status)
 
-    def test_a_missing_registry_status_falls_back_to_the_agents_state(self):
-        self.rig.registry(status=None)
-        self.rig.agents([{"name": "Alpha", "sessionId": SID, "state": "waiting"}])
-        self.refused(containing="is at a prompt")
-        self.rig.agents([{"name": "Alpha", "sessionId": OTHER_SID, "state": "idle"},
-                         {"name": "Alpha", "sessionId": SID, "status": "idle"}])
-        self.sent()
-
-    def test_the_registry_status_wins_over_the_agents_state(self):
-        self.rig.registry(status="blocked")
-        self.rig.agents([{"name": "Alpha", "sessionId": SID, "state": "idle"}])
-        self.refused(containing="is at a prompt")
+    def test_an_empty_registry_status_is_refused_without_asking_claude_agents(self):
+        for status in (None, ""):
+            with self.subTest(status=status):
+                self.rig.registry(status=status)
+                self.assertEqual(self.refused(), "cannot tell whether Alpha is at a prompt: its status is "
+                                                 "unknown; check its tab")
+        self.assertFalse(os.path.exists(self.rig.agents_ran), "claude agents was run")
 
     def test_two_rows_on_one_pid_without_ids_take_the_last_and_any_prompt_refuses(self):
         self.rig.registry("a.json", status="idle", session=None)
@@ -201,61 +207,75 @@ class Deliver(unittest.TestCase):
         self.refused(containing="is at a prompt")
 
     def test_a_terminal_running_something_else_is_refused_and_named(self):
-        for row, shown in (("4242 4242 4242 S+ /bin/zsh", "zsh"), ("4242 4242 4242 S+ -zsh", "zsh"),
-                           ("4242 4242 4242 S+ less", "less"), ("4242 4242 4242 S+ vim", "vim"),
-                           ("4242 4242 4242 S+ /usr/bin/ssh", "ssh"),
-                           ("4242 4242 4242 S+ /opt/My Tools/claude-helper", "claude-helper")):
-            self.rig.foreground(row)
+        for args, shown in (("/bin/zsh", "zsh"), ("-zsh", "zsh"), ("less", "less"), ("vim", "vim"),
+                            ("/usr/bin/ssh host", "ssh"), ("/opt/tools/claude-helper --x", "claude-helper"),
+                            ("/opt/My Tools/claude", "My")):
+            self.rig.foreground(row(4242, 4242, 4242, "S+", args, CLAUDE_UCOMM))
             reason = self.refused(containing="not Claude Code")
             self.assertIn("running " + shown, reason)
 
-    def test_an_editor_or_pager_claude_started_is_refused_and_named(self):
+    def test_anything_in_the_group_that_is_not_a_known_helper_is_refused_and_named(self):
         for member, shown in (("vim", "vim"), ("/usr/bin/nvim", "nvim"), ("nvim --embed", "nvim"),
-                              ("/usr/bin/less -R", "less"), ("man", "man"), ("nano", "nano")):
+                              ("/usr/bin/less -R", "less"), ("man ls", "man"), ("nano", "nano"),
+                              ("/bin/ed", "ed"), ("joe x.txt", "joe"), ("pico", "pico"), (("vim", "view"), "vim"),
+                              ("vimdiff a b", "vimdiff"), ("emacsclient -t", "emacsclient"), ("ssh host", "ssh"),
+                              ("fzf", "fzf"), (("Electron", "/opt/My Editor/editor --wait"), "Electron")):
             with self.subTest(member=member):
-                self.rig.foreground(claude_rows(PID, "caffeinate", member))
+                self.rig.foreground(claude_rows(PID, "caffeinate -i -t 300", member))
                 self.assertEqual(self.refused(containing="finish there first"),
-                                 "Alpha is in %s; finish there first" % shown)
+                                 "%s is running in Alpha; finish there first" % shown)
 
-    def test_the_editor_named_in_the_environment_is_refused(self):
-        self.rig.foreground(claude_rows(PID, "/opt/bin/myedit"))
-        self.sent()
-        for var in ("EDITOR", "VISUAL"):
-            with self.subTest(var=var), mock.patch.dict(os.environ, {var: "/opt/bin/myedit --wait"}):
-                self.refused(containing="Alpha is in myedit")
+    def test_an_editor_nobody_listed_is_refused_with_no_editor_variable_set(self):
+        self.rig.foreground(claude_rows(PID, "/opt/bin/myedit --wait"))
+        env = {k: v for k, v in os.environ.items() if k not in ("EDITOR", "VISUAL")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.refused(containing="myedit is running in Alpha")
 
-    def test_a_login_shell_in_the_group_is_refused(self):
-        self.rig.foreground(claude_rows(PID, "-bash"))
-        self.assertEqual(self.refused(), "Alpha is in bash; finish there first")
+    def test_a_shell_without_a_command_string_or_a_login_shell_is_refused(self):
+        for member, shown in (("-bash", "bash"), ("/bin/zsh", "zsh"), ("bash -i -c x", "bash"),
+                              ("-bash -i -c claude", "bash"), ("-zsh -c x", "zsh"), ("bash script.sh -c", "bash"),
+                              ("bash -o pipefail -c x", "bash"), ("/bin/zsh -ic x", "zsh")):
+            with self.subTest(member=member):
+                self.rig.foreground(claude_rows(PID, member))
+                self.assertEqual(self.refused(), "%s is running in Alpha; finish there first" % shown)
 
-    def test_helpers_in_the_group_do_not_refuse(self):
-        self.rig.foreground(claude_rows(PID, "caffeinate", "/opt/tools/venv/bin/python", "node",
-                                        "npm exec @scope/mcp@latest", "/bin/bash", "bash", "/bin/zsh"))
+    def test_the_helpers_seen_in_live_sessions_do_not_refuse(self):
+        self.rig.foreground(claude_rows(
+            PID, "caffeinate -i -t 300", ("python3.11", "/opt/tools/venv/bin/python -m server"),
+            ("python3.14", "/opt/cache/bin/python"), ("python", "python mcp"),
+            ("node", "npm exec @scope/mcp@latest"), ("node", "node /opt/x/index.js --stdio"),
+            ("slack-mcp-server", "/opt/x/bin/slack-mcp-server-darwin-arm64 --transport stdio"),
+            ("uv", "/opt/homebrew/bin/uv tool uvx x"), ("dart", "/opt/dart-sdk/bin/dart mcp-server"),
+            "/bin/bash -c ls", "bash -lc 'x y'", "/bin/zsh -c -l 'eval x'", "sh -ec x", "bash --norc -c x"))
         self.sent()
 
     def test_an_editor_outside_the_foreground_group_does_not_refuse(self):
-        self.rig.foreground(claude_rows(PID) + "\n5000 5000 %d Ss vim" % PID)
+        self.rig.foreground(claude_rows(PID) + "\n" + row(5000, 5000, PID, "Ss", "vim"))
         self.sent()
+
+    def test_a_line_that_does_not_parse_is_refused(self):
+        self.rig.foreground(claude_rows(PID) + "\n5000 5000 %d Ss" % PID)
+        self.refused(containing="cannot read what is running on Alpha's terminal")
 
     def test_a_stopped_or_exited_claude_is_refused(self):
         for stat, why in (("T+", "is stopped"), ("Z+", "has exited")):
-            self.rig.foreground("4242 4242 4242 %s claude" % stat)
+            self.rig.foreground(row(4242, 4242, 4242, stat, "claude", CLAUDE_UCOMM))
             self.refused(containing="Alpha's Claude Code " + why)
 
     def test_a_foreground_group_led_by_another_claude_is_refused(self):
-        self.rig.foreground("4242 4242 9999 S claude\n9999 9999 9999 S+ claude")
+        self.rig.foreground(row(4242, 4242, 9999, "S", "claude") + "\n" + row(9999, 9999, 9999, "S+", "claude"))
         self.refused(containing="another Claude Code")
 
     def test_a_claude_path_is_accepted(self):
-        self.rig.foreground("4242 4242 4242 Ss+ /home/someone/.local/bin/claude")
+        self.rig.foreground(row(4242, 4242, 4242, "Ss+", "/home/someone/.local/bin/claude --resume x", CLAUDE_UCOMM))
         self.sent()
 
     def test_no_foreground_group_is_refused(self):
-        self.rig.foreground("4242 4242 0 S 4242")
+        self.rig.foreground(row(4242, 4242, 0, "S", "claude"))
         self.refused(containing="nothing is running in the foreground")
 
     def test_a_session_that_left_the_terminal_is_refused(self):
-        self.rig.foreground("5555 5555 5555 S+ claude")
+        self.rig.foreground(row(5555, 5555, 5555, "S+", "claude"))
         self.refused(containing="no longer on that terminal")
 
     def test_the_terminal_read_names_the_tty(self):
@@ -271,7 +291,7 @@ class Deliver(unittest.TestCase):
         self.refused(containing="no longer registered")
 
     def test_the_terminal_is_checked_before_the_prompt_state(self):
-        self.rig.foreground("4242 4242 4242 S+ /bin/zsh")
+        self.rig.foreground(row(4242, 4242, 4242, "S+", "/bin/zsh"))
         self.rig.registry(status="blocked")
         self.refused(containing="running zsh")
 
@@ -286,7 +306,7 @@ class Deliver(unittest.TestCase):
         self.rig.after_first_call({self.rig.fg: claude_rows(PID, "vim") + "\n"})
         ok, reason = self.go("yes")
         self.assertFalse(ok)
-        self.assertTrue(reason.startswith(send.TYPED + ": Alpha is in vim"), reason)
+        self.assertTrue(reason.startswith(send.TYPED + ": vim is running in Alpha"), reason)
         self.assertEqual(len(self.rig.calls()), 1)
 
     def test_a_failed_return_says_the_text_was_typed(self):
@@ -303,6 +323,14 @@ class Deliver(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(reason, "iTerm2 is not running (-2700)")
         self.assertEqual(len(self.rig.calls()), 1, "no return after a failed typing")
+
+    def test_a_timeout_while_typing_says_the_text_may_be_typed(self):
+        with mock.patch.object(iterm, "type_into_tty", return_value=(False, iterm.TIMED_OUT)), \
+                mock.patch.object(iterm, "submit_tty") as submit:
+            ok, reason = self.go("yes")
+        self.assertFalse(ok)
+        self.assertEqual(reason, "typed but not submitted: timed out talking to iTerm2; check its tab")
+        submit.assert_not_called()
 
     def test_a_timeout_never_quotes_the_command_line(self):
         def slow(argv, **kw):
@@ -339,39 +367,42 @@ class Deliver(unittest.TestCase):
 
 
 class Terminal(unittest.TestCase):
-    PS_CLAUDE = """ 37482 46022 46022 S+   caffeinate
- 45743 45743 46022 Ss   /opt/homebrew/bin/bash
- 46022 46022 46022 R+   claude
- 46119 46022 46022 S+   /opt/tools/venv/bin/python
- 46120 46022 46022 S+   vim
+    PS_CLAUDE = """ 37482 46022 46022 S+   caffeinate       caffeinate -i -t 300
+ 45743 45743 46022 Ss   bash             /opt/homebrew/bin/bash -c sleep 9
+ 46022 46022 46022 R+   2.1.330          claude --resume x
+ 46119 46022 46022 S+   python3.11       /opt/tools/venv/bin/python -m server
+ 46120 46022 46022 S+   vim              vim /tmp/claude-prompt.md
 """
-    PS_SHELL_AFTER_CLAUDE = """ 45743 45743 45743 Ss+  /opt/homebrew/bin/bash
- 46022 46022 45743 T    claude
+    PS_SHELL_AFTER_CLAUDE = """ 45743 45743 45743 Ss+  bash             -bash
+ 46022 46022 45743 T    2.1.330          claude
 """
-    PS_SPACES = " 700 700 700 S+ /Applications/My App.app/Contents/MacOS/claude\n"
+    PS_SPACES = " 700 700 700 S+ claude /Applications/My App.app/Contents/MacOS/claude --x\n"
 
     def test_the_leader_and_the_other_members_of_the_foreground_group(self):
         term = send.parse_terminal(self.PS_CLAUDE)
         self.assertEqual(term["pids"], {37482, 45743, 46022, 46119, 46120})
+        self.assertFalse(term["bad"])
         fg = term["fg"]
-        self.assertEqual((fg["leader"], fg["stat"], fg["command"]), (46022, "R+", "claude"))
-        self.assertEqual(fg["members"], [(37482, "caffeinate"), (46119, "/opt/tools/venv/bin/python"),
-                                         (46120, "vim")])
-        self.assertEqual(send.interactive_member(fg["members"]), "vim")
+        self.assertEqual((fg["leader"], fg["stat"], fg["command"]), (46022, "R+", "claude --resume x"))
+        self.assertEqual(fg["members"], [(37482, "caffeinate", "caffeinate -i -t 300"),
+                                         (46119, "python3.11", "/opt/tools/venv/bin/python -m server"),
+                                         (46120, "vim", "vim /tmp/claude-prompt.md")])
+        self.assertEqual(send.foreign_member(fg["members"]), "vim")
 
     def test_a_shell_at_its_prompt(self):
         fg = send.parse_terminal(self.PS_SHELL_AFTER_CLAUDE)["fg"]
-        self.assertEqual((fg["leader"], fg["command"], fg["members"]), (45743, "/opt/homebrew/bin/bash", []))
+        self.assertEqual((fg["leader"], fg["command"], fg["members"]), (45743, "-bash", []))
 
     def test_a_command_with_spaces_stays_whole(self):
         fg = send.parse_terminal(self.PS_SPACES)["fg"]
-        self.assertEqual(fg["command"], "/Applications/My App.app/Contents/MacOS/claude")
+        self.assertEqual(fg["command"], "/Applications/My App.app/Contents/MacOS/claude --x")
 
     def test_nothing_in_the_foreground(self):
         self.assertIsNone(send.parse_terminal("")["fg"])
-        self.assertIsNone(send.parse_terminal(" 12 12 0 Ss bash\n")["fg"])
+        self.assertIsNone(send.parse_terminal(" 12 12 0 Ss bash -bash\n")["fg"])
         self.assertIsNone(send.parse_terminal("garbage\n")["fg"])
-        self.assertEqual(send.parse_terminal(" 12 12 0 Ss bash\n")["pids"], {12})
+        self.assertTrue(send.parse_terminal("garbage\n")["bad"])
+        self.assertEqual(send.parse_terminal(" 12 12 0 Ss bash -bash\n")["pids"], {12})
 
 
 def all_nodes(nodes):
@@ -486,7 +517,7 @@ class Board(AppWorld):
         self.assertEqual(self.rig.calls(), [])
 
     def test_a_refusal_shows_in_the_box_and_keeps_the_text(self):
-        self.rig.foreground("%d %d %d S+ /bin/zsh" % ((standin.PARENT_PID,) * 3))
+        self.rig.foreground(row(standin.PARENT_PID, standin.PARENT_PID, standin.PARENT_PID, "S+", "/bin/zsh"))
 
         async def body(app, pilot):
             await self.open_box(app, pilot)
@@ -620,73 +651,108 @@ class Board(AppWorld):
         self.rig.pid, self.rig.tty_path = pid, tty
         self.rig.foreground(claude_rows(pid), tty=tty)
 
-    def test_same_name_sessions_each_row_tells_its_own_session(self):
-        self.reg("Live One", self.s, pid=standin.PARENT_PID, cwd=self.folder)
+    SHARED = "two running sessions are named Live One; rename one first"
+
+    async def refused_on_every_row(self, app, pilot, pick, expect):
+        """Put the real cursor on every row pick() accepts, by key and then with the arrow keys, press t
+        and expect the refusal in the footer. Nothing mocks the cursor."""
+        keys = [k for k in app.current._order if pick(app.current._by_key[k])]
+        self.assertTrue(keys, "no row to try")
+
+        async def press_t(where):
+            app.status_text = ""
+            await pilot.press("t")
+            await settle(pilot, lambda: expect in (app.status_text or ""), "the refusal on " + where)
+            self.assertNotEqual(self.screen_name(app), "SendScreen")
+        for key in keys:
+            app.current.move_to(key)
+            await press_t(key)
+        app.current.move_to(app.current._order[0])
+        tried = 0
+        for _ in range(len(app.current._order)):
+            node = app.current.current()
+            if node is not None and pick(node):
+                await press_t("the arrow keys at " + node.key)
+                tried += 1
+            await pilot.press("down")
+        self.assertGreater(tried, 0)
+        return keys
+
+    def test_same_name_sessions_are_refused_on_the_sessions_tab(self):
         self.status_file("live.json", "Live One", self.s, "first item")
-        other, folder = self.add_second("Live One", "elsewhere", "second item")
+        self.add_second("Live One", "elsewhere", "second item")
+        self.aim_rig_at(os.getppid(), self.TTY2)
 
         async def body(app, pilot):
-            rows = [n for n in all_nodes(app.lists[views.SESSIONS_TAB].nodes) if n.key == "ses:Live One"]
-            self.assertEqual(sorted(n.sid for n in rows), sorted([self.s, other]))
-            for node in rows:
-                mine = node.sid == other
-                self.aim_rig_at(os.getppid() if mine else standin.PARENT_PID, self.TTY2 if mine else TTY)
-                await self.open_box(app, pilot, node)
-                self.assertIn("elsewhere" if mine else "work", self.box_texts(app)[1])
-                await self.send_text(app, pilot, "for you")
-                await settle(pilot, lambda: self.screen_name(app) != "SendScreen", "the send")
+            await self.refused_on_every_row(app, pilot, lambda n: n.session == "Live One", self.SHARED)
         self.drive_tab("3", body)
-        calls = self.rig.calls()
-        self.assertEqual(sorted(c["argv"][1] for c in calls[::2]), sorted([TTY, self.TTY2]))
+        self.assertEqual(self.rig.calls(), [])
 
-    def test_a_name_two_live_sessions_share_is_refused_when_only_the_name_is_known(self):
+    def test_same_name_sessions_are_refused_on_the_needs_tab_rows_and_tasks(self):
+        self.status_file("live.json", "Live One", self.s, "first item")
+        self.add_second("Live One", "elsewhere", "second item")
+        self.aim_rig_at(os.getppid(), self.TTY2)
+
+        async def body(app, pilot):
+            app.current.set_all(True)
+            keys = await self.refused_on_every_row(app, pilot, lambda n: n.session == "Live One", self.SHARED)
+            self.assertTrue(any(":t:" in k for k in keys), keys)
+        self.drive_needs(body)
+        self.assertEqual(self.rig.calls(), [])
+
+    def test_a_shared_name_is_refused_even_with_the_session_id(self):
         other, _ = self.add_second("Live One", "elsewhere")
 
+        async def body(app, pilot):
+            for sid_ in (None, self.s, other):
+                tty, reason, _n, _r = app.snapshot.target_record("Live One", sid=sid_, unique=True)
+                self.assertIsNone(tty)
+                self.assertEqual(reason, self.SHARED)
+            self.assertIsNotNone(app.snapshot.target_record("Live One")[0], "the jump is unchanged")
+        self.drive_needs(body)
+
+    def test_a_name_alone_that_finds_a_session_with_an_id_is_refused(self):
         async def body(app, pilot):
             tty, reason, _n, _r = app.snapshot.target_record("Live One", unique=True)
             self.assertIsNone(tty)
-            self.assertIn("more than one running session is named Live One", reason)
-            self.assertEqual(app.snapshot.target_record("Live One", sid=other, unique=True)[0], self.TTY2)
+            self.assertIn("cannot tell which session Live One is", reason)
+            self.assertEqual(app.snapshot.target_record("Live One", sid=self.s, unique=True)[0], TTY)
         self.drive_needs(body)
 
-    def test_an_item_two_same_name_sessions_share_asks_with_the_folder(self):
-        other, _ = self.add_second("Live One", "elsewhere")
+    def test_an_item_two_same_name_sessions_share_is_refused_after_the_pick(self):
+        self.add_second("Live One", "elsewhere")
         self.aim_rig_at(os.getppid(), self.TTY2)
 
         async def body(app, pilot):
             await pilot.press("2")
             await settle(pilot, lambda: app.active == 1, "the to-dos tab")
             item = next(n for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 2)
-            with mock.patch.object(app.current, "current", return_value=item):
-                await pilot.press("t")
-                await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
-            labels = app.screen.names
-            self.assertEqual(len(labels), 2)
-            self.assertTrue(any("elsewhere" in x for x in labels), labels)
-            await pilot.press(*(["down"] if "elsewhere" in labels[1] else []), "enter")
-            await settle(pilot, lambda: self.screen_name(app) == "SendScreen", "the send box")
-            self.assertIn("elsewhere", self.box_texts(app)[1])
-            await self.send_text(app, pilot, "picked")
-            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+            app.current.move_to(item.key)
+            await pilot.press("t")
+            await settle(pilot, lambda: self.screen_name(app) == "SessionPicker", "the picker")
+            self.assertTrue(any("elsewhere" in x for x in app.screen.names), app.screen.names)
+            await pilot.press("enter")
+            await settle(pilot, lambda: self.SHARED in (app.status_text or ""), "the refusal")
+            self.assertNotEqual(self.screen_name(app), "SendScreen")
         self.drive_needs(body)
-        self.assertEqual(self.rig.calls()[0]["argv"], ["-", self.TTY2, "picked"])
+        self.assertEqual(self.rig.calls(), [])
 
-    def test_an_item_one_of_two_same_name_sessions_holds_tells_that_one(self):
+    def test_an_item_one_of_two_same_name_sessions_holds_is_refused(self):
         self.status_file("live.json", "Live One", self.s, "only the first has this")
         self.add_second("Live One", "elsewhere", "only the second has this")
 
         async def body(app, pilot):
             await pilot.press("2")
             await settle(pilot, lambda: app.active == 1, "the to-dos tab")
-            item = next(n for n in all_nodes(app.current.nodes) if n.todo and n.owners
-                        and n.owners[0][1] == self.s)
-            self.assertIsNone(item.sid)
-            await self.open_box(app, pilot, item)
-            self.assertIn("work", self.box_texts(app)[1])
-            await self.send_text(app, pilot, "first")
-            await settle(pilot, lambda: "sent to Live One" in (app.status_text or ""), "the footer")
+            keys = [n.key for n in all_nodes(app.current.nodes) if n.todo and len(n.owners) == 1]
+            self.assertEqual(len(keys), 2)
+            for key in keys:
+                app.status_text = ""
+                app.current.move_to(key)
+                await pilot.press("t")
+                await settle(pilot, lambda: self.SHARED in (app.status_text or ""), "the refusal")
         self.drive_needs(body)
-        self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "first"])
+        self.assertEqual(self.rig.calls(), [])
 
     def test_an_item_two_sessions_share_asks_which_one(self):
         self.add_second("Other One", "elsewhere")
@@ -744,16 +810,49 @@ class Board(AppWorld):
         self.drive_tab("3", body)
         self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "parent"])
 
-    def test_a_helper_name_two_live_helpers_share_is_refused(self):
+    def test_a_helper_name_two_live_helpers_share_is_refused_and_never_falls_back(self):
         self.add_helper(own_tab=True)
         self.reg("wt-send-helper", sid(), pid=os.getppid(), cwd=self.folder)   # an unattached one
+        shared = "two running helpers are named wt-send-helper; rename one first"
 
         async def body(app, pilot):
-            tty, reason, _n, _r = app.snapshot.target_record(None, "wt-send-helper", unique=True)
-            self.assertIsNone(tty)
-            self.assertEqual(reason, "more than one running helper is named wt-send-helper")
+            for session in (None, "Live One"):
+                tty, reason, _n, _r = app.snapshot.target_record(session, "wt-send-helper", self.s, unique=True)
+                self.assertIsNone(tty)
+                self.assertEqual(reason, shared)
             self.assertEqual(app.snapshot.target_record(None, "wt-send-helper")[0], self.TTY3, "the jump is unchanged")
+            app.current.set_open("ses:Live One", True)
+            await settle(pilot, lambda: "ses:Live One:k:wt-send-helper" in app.current._order, "the helper row")
+            app.current.move_to("ses:Live One:k:wt-send-helper")
+            await pilot.press("t")
+            await settle(pilot, lambda: shared in (app.status_text or ""), "the refusal")
+            self.assertNotEqual(self.screen_name(app), "SendScreen")
+        self.drive_tab("3", body)
+        self.assertEqual(self.rig.calls(), [])
+
+    def test_a_helper_that_is_not_known_does_not_fall_back_to_its_parent(self):
+        async def body(app, pilot):
+            tty, reason, _n, _r = app.snapshot.target_record("Live One", "wt-gone", self.s, unique=True)
+            self.assertIsNone(tty)
+            self.assertEqual(reason, "wt-gone is not a live session")
+            self.assertEqual(app.snapshot.target_record("Live One", "wt-gone")[0], TTY, "the jump is unchanged")
         self.drive_needs(body)
+
+    def test_a_stale_row_is_refused_as_not_running_even_when_a_live_helper_has_its_name(self):
+        self.add_helper(own_tab=True)
+        self.aim_rig_at(standin.CHILD_PID, self.TTY3)
+        with open(os.path.join(self.paths["status"], "stale.json"), "w") as fh:
+            json.dump({"session": "wt-send-helper", "sessionId": sid(), "updated": standin.iso(-90 * 86400)}, fh)
+
+        async def body(app, pilot):
+            app.current.set_open("sesg:stale", True)
+            await settle(pilot, lambda: "stale:wt-send-helper" in app.current._order, "the stale row")
+            app.current.move_to("stale:wt-send-helper")
+            await pilot.press("t")
+            await settle(pilot, lambda: "wt-send-helper is not running" in (app.status_text or ""), "the refusal")
+            self.assertNotEqual(self.screen_name(app), "SendScreen")
+        self.drive_tab("3", body)
+        self.assertEqual(self.rig.calls(), [])
 
     def test_a_running_row_on_the_resume_tab_tells_that_session_by_its_id(self):
         os.remove(os.path.join(self.paths["status"], "live.json"))
@@ -771,6 +870,24 @@ class Board(AppWorld):
             await settle(pilot, lambda: "sent to Live Parked" in (app.status_text or ""), "the footer")
         self.drive_tab("4", body)
         self.assertEqual(self.rig.calls()[0]["argv"], ["-", TTY, "from resume"])
+
+    def test_a_resume_row_whose_name_two_running_sessions_share_is_refused(self):
+        os.remove(os.path.join(self.paths["status"], "live.json"))
+        os.remove(os.path.join(self.paths["sessions"], "%s.json" % self.s))
+        s, _ = self.transcript("Live Parked")
+        self.reg("Live Parked", s, pid=standin.PARENT_PID, cwd=self.folder)
+        park.park(s, "Live Parked", "note")
+        self.add_second("Live Parked", "elsewhere")
+
+        async def body(app, pilot):
+            await settle(pilot, lambda: app.current.current() is not None and app.current.current().resume == s,
+                         "the parked row")
+            await pilot.press("t")
+            await settle(pilot, lambda: "two running sessions are named Live Parked; rename one first"
+                         in (app.status_text or ""), "the refusal")
+            self.assertNotEqual(self.screen_name(app), "SendScreen")
+        self.drive_tab("4", body)
+        self.assertEqual(self.rig.calls(), [])
 
 
 if __name__ == "__main__":
