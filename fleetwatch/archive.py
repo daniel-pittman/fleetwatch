@@ -122,14 +122,16 @@ def transcript_files(root):
 
 def wanted(src_stat, dest_path):
     """True when src should replace or create dest: dest is missing, or src is neither older nor smaller
-    than dest and differs from it in size or time."""
+    than dest and differs from it in size or time. Times compare in whole seconds, because some rsyncs
+    (macOS's openrsync among them) set only whole seconds; finer, every run would copy every file again."""
     try:
         d = os.stat(dest_path)
     except FileNotFoundError:
         return True
-    if src_stat.st_size < d.st_size or src_stat.st_mtime < d.st_mtime:
+    src_s, dest_s = int(src_stat.st_mtime), int(d.st_mtime)
+    if src_stat.st_size < d.st_size or src_s < dest_s:
         return False
-    return src_stat.st_size != d.st_size or src_stat.st_mtime != d.st_mtime
+    return src_stat.st_size != d.st_size or src_s != dest_s
 
 
 def plan(src_root, dest_root, rels):

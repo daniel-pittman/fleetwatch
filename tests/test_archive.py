@@ -117,7 +117,7 @@ class RunCases:
         self.assertTrue(record["ok"], record)
         self.assertEqual(record["method"], self.METHOD)
         self.assertEqual(self.read(self.a("-proj", s + ".jsonl")), self.read(path))
-        self.assertEqual(os.path.getmtime(self.a("-proj", s + ".jsonl")), os.path.getmtime(path))
+        self.assertEqual(int(os.path.getmtime(self.a("-proj", s + ".jsonl"))), int(os.path.getmtime(path)))
         self.assertEqual(self.read(self.a("-proj", s, "subagents", "agent-a.jsonl")), "sub\n")
         self.assertEqual(self.read(self.a("-proj", s, "tool-results", "r1.txt")), "result\n")
         self.assertTrue(os.path.exists(self.a("-proj", "agent-old.jsonl")))
@@ -163,9 +163,10 @@ class RunCases:
         self.assertEqual(record["copied"], 1)
 
     def test_an_unchanged_tree_copies_nothing(self):
-        self.live()
+        s, _ = self.live(mtime=time.time() - HOUR + 0.75)
+        self.write(os.path.join(self.projects, "-proj", s, "tool-results", "r.txt"), "r\n", time.time() - 0.25)
         self.write(os.path.join(self.claude, "history.jsonl"), "h\n")
-        self.run_archive()
+        self.assertEqual(self.run_archive()["copied"], 3)
         self.assertEqual(self.run_archive()["copied"], 0)
 
     def test_the_record_and_the_log_line(self):
@@ -186,9 +187,25 @@ class PythonCopy(RunCases, Home):
     METHOD = "python"
 
 
-@unittest.skipUnless(shutil.which("rsync"), "no rsync on PATH")
-class RsyncCopy(RunCases, Home):
+class RsyncCases(RunCases):
     METHOD = "rsync"
+    RSYNC = None
+
+    def setUp(self):
+        super().setUp()
+        if not self.RSYNC:
+            self.skipTest("no such rsync here")
+        os.environ["FLEETWATCH_RSYNC"] = self.RSYNC
+
+
+class RsyncCopy(RsyncCases, Home):
+    RSYNC = shutil.which("rsync")
+
+
+class SystemRsyncCopy(RsyncCases, Home):
+    """macOS's /usr/bin/rsync is openrsync, which sets whole-second times."""
+    RSYNC = "/usr/bin/rsync" if os.access("/usr/bin/rsync", os.X_OK) and \
+        os.path.realpath(shutil.which("rsync") or "") != "/usr/bin/rsync" else None
 
 
 class RunEdges(Home):
