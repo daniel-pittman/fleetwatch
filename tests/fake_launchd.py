@@ -1,10 +1,9 @@
 """A stand-in for `launchctl`, keeping what is loaded in a JSON file: FAKE_LAUNCHCTL_STATE names it
 ({"loaded": {label: plist path}, "running": [label, ...]}), FAKE_LAUNCHCTL_LOG gets one line per call.
 
-Supported: `print gui/UID/LABEL`, `bootstrap gui/UID PLIST`, `bootout gui/UID/LABEL`, `kickstart -k
-gui/UID/LABEL` (marks it running) and `list`. A label in
-the state's "fail" list makes bootstrap and bootout of it fail the way launchctl does. It never touches a
-real launchd. Use it from a test as a Manager runner (`runner(state, log)`) or as a command
+Supported: `print gui/UID/LABEL`, `bootstrap gui/UID PLIST` (a kept-alive job starts running), `bootout
+gui/UID/LABEL`, `kickstart -k gui/UID/LABEL` (marks it running) and `list`. A label in the state's "fail"
+list makes bootstrap and bootout of it fail the way launchctl does. It never touches a real launchd. Use it from a test as a Manager runner (`runner(state, log)`) or as a command
 (FLEETWATCH_LAUNCHCTL="python tests/fake_launchd.py").
 """
 import json
@@ -45,7 +44,8 @@ def call(argv, state_path, log_path=None):
     if verb == "bootstrap" and len(argv) == 3:
         try:
             with open(argv[2], "rb") as fh:
-                label = plistlib.load(fh)["Label"]
+                info = plistlib.load(fh)
+            label = info["Label"]
         except (OSError, KeyError, plistlib.InvalidFileException):
             return 5, "", "Bootstrap failed: 5: Input/output error\n"
         if label in fail:
@@ -53,6 +53,8 @@ def call(argv, state_path, log_path=None):
         if label in loaded:
             return 37, "", "Bootstrap failed: 37: Operation already in progress\n"
         loaded[label] = argv[2]
+        if info.get("KeepAlive"):
+            state["running"] = sorted(running | {label})
         _save(state_path, state)
         return 0, "", ""
     if verb == "bootout" and len(argv) == 2:
