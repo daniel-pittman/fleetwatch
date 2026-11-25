@@ -1348,20 +1348,26 @@ def last_error(name):
 
 
 def record_streak(name, error):
+    """logs/streaks/NAME holds "RUNS SINCE": the failed runs in a row and the epoch second the streak began.
+    fleetwatch.index_health.read_streak reads it (a file holding RUNS alone has no start)."""
     streak_file = ROOT / "logs" / "streaks" / name
     try:
-        streak = int(streak_file.read_text()) if streak_file.exists() else 0
+        parts = streak_file.read_text().split() if streak_file.exists() else []
+        streak = int(parts[0]) if parts else 0
+        since = int(float(parts[1])) if len(parts) > 1 else None
     except ValueError:
-        streak = 0
+        streak, since = 0, None
     if error is None:
         if streak:
             with open(FAILURES_LOG, "a") as f:
                 f.write("%s %s recovered after %d failed run(s)\n" % (now_iso(), name, streak))
             streak_file.unlink()
         return
+    if not streak:
+        since = int(time.time())
     streak += 1
     streak_file.parent.mkdir(parents=True, exist_ok=True)
-    streak_file.write_text(str(streak))
+    streak_file.write_text(str(streak) if since is None else "%d %d" % (streak, since))
     with open(FAILURES_LOG, "a") as f:
         f.write("%s %s FAILED (%d in a row): %s\n" % (now_iso(), name, streak, error))
 

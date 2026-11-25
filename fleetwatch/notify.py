@@ -7,7 +7,7 @@ poll and compares them with what it saw before. A notification fires on these tr
     stuck     a session becomes stuck on a permission prompt
     question  a session has a new question (keyed by session and a hash of its text)
     due       one of your dated items is due today (once per item per day) or overdue (once)
-    index     an index problem appears
+    index     an index problem appears, and again once when its failure streak passes the alert limits
     watch     a watch flag appears
 
 Nothing already there when the first run starts is announced: that run records what it sees
@@ -134,7 +134,7 @@ class Item:
     name: str               # the session, or the index, it concerns
     sid: str = ""           # the session ID, for the click
     text: str = ""
-    variant: str = ""       # a due item's "today" or "overdue"; "run" on a watch item about the runs
+    variant: str = ""       # a due item's "today" or "overdue"; "run" on a watch item about the runs; "streak" on an index failure streak
 
 
 def _gkind(item):
@@ -147,12 +147,22 @@ def _hash(text):
 
 
 def index_items(now):
-    """One item per index with a problem; nothing when the index extra is missing or the registry cannot be read."""
+    """One item per index with a problem, and one more for a failure streak past its limits; nothing when the
+    index extra is missing or the registry cannot be read. The streak's key holds no count or time, so a
+    streak is announced once while it lasts, and again only after a run succeeds and a new one begins."""
     try:
         from . import index_health
         res = index_health.load()
-        return [Item("index", ("index", r.name, ", ".join(r.problems(now))), r.name,
-                     text=", ".join(r.problems(now))) for r in index_health.problem_rows(res.rows, now)]
+        out = []
+        for r in index_health.problem_rows(res.rows, now):
+            problems = r.problems(now)
+            streak = r.streak_problem(now)
+            others = [p for p in problems if p != streak]
+            if others:
+                out.append(Item("index", ("index", r.name, ", ".join(others)), r.name, text=", ".join(others)))
+            if streak:
+                out.append(Item("index", ("index", r.name, "streak"), r.name, text=streak, variant="streak"))
+        return out
     except Exception:
         return []
 
@@ -408,13 +418,15 @@ class Notifier:
             text = ("%s has an overdue item" if n == 1 else "%s has overdue items") % name if overdue \
                 else ("%s has an item due today" if n == 1 else "%s has items due today") % name
         elif first.kind == "index":
-            text = "Index %s has a problem" % name
+            streak = next((i for i in members if i.variant == "streak"), None)
+            text = "Index %s has %s" % (name, streak.text) if streak else "Index %s has a problem" % name
         elif first.variant == "run":
             text = "Watches are not running"
         else:
             text = "%s has a watch flag" % name
         if self.settings.show_text:
-            detail = "; ".join(i.text for i in members if i.text and first.kind != "stuck")
+            detail = "; ".join(i.text for i in members
+                              if i.text and first.kind != "stuck" and i.variant != "streak")
             if detail:
                 text += ": " + detail
         return Message(TITLE, text, click_command(first))
