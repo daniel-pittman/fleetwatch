@@ -275,6 +275,20 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.count("not installed"), len(OURS))
 
+    def test_a_job_that_cannot_be_unloaded_keeps_its_plist_and_fails(self):
+        run(install_cli.install_main, self.h)
+        st = self.h.launchd()
+        st["fail"] = ["local.fleetwatch.index-refresh", "local.fleetwatch.notify"]
+        self.h.state_file.write_text(json.dumps(st))
+        code, out = run(install_cli.uninstall_main, self.h)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(sorted(p.name for p in self.h.agents.iterdir()),
+                         ["local.fleetwatch.index-refresh.plist", "local.fleetwatch.notify.plist"])
+        self.assertEqual(sorted(self.h.launchd()["loaded"]),
+                         ["local.fleetwatch.index-refresh", "local.fleetwatch.notify"])
+        self.assertIn("could not unload local.fleetwatch.index-refresh", out)
+        self.assertIn("kept %s" % deps._home(self.h.agents / "local.fleetwatch.index-refresh.plist"), out)
+
     def test_uninstall_dry_run_changes_nothing(self):
         run(install_cli.install_main, self.h)
         n, before = len(self.h.calls()), sorted(p.name for p in self.h.agents.iterdir())

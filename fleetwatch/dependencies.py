@@ -269,8 +269,13 @@ class Job:
                 if res.ok:
                     ctx.say("  unloaded %s" % label)
                 else:
-                    ok = False
+                    # A loaded job whose file is gone can no longer be reloaded or inspected from it,
+                    # so its file stays until it unloads.
                     ctx.say("  could not unload %s: %s" % (label, res.detail))
+                    for p in self._files(m):
+                        if p.exists():
+                            ctx.say("  kept %s while %s is loaded" % (_home(p), label))
+                    return False
         elif loaded is None and self.installed(m):
             ctx.say("  %s cannot be asked whether %s is loaded (%s); if it is: %s"
                     % (m.name, label, m.why_not(), _unload_hint(m, label)))
