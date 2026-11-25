@@ -152,8 +152,8 @@ class RunCases:
         self.write(path, "cut\n", now - HOUR)
         self.run_archive()
         self.assertEqual(self.read(self.a("-proj", s + ".jsonl")), kept)
-        # Larger but older than the archive copy: refused.
-        self.write(path, kept + "more\n", now - 3 * HOUR)
+        # Larger but older than the archive copy, and not starting with it: refused.
+        self.write(path, "X" + kept[1:] + "more\n", now - 3 * HOUR)
         self.run_archive()
         self.assertEqual(self.read(self.a("-proj", s + ".jsonl")), kept)
         # Larger and newer: copied.
@@ -168,6 +168,50 @@ class RunCases:
         self.write(os.path.join(self.claude, "history.jsonl"), "h\n")
         self.assertEqual(self.run_archive()["copied"], 3)
         self.assertEqual(self.run_archive()["copied"], 0)
+
+    def test_a_cut_off_archive_copy_is_replaced_even_when_newer(self):
+        # An interrupted transfer leaves the first part of a transcript, with a later time than the live file.
+        now = time.time()
+        s, path = self.live(mtime=now - 2 * HOUR, extra="line\n" * 200)
+        whole = self.read(path)
+        self.write(self.a("-proj", s + ".jsonl"), whole[:len(whole) // 2], now - 60)
+        record = self.run_archive()
+        self.assertTrue(record["ok"], record)
+        self.assertEqual(self.read(self.a("-proj", s + ".jsonl")), whole)
+        self.assertEqual(record["copied"], 1)
+        self.assertEqual(self.run_archive()["copied"], 0)
+
+    def test_a_shorter_newer_archive_copy_that_is_not_a_prefix_is_kept(self):
+        now = time.time()
+        s, path = self.live(mtime=now - 2 * HOUR, extra="line\n" * 200)
+        self.write(self.a("-proj", s + ".jsonl"), "a different start\n", now - 60)
+        self.run_archive()
+        self.assertEqual(self.read(self.a("-proj", s + ".jsonl")), "a different start\n")
+
+    def test_a_symlinked_history_is_not_archived(self):
+        real = self.write(os.path.join(self.root, "elsewhere.jsonl"), "h1\n")
+        os.symlink(real, os.path.join(self.claude, "history.jsonl"))
+        self.live()
+        record = self.run_archive()
+        self.assertTrue(record["ok"], record)
+        self.assertFalse(os.path.lexists(os.path.join(self.dest, "history.jsonl")))
+        self.assertEqual(record["copied"], 1)
+
+    def test_a_run_removes_temp_copies_a_stopped_run_left_and_nothing_else(self):
+        s, _ = self.live()
+        self.run_archive()
+        folder = self.a("-proj")
+        dead = [self.write(os.path.join(folder, ".fleetwatch-archive-ab12_xyz"), "partial"),
+                self.write(os.path.join(folder, s, "subagents", ".fleetwatch-archive-q9w8e7r6"), "partial"),
+                self.write(os.path.join(self.dest, ".fleetwatch-archive-hist0001"), "partial"),
+                self.write(os.path.join(str(archive.state_dir()), "fleetwatch-archive-k3j4h5g6.list"), "a\0")]
+        kept = [self.write(os.path.join(folder, ".fleetwatch-archive-notes.txt"), "mine"),
+                self.write(os.path.join(folder, "fleetwatch-archive-ab12_xyz"), "mine")]
+        self.assertTrue(self.run_archive()["ok"])
+        for p in dead:
+            self.assertFalse(os.path.exists(p), p)
+        for p in kept:
+            self.assertTrue(os.path.exists(p), p)
 
     def test_the_record_and_the_log_line(self):
         self.live()
@@ -238,6 +282,18 @@ class RunEdges(Home):
         self.assertFalse(record["ok"])
         self.assertIn("rsync exited 1", record["error"])
         self.assertIn("failed: rsync exited 1", self.read(str(archive.log_path())))
+
+    def test_the_rsync_count_is_what_rsync_reports_it_copied(self):
+        # Two files planned; the stand-in reports one transfer (the other skipped or vanished) and exits 24.
+        a, _ = self.live()
+        self.live()
+        stand_in = self.write(os.path.join(self.root, "rsync-one"),
+                              "#!/bin/sh\necho 'cd+++++++ -proj/'\necho '>f+++++++ -proj/%s.jsonl'\nexit 24\n" % a)
+        os.chmod(stand_in, 0o755)
+        os.environ["FLEETWATCH_RSYNC"] = stand_in
+        record = archive.run(self.paths, None, io.StringIO())
+        self.assertTrue(record["ok"], record)
+        self.assertEqual(record["copied"], 1)
 
     def test_rsync_exit_24_is_vanished_files_not_a_failure(self):
         self.live()
@@ -337,7 +393,7 @@ class Status(Home):
         for key in archive.STATE_KEYS + ("age_s", "coverage", "archive"):
             self.assertIn(key, doc)
         self.assertEqual(doc["coverage"], {"live": 1, "archived": 1, "missing": 0, "missing_before": 0,
-                                           "behind": 0})
+                                           "behind": 0, "diverged": 0})
 
     def test_a_transcript_the_last_run_missed_a_failed_run_and_a_stale_run(self):
         archive.run(self.paths, "python", io.StringIO())

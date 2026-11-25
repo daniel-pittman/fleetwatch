@@ -45,5 +45,5 @@ All optional: a missing one is a warning, and doctor still exits 0.
 
 ## Other checks
 
-- **The archive:** `fleetwatch.archive.check()`: the last archive run (from `archive/last_run.json` in the state folder) never happened, failed or is older than twice its interval, or a live transcript last written before the last run started has no archive copy. A job installed less than two intervals ago that has not run yet is fine.
+- **The archive:** `fleetwatch.archive.check()`: the last archive run (from `archive/last_run.json` in the state folder) never happened, failed or is older than twice its interval, or a live transcript last written before the last run started has no archive copy. A job installed less than two intervals ago that has not run yet is fine. An archive copy shorter than its live transcript that differs from the live file's start is a warning.
 - **Indexes:** an index whose scheduled refresh has failed 3 runs in a row, or for 6 hours, is named with its last error's first line. `[alerts] index_failure_runs` and `index_failure_hours` in settings.toml change the limits. The same streak shows on the board's Needs you tab and is sent once per streak by `fleetwatch notify`.

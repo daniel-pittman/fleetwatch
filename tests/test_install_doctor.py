@@ -511,6 +511,22 @@ class Doctor(unittest.TestCase):
         self.assertEqual(bad[("session archive", "archive check")]["detail"],
                          "1 live transcript with no archive copy")
 
+    def test_a_shorter_archive_copy_that_differs_is_a_warning(self):
+        self.healthy()
+        grown = self.h.transcript("-work-c/%s.jsonl" % sid(4), archived=True, age=7200)
+        grown.write_text(grown.read_text() + '{"type":"assistant"}\n')        # behind, a prefix: the next run copies it
+        code, rows = self.rows()
+        self.assertEqual(code, 0)
+        self.assertEqual(rows[("session archive", "archive check")]["status"], "ok")
+        self.assertNotIn(("session archive", "archive copies"), rows)
+        cut = self.h.archive / "projects" / "-work-a" / ("%s.jsonl" % sid(1))
+        cut.write_text("{}\n")                                               # shorter, and not the live file's start
+        code, rows = self.rows()
+        self.assertEqual(code, 0)
+        row = rows[("session archive", "archive copies")]
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("1 archive copy is shorter than its live transcript and differs from its start", row["detail"])
+
     def test_the_archive_job_running_late(self):
         self.healthy()
         self.h.archive_run(ago=3 * 3600)
