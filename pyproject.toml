@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fleetwatch"
-version = "1.1.0"
+version = "1.2.0"
 description = "A terminal dashboard for many Claude Code sessions at once: which ones need you, desktop notifications, and a searchable memory that survives compaction"
 readme = "README.md"
 license = "MIT"
