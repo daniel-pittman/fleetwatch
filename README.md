@@ -75,7 +75,7 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
     fleetwatch doctor --fix         # make the safe repairs, report the rest
     fleetwatch uninstall            # stop and remove every job
 
-fleetwatch runs four background jobs, as launchd agents on macOS (in `~/Library/LaunchAgents`) or systemd user units elsewhere, each logging to fleetwatch's state folder:
+fleetwatch runs four background jobs, as launchd agents on macOS (in `~/Library/LaunchAgents`) or systemd user units elsewhere (systemd 240 or later), each logging to fleetwatch's state folder:
 
 | Job | What it does | Runs | Its own command |
 |---|---|---|---|

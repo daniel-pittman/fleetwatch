@@ -417,6 +417,43 @@ class Doctor(unittest.TestCase):
             os.utime(p, (old, old))
         self.assertEqual(self.rows()[1][("index refresh", "last run")]["status"], "fail")
 
+    def test_on_linux_a_job_that_ran_is_seen_through_the_log_its_unit_names(self):
+        # systemd writes a run's output where the unit's StandardOutput= and StandardError= say; doctor
+        # reads <state>/<name>.log and .err, so a healthy Linux machine passes only if the two agree.
+        runner = lambda argv, **_kw: subprocess.CompletedProcess(argv, 0, "", "")
+        m = services.Manager("linux", runner, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"})
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(install_cli.install_main([], io.StringIO(), m), 0)
+            units = self.h.root / "systemd"
+            old = time.time() - 3 * 3600
+            for p in units.iterdir():
+                os.utime(p, (old, old))
+            for unit, stream in (("fleetwatch-index-refresh", "StandardOutput"),
+                                 ("fleetwatch-watch-run", "StandardError")):
+                lines = (units / (unit + ".service")).read_text().splitlines()
+                target = {k: v for k, _, v in (ln.partition("=") for ln in lines)}.get(stream, "")
+                self.assertTrue(target.startswith("append:"), (unit, stream, lines))
+                with open(target[len("append:"):], "a") as f:      # what systemd does on a run
+                    f.write("=== run started\n")
+            self.h.transcript("-work-a/%s.jsonl" % sid(1), archived=True, age=7200)
+            self.h.archive_run()
+            out = io.StringIO()
+            install_cli.doctor_main(["--json"], out, m)
+        rows = {(c["item"], c["check"]): c for c in json.loads(out.getvalue())["checks"]}
+        for name in ("index refresh", "watch run"):
+            self.assertEqual(rows[(name, "last run")]["status"], "ok", rows[(name, "last run")])
+
+    def test_linux_units_append_to_the_state_folder_logs(self):
+        with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(
+                self.h.root / "state 100%")}):
+            schedule.install(io.StringIO(), schedule.INDEX)
+            service = (self.h.root / "systemd" / "fleetwatch-index-refresh.service").read_text()
+            log_dir = Path(schedule.settings.state_dir())
+        self.assertTrue(log_dir.is_dir())
+        self.assertIn("StandardOutput=append:%s\n" % str(log_dir / "index-refresh.log").replace("%", "%%"), service)
+        self.assertIn("StandardError=append:%s\n" % str(log_dir / "index-refresh.err").replace("%", "%%"), service)
+        self.assertLess(service.index("StandardOutput="), service.index("ExecStart="))
+
     def test_an_older_job_still_loaded_or_installed(self):
         self.healthy()
         self.h.legacy(LEGACY_INDEX)

@@ -235,13 +235,19 @@ def install(out=None, job=INDEX, hint=True):
     cron_env = "".join("%s=%s " % (k, shlex.quote(v).replace("%", "\\%")) for k, v in environment)
     minutes = job.interval_s // 60
     service, timer = _units(job)
+    # Each run appends to <state>/<name>.log and .err, as the launchd plist does, because doctor's
+    # last-run check reads those files on both platforms. `append:` needs systemd 240 or later, and
+    # systemd creates the file but not its folder. systemd expands % specifiers, so % is doubled.
+    logs = "".join("%s=append:%s\n" % (key, str(log_dir / (_log_name(job) + ext)).replace("%", "%%"))
+                   for key, ext in (("StandardOutput", ".log"), ("StandardError", ".err")))
     try:
+        log_dir.mkdir(parents=True, exist_ok=True)
         service.parent.mkdir(parents=True, exist_ok=True)
         service.write_text(
             "[Unit]\nDescription=%s\n\n[Service]\nType=oneshot\n"
-            "Nice=10\n%s%sExecStart=%s\n"
+            "Nice=10\n%s%s%sExecStart=%s\n"
             % (job.what, "IOSchedulingClass=idle\n" if job.background else "",
-               "".join(_systemd_env_line(k, v) for k, v in environment), cmd))
+               "".join(_systemd_env_line(k, v) for k, v in environment), logs, cmd))
         timer.write_text(
             "[Unit]\nDescription=%s every %d minutes\n\n[Timer]\n"
             "OnBootSec=5min\nOnUnitActiveSec=%dmin\n\n[Install]\nWantedBy=timers.target\n"
