@@ -3,8 +3,10 @@ schedule that stopped still shows as stale."""
 import json
 import os
 import sys
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
@@ -14,14 +16,39 @@ from test_indexes_tab import CanaryTree, iso  # noqa: E402
 
 H = 3600
 
+ROOT_VARS = ("FLEETWATCH_CONFIG_DIR", "XDG_STATE_HOME", "XDG_DATA_HOME")
+
+
+def isolate(test):
+    """Give one test its own config, state and data folders and its own indexer settings, with
+    no routing sources and no catch-all, so a settings.toml, launch ledger or placements file on
+    the machine running the suite can neither change the result nor be written. Restores the
+    environment and the indexer settings on cleanup."""
+    from fleetwatch import indexes, settings
+    from fleetwatch.memory import refresh
+    tmp = tempfile.TemporaryDirectory()
+    test.addCleanup(tmp.cleanup)
+    base = Path(tmp.name).resolve()
+    saved = dict(os.environ)
+    test.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
+    for var, sub in zip(ROOT_VARS, ("config", "state", "data")):
+        (base / sub).mkdir()
+        os.environ[var] = str(base / sub)
+    for var in ("FLEETWATCH_DEMO", "FLEETWATCH_LAUNCH_LEDGER", "FLEETWATCH_PROJECTS_DIR"):
+        os.environ.pop(var, None)
+    test.addCleanup(refresh.configure, refresh.SETTINGS)
+    refresh.configure(settings.indexer(raw={
+        "paths": {"data_dir": str(base / "data"), "projects_dir": str(base / "projects")},
+        "routing": {"sources": {"codex": [], "antigravity": []}}}, cfg_dir=base / "config"))
+    test.enterContext(mock.patch.object(indexes, "calling_session", return_value=None))
+    return base
+
 
 class RunMarkerCase(unittest.TestCase):
     def setUp(self):
-        self.saved = dict(os.environ)
-        os.environ.pop("FLEETWATCH_DEMO", None)
+        isolate(self)
         self.tree = CanaryTree()
         self.addCleanup(self.tree.close)
-        self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.saved)))
 
     def own(self, name, ago):
         path = self.tree.root / name / "state" / "last_run.json"
@@ -79,6 +106,9 @@ class LongRun(RunMarkerCase):
 
 
 class Marker(unittest.TestCase):
+    def setUp(self):
+        isolate(self)
+
     def run_all(self, root, fail=()):
         from fleetwatch.memory import refresh
         reg = {"defaults": {}, "indexes": {"one": {}, "two": {}, "bad": {}}}
@@ -102,8 +132,6 @@ class Marker(unittest.TestCase):
         return seen
 
     def test_the_marker_holds_only_times_and_names_and_is_replaced_atomically(self):
-        import tempfile
-        from pathlib import Path
         from fleetwatch.memory import refresh
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -116,13 +144,12 @@ class Marker(unittest.TestCase):
             self.assertGreaterEqual(final["ended"], final["started"])
             self.assertIsNone(seen[0]["ended"])
             self.assertEqual(seen[1]["finished"], ["one"])
-            self.assertEqual(os.listdir(root / "logs"), ["refresh_run.json"])
+            # Atomic replacement leaves no temporary file; the run lock is the run's own file.
+            self.assertEqual(sorted(os.listdir(root / "logs")), ["refresh-run.lock", "refresh_run.json"])
             self.assertGreaterEqual(replace.call_count, 5)
             self.assertTrue(hasattr(refresh, "write_run_marker"))
 
     def test_a_single_index_refresh_writes_no_marker(self):
-        import tempfile
-        from pathlib import Path
         from fleetwatch.memory import refresh
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

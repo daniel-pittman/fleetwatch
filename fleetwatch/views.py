@@ -8,7 +8,7 @@ from collections import Counter
 
 from .config import OTHER
 from .data import (MARKERS_UTF8, LOCAL_TZ, ago, build_view, clean, date_label, day, dedup_key,
-                   due_label, has_overdue, items_of, plural, short_name, task_label, timeline_rows)
+                   due_label, has_overdue, ident, items_of, plural, short_name, task_label, timeline_rows)
 from .index_health import problem_rows
 from .providers import format_counts
 from .resume import home_folder, left_off, short_folder, tags
@@ -84,6 +84,9 @@ class Node:
     start_open: bool = False
     session: str = None                            # cleaned name of the owning top-level session
     helper: str = None                             # a helper session this row is about; its own tab first
+    sid: str = None                                # sessionId of the owning top-level session; Enter and p go by it
+    helper_sid: str = None                         # sessionId of the helper a helper row is about
+    ended: bool = False                            # a Needs-you row for a session that is not running
     sessions: list = field(default_factory=list)   # every session holding a merged item (a picker when > 1)
     section: bool = False                          # a header: Enter folds it, nothing to jump to
     sort: tuple = ()                               # coarse rank that stabilise() keeps rows within
@@ -98,6 +101,24 @@ class Node:
     @property
     def expandable(self):
         return bool(self.body or self.children)
+
+
+def _key_part(value):
+    if isinstance(value, tuple):
+        return ":".join(_key_part(v) for v in value)
+    if isinstance(value, str):
+        return value.replace("%", "%25").replace(":", "%3A")
+    return "%r" + _key_part(repr(value))      # no escaped string starts with %r
+
+
+def node_key(kind, *parts):
+    """The key of a row about a session: the row kind, then the identity of what the row shows.
+
+    A session or helper goes in as its data.ident, never as its display name, and every part is escaped
+    so that parts cannot run together. Two different rows therefore never share a key, whatever the
+    sessions are named. The cursor, the folds and the row order are all kept by key, so a shared key
+    would put the cursor on a row other than the one it is drawn on."""
+    return ":".join([kind] + [_key_part(p) for p in parts])
 
 
 def _row_text(parts):
@@ -174,7 +195,8 @@ def needs_nodes(view, now, sort="oldest"):
     nodes = []
     for x in sorted(view["for_you"], key=lambda x: (_needs_key(sort, x), x["updated"] or 0)):
         n_q = len(x["qs"])
-        base = "needs:" + x["name"]
+        own, sid, gone = ident(x["r"]), x["r"].get("sessionId"), bool(x.get("gone"))
+        base = node_key("needs", own)
         head = [(x["name"], "bold")]
         if x["persona"]:
             head.append((" (%s)" % x["persona"], ""))
@@ -200,15 +222,15 @@ def needs_nodes(view, now, sort="oldest"):
         kids = []
         for c, secs in x["helper_stuck"]:
             cname = clean(c["name"])
-            kids.append(Node("%s:h:%s" % (base, cname), _row_text(
+            kids.append(Node(node_key("needs", own, "h", ident(c)), _row_text(
                 [("! ", RED), ("helper %s stuck on a prompt %s" % (cname, ago(secs)), RED)]),
-                session=x["name"], helper=cname, hang=2))
-        for i, t in enumerate(x["tasks"], 1):
+                session=x["name"], sid=sid, helper=cname, helper_sid=c.get("sessionId"), hang=2))
+        for t in x["tasks"]:
             label, red = task_label(t)
             kid = _row_text([(label + ": ", RED if red else DIM if t["kind"] == "undated" else ""),
                              (t["what"], RED if red else DIM if t["kind"] == "undated" else "")])
-            kids.append(Node("%s:t:%d:%s" % (base, i, t["what"]), kid, session=x["name"], hang=2,
-                             todo=(tuple(t["keys"]), t["what"])))
+            kids.append(Node(node_key("needs", own, "t", t["id"]), kid, session=x["name"], sid=sid,
+                             ended=gone, hang=2, todo=(tuple(t["keys"]), t["what"])))
         width = len(str(n_q))
         for i, (text, since, tag) in enumerate(x["qs"], 1):
             lead = "%*d. " % (width, i)
@@ -217,8 +239,11 @@ def needs_nodes(view, now, sort="oldest"):
                 t.append(" · %s" % ago(now - since), style=DIM)
             if tag:
                 t.append(" [%s]" % tag, style=DIM)
-            kids.append(Node("%s:q:%d" % (base, i), t, session=x["name"], helper=tag, hang=len(lead)))
-        node = Node(base, _row_text(head), children=kids, session=x["name"], sort=_needs_key(sort, x))
+            asker = x["q_helpers"][i - 1]
+            kids.append(Node(node_key("needs", own, "q", str(i)), t, session=x["name"], sid=sid, helper=tag,
+                             helper_sid=asker.get("sessionId") if asker else None, hang=len(lead)))
+        node = Node(base, _row_text(head), children=kids, session=x["name"], sid=sid, ended=gone,
+                    sort=_needs_key(sort, x))
         preview = question_preview(x, now)
         if preview:
             node.head_shut = _row_text(head + [("\n" + preview, "")])
@@ -446,7 +471,7 @@ def session_state(x):
     return "idle" if x["r"]["live"] else "idle (exited)", ""
 
 
-def session_node(x, now, prefix="ses:"):
+def session_node(x, now):
     r = x["r"]
     state, style = session_state(x)
     head = [(x["name"], "bold")]
@@ -463,14 +488,15 @@ def session_node(x, now, prefix="ses:"):
         body.append((Text("  "), Text(x["working_on"])))
     if x.get("renamed_from"):
         body.append((Text("  "), Text("renamed from %s" % x["renamed_from"], style=DIM)))
-    key = prefix + x["name"]
     children = []
     for c in kids:
         cname = clean(c["name"])
         t = Text("↳ ", style=DIM)
         t.append("%s  %s" % (cname, clean(c["state"])))
-        children.append(Node("%s:k:%s" % (key, cname), t, session=x["name"], helper=cname, hang=2))
-    return Node(key, _row_text(head), body, children, session=x["name"])
+        children.append(Node(node_key("ses", ident(r), "k", ident(c)), t, session=x["name"],
+                             sid=r.get("sessionId"), helper=cname, helper_sid=c.get("sessionId"), hang=2))
+    return Node(node_key("ses", ident(r)), _row_text(head), body, children, session=x["name"],
+                sid=r.get("sessionId"))
 
 
 def _session_key(sort):
@@ -499,8 +525,9 @@ def sessions_nodes(view, stale, now, sort="recent", grouping=None, ready=0):
     if view["orphans"]:
         node = Node("sesg:orphans", _row_text([("Unattached helpers", "bold"),
                                                (" · %d" % len(view["orphans"]), DIM)]), section=True)
-        node.children = [Node("orph:" + clean(r["name"]), _row_text(
-            [(clean(r["name"]), ""), ("  " + clean(r["state"]), DIM)]), helper=clean(r["name"]))
+        node.children = [Node(node_key("orph", ident(r)), _row_text(
+            [(clean(r["name"]), ""), ("  " + clean(r["state"]), DIM)]), helper=clean(r["name"]),
+            helper_sid=r.get("sessionId"))
             for r in view["orphans"]]
         out.append(node)
     if stale:
@@ -508,9 +535,9 @@ def sessions_nodes(view, stale, now, sort="recent", grouping=None, ready=0):
         if ready:
             label.append((" · %d ready to prune (P)" % ready, DIM))
         node = Node("sesg:stale", _row_text(label), section=True)
-        node.children = [Node("stale:" + clean(r["name"]), _row_text(
+        node.children = [Node(node_key("stale", ident(r)), _row_text(
             [(clean(r["name"]), ""), ("  %s, last active %s" % ("status file only" if r.get("file_only") else clean(r["state"]), day(r["last"])), DIM)]),
-            helper=clean(r["name"]))
+            helper=clean(r["name"]), helper_sid=r.get("sessionId"))
             for r in stale]
         out.append(node)
     return out

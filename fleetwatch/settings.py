@@ -30,6 +30,10 @@ it, because a guess could scrub less than you asked for or rename every stored e
     protected = ["ferpa"]             # groups that refuse keep_patterns and person_names: false
     guess = {"-work-" = "research"}   # project-folder fragment -> group, for `discover`
 
+    [archive]
+    dest = "~/.local/share/claude-session-archive/archive"  # where `fleetwatch archive run` copies
+                                      # transcripts; CLAUDE_SESSION_ARCHIVE_DEST overrides it
+
     [scanner]
     rule_packs = ["education"]        # added to the core rules; a name ending .yaml is a
                                       # pack file, relative to the config folder
@@ -200,6 +204,21 @@ def state_dir():
     """fleetwatch's log folder: $XDG_STATE_HOME/fleetwatch, else ~/.local/state/fleetwatch."""
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
     return os.path.join(base, "fleetwatch")
+
+
+def archive_root(raw=None):
+    """The transcript archive's folder (it holds projects/ and history.jsonl): CLAUDE_SESSION_ARCHIVE_DEST,
+    else settings.toml `[archive] dest`, else ~/.local/share/claude-session-archive/archive. The default
+    is where the archiver fleetwatch replaced kept its copies, so an existing archive is used in place."""
+    env = os.environ.get("CLAUDE_SESSION_ARCHIVE_DEST")
+    if env:
+        return os.path.expanduser(env)
+    raw = load() if raw is None else raw
+    table = raw.get("archive")
+    dest = table.get("dest") if isinstance(table, dict) else None
+    if isinstance(dest, str) and dest.strip():
+        return os.path.expanduser(dest.strip())
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "claude-session-archive", "archive")
 
 
 def data_dir():

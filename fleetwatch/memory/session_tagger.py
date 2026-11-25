@@ -40,7 +40,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from .render import render_exchange
-from .session_parse import DEFAULT_RULES
+from .session_parse import DEFAULT_RULES, jsonl_lines
+
+# Retention a tagger run passes to Claude Code, far past any transcript's useful life.
+TAGGER_RETENTION_DAYS = 36500
 
 TOKEN_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
               "webSearchRequests", "costUSD")
@@ -187,8 +190,13 @@ def tag_batch(batch, tc, usage, cwd):
               "incoming": trim(r["user_text"], 1400, 400),
               "reply": trim("\n\n".join(r["assistant"]), 1000, 800),
               "tools": ", ".join(sorted(r["tools"]))} for r in batch]
+    # --setting-sources "" keeps the user's hooks and settings out of the tagger, but it also
+    # hides cleanupPeriodDays: Claude Code's startup cleanup then falls back to its 30-day
+    # default and deletes transcripts in every project (anthropics/claude-code#45903). The
+    # explicit --settings value keeps any cleanup this run starts from deleting them.
     cmd = ["claude", "-p", "--model", tc.model, "--tools", "", "--strict-mcp-config",
-           "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
+           "--setting-sources", "", "--settings", json.dumps({"cleanupPeriodDays": TAGGER_RETENTION_DAYS}),
+           "--disable-slash-commands", "--no-session-persistence",
            "--system-prompt", tc.system, "--output-format", "json"]
     p = subprocess.run(cmd, input=json.dumps(items, ensure_ascii=False), capture_output=True,
                        text=True, cwd=cwd, timeout=600)
@@ -223,10 +231,9 @@ def normalize_topics(topics):
 def load_tags(path):
     cache = {}
     if path.exists():
-        for line in path.read_text().splitlines():
-            if line.strip():
-                rec = json.loads(line)
-                cache[rec["id"]] = rec
+        for line in jsonl_lines(path.read_text()):
+            rec = json.loads(line)
+            cache[rec["id"]] = rec
     return cache
 
 

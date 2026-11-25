@@ -336,7 +336,7 @@ def stored_versions(data_dir, sig, scan_version, tag_version):
     recs = ok = 0
     tp = Path(data_dir) / "state" / "tags.jsonl"
     if tp.exists():
-        for line in tp.read_text().splitlines():
+        for line in tp.read_text().split("\n"):  # JSONL: newline only, not splitlines()
             try:
                 rec = json.loads(line)
             except ValueError:

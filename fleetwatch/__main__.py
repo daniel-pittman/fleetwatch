@@ -11,6 +11,8 @@ def build_parser():
                     "--once prints one snapshot.",
         epilog="commands (run `fleetwatch COMMAND --help` for each):\n"
                "  resume [NAME]       resume a named session in its folder\n"
+               "  restore [NAME|ID]   copy an archive-only transcript back, without starting it\n"
+               "  archive             run | install | uninstall | status: the transcript archive\n"
                "  park [NAME]         mark a session finished for now, with a note\n"
                "  unpark [NAME]       take a session off the parked list\n"
                "  prune               move finished sessions' status files to .pruned/\n"
@@ -20,6 +22,9 @@ def build_parser():
                "  notify              desktop notifications when something new needs you\n"
                "  watch               run | report | ack | schedule: GitHub watches for stopped sessions\n"
                "  iterm               install | status | uninstall the hotkey window\n"
+               "  install [--dry-run] install and start every scheduled job, retiring older ones\n"
+               "  uninstall           stop and remove every scheduled job\n"
+               "  doctor [--fix]      check every job, folder and program fleetwatch relies on\n"
                "  search, index       session memory (need the search and memory extras)")
     p.add_argument("--window", type=data.parse_window, default=data.parse_window("24h"),
                    help="activity window, e.g. 90m, 6h, 3d (default 24h)")
@@ -63,6 +68,9 @@ def main(argv=None):
     if argv[:1] == ["iterm"]:
         from . import overlay
         return overlay.main(argv[1:])
+    if argv[:1] in (["install"], ["uninstall"], ["doctor"]):
+        from . import install_cli
+        return getattr(install_cli, argv[0] + "_main")(argv[1:])
     if argv[:1] == ["write-status"]:
         from . import write_status
         return write_status.main(argv[1:])
@@ -78,6 +86,13 @@ def main(argv=None):
     if argv[:1] == ["resume"]:
         from . import resume
         return resume.main(argv[1:])
+    # The transcript archive and restoring from it.
+    if argv[:1] == ["archive"]:
+        from . import archive
+        return archive.main(argv[1:])
+    if argv[:1] == ["restore"]:
+        from . import restore
+        return restore.main(argv[1:])
     if argv[:1] == ["notify"]:
         from . import notify
         return notify.main(argv[1:])

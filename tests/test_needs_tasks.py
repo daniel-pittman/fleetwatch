@@ -131,11 +131,11 @@ class SortTests(unittest.TestCase):
             e.reg(n, n)
             e.status(n + ".json", session=n, updated=iso(-60), questions=["q"])
         nodes = views.needs_nodes(view_of(e), NOW, "name")
-        again = views.stabilise(nodes, ["needs:Bb", "needs:Aa"])
+        again = views.stabilise(nodes, [views.node_key("needs", ("s", "Bb")), views.node_key("needs", ("s", "Aa"))])
         self.assertEqual([n.session for n in again], ["Aa", "Bb"])   # name sort ranks Aa first
         nodes = views.needs_nodes(view_of(e), NOW, "oldest")
-        order = [n.key for n in views.stabilise(nodes, ["needs:Bb", "needs:Aa"])]
-        self.assertEqual(order, ["needs:Bb", "needs:Aa"])
+        order = [n.key for n in views.stabilise(nodes, [views.node_key("needs", ("s", "Bb")), views.node_key("needs", ("s", "Aa"))])]
+        self.assertEqual(order, [views.node_key("needs", ("s", "Bb")), views.node_key("needs", ("s", "Aa"))])
 
 
 class HeaderTests(unittest.TestCase):

@@ -8,7 +8,9 @@ fleetwatch.search.errors.SearchError subclasses. The command line lives in fleet
 Query syntax is SQLite FTS5: bare words are ANDed, "quoted words" is a phrase,
 and NOT / OR work as operators.
 """
+import contextlib
 import dataclasses
+import fcntl
 import hashlib
 import json
 import os
@@ -30,7 +32,7 @@ try:
 except ImportError:
     np = None
 
-from .errors import (ConfigError, EmbedderUnavailable, EmbeddingFailed, EmptyCorpus,
+from .errors import (BuildBusy, ConfigError, EmbedderUnavailable, EmbeddingFailed, EmptyCorpus,
                      IndexMissing, IndexStale, ModelMismatch, NoProbesYet, ProbesInvalid,
                      ProbesMissing)
 
@@ -801,6 +803,63 @@ CREATE INDEX exchange_providers_provider ON exchange_providers(provider);
 """ % PROVIDER_TABLE
 
 
+# How long a build waits for another build of the same index before giving up. It stays under
+# the 1800 s a plain index's refresh command is allowed, so a waiting build fails with BuildBusy
+# rather than being killed by that timeout.
+BUILD_LOCK_WAIT_S = 1500
+TEMP_SUFFIX_RE = re.compile(r"(\d+)(-journal|-wal|-shm)?")
+
+
+@contextlib.contextmanager
+def build_lock(db_path, progress=None):
+    """One writer per index file, held from corpus collection until the new file is in place.
+    Without it a build that read the corpus earlier can publish after a newer one and bring
+    back rows the newer one removed (a forgotten session). The kernel drops an flock when its
+    process exits however it exits, so a killed build never leaves the index locked; the lock
+    file itself stays, since deleting it would let two builds lock two different files."""
+    path = db_path.with_name(db_path.name + ".lock")
+    with open(path, "a") as fh:
+        deadline = time.monotonic() + BUILD_LOCK_WAIT_S
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise BuildBusy("another build of %s has held its lock for over %d s; try "
+                                    "again when it finishes" % (db_path, BUILD_LOCK_WAIT_S))
+                if progress and not waiting:
+                    progress("Waiting for another build of %s to finish ..." % db_path.name)
+                waiting = True
+                time.sleep(0.1)
+        yield
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def remove_dead_temp_files(db_path):
+    """Delete `<index>.tmp.<pid>` files (and their SQLite sidecars) left by a build that was
+    killed or crashed. Call it under build_lock. A file whose pid is still alive is kept, since
+    that process may have it open. The fixed `<index>.tmp` name of earlier releases is left
+    alone: their builds take no build_lock and may be writing it."""
+    prefix = db_path.name + ".tmp."
+    for p in db_path.parent.iterdir():
+        if not p.name.startswith(prefix):
+            continue
+        m = TEMP_SUFFIX_RE.fullmatch(p.name[len(prefix):])
+        if m and int(m.group(1)) != os.getpid() and not _pid_alive(int(m.group(1))):
+            p.unlink(missing_ok=True)
+
+
 def build(ix, progress=None):
     """Rebuild the index's SQLite file from its corpus roots and return a report dict.
 
@@ -808,7 +867,16 @@ def build(ix, progress=None):
     default) raises EmbedderUnavailable when nothing can embed, rather than quietly writing
     a TF-IDF index that ranks worse; tfidf builds keyword vectors and needs no model.
     `progress(text)`, when given, hears about the slow embedding step before it starts.
+    A second build of the same index waits for the first (build_lock) and then reads the
+    corpus afresh; after BUILD_LOCK_WAIT_S it raises BuildBusy.
     """
+    db_path = ix.cfg["_index_path"]
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with build_lock(db_path, progress):
+        return _build_locked(ix, progress)
+
+
+def _build_locked(ix, progress):
     cfg = ix.cfg
     t0 = time.time()
     chunks, per_root, skipped = collect_chunks(cfg)
@@ -838,10 +906,11 @@ def build(ix, progress=None):
                 "in search_config.yaml, or set similarity.backend: tfidf to build keyword vectors.")
 
     db_path = cfg["_index_path"]
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = db_path.with_suffix(".sqlite.tmp")
-    if tmp.exists():
-        tmp.unlink()
+    remove_dead_temp_files(db_path)
+    # One temp file per process, never the fixed `<index>.tmp`: an earlier release's build
+    # takes no build_lock and deletes that name before writing it.
+    tmp = db_path.with_name("%s.tmp.%d" % (db_path.name, os.getpid()))
+    tmp.unlink(missing_ok=True)
     con = sqlite3.connect(tmp)
     try:
         con.executescript(SCHEMA)
@@ -891,12 +960,12 @@ def build(ix, progress=None):
                     (time.strftime("%Y-%m-%d %H:%M:%S"),))
         con.commit()
         con.execute("VACUUM")
+        con.close()
+        os.replace(tmp, db_path)
     except BaseException:
         con.close()
         tmp.unlink(missing_ok=True)
         raise
-    con.close()
-    os.replace(tmp, db_path)
     ix._words = None        # the vocabulary belongs to the file just replaced
 
     counts = {}

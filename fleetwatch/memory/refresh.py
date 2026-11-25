@@ -28,9 +28,13 @@ index folder's own search.py) under settings.toml [paths] build_python (default:
 zone, the heartbeat patterns, the rule packs and the protected groups come from settings.toml
 (fleetwatch.settings.indexer); an invalid settings.toml stops the run before any index is touched.
 Each index has an atomic mkdir lock (broken when older than 60 minutes); one index failing
-never stops the others. The process exits if its resident memory passes 4 GB.
+never stops the others. Only one whole-registry run goes at a time (run_lock), and builds of
+one index file wait for each other (the engine's build_lock). The process exits if its
+resident memory passes 4 GB.
 """
 import argparse
+import contextlib
+import fcntl
 import glob as globmod
 import json
 import os
@@ -55,6 +59,10 @@ from . import antigravity_parse, codex_parse, doc_corpus, routing, session_parse
 from .privacy_scan import RuleSet, Scanner, protected_ready
 
 LOCK_STALE_S = 3600
+# run_one and run_plain return True, False, or SKIPPED when another process holds the index's
+# lock. SKIPPED is truthy, so a caller that only asks whether the index failed reads a skip as
+# no failure; one that counts successes or failure streaks must test for it.
+SKIPPED = "skipped"
 BUILTIN_DEFAULTS = dict(schedule_minutes=30, tag=True, tag_budget_per_run=400)
 MEM_CAP = 4 << 30
 
@@ -396,6 +404,41 @@ def now_iso():
     return datetime.now(PARSE_RULES.tz).isoformat(timespec="seconds")
 
 
+# A refresh run holds its run lock for its whole life, and the kernel frees that lock only when
+# the run ends, so a build that never returns would stop every later scheduled run. Each build
+# command is therefore bounded; on timeout its whole process group is killed, so a grandchild
+# (the engine build a refresh command starts) cannot keep the index's writer lock either.
+BUILD_TIMEOUT_S = 1800
+
+
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
+
+
+def run_bounded(argv, cwd, timeout=None):
+    """subprocess.run(argv, capture_output=True, text=True) in its own session, killed with its
+    whole process group after `timeout` seconds (BUILD_TIMEOUT_S by default). A timeout raises
+    RuntimeError naming the command, which fails that index only."""
+    timeout = BUILD_TIMEOUT_S if timeout is None else timeout
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        raise RuntimeError("timed out after %ds: %s" % (timeout, " ".join(str(a) for a in argv[1:])))
+    except BaseException:
+        # Ctrl-C, or launchd stopping the job: the build runs in its own session, so it would
+        # otherwise keep running, and keep holding the index's writer lock, after this run ends.
+        _kill_group(proc)
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 class Lock:
     def __init__(self, state):
         self.path = state / "refresh.lock.d"
@@ -541,7 +584,7 @@ class Index:
         # data folder, so a module file where refresh was started is never imported.
         argv = ([BUILD_PY, str(wrapper), "build"] if wrapper.exists()
                 else [BUILD_PY, "-P", "-m", "fleetwatch", "index", "build", self.name])
-        p = subprocess.run(argv, capture_output=True, text=True, cwd=self.dir)
+        p = run_bounded(argv, self.dir)
         if p.returncode != 0:
             raise RuntimeError("engine build failed: " + p.stderr.strip()[-400:])
         line = next((ln for ln in p.stdout.splitlines() if ln.startswith("Indexed")), "")
@@ -801,6 +844,14 @@ def plain_source_files(entry):
 def run_plain(name, entry, opts):
     state = ROOT / name / "state"
     state.mkdir(parents=True, exist_ok=True)
+    with Lock(state) as lock:
+        if lock is None:
+            print("[%s] refresh already running; skipped" % name)
+            return SKIPPED
+        return _run_plain_locked(name, entry, opts, state, lock)
+
+
+def _run_plain_locked(name, entry, opts, state, lock):
     index_file = Path(os.path.expanduser(entry["index_file"]))
     built_at = index_file.stat().st_mtime if index_file.exists() else 0
     newer = []
@@ -817,9 +868,19 @@ def run_plain(name, entry, opts):
                     changed=[], wall_s=0.0)
     else:
         for cmd in entry["refresh"]:
+            lock.touch()
             argv = plain_argv(cmd)
-            r = subprocess.run(argv, cwd=plain_dir(name), capture_output=True, text=True,
-                               timeout=1800)
+            # A command that times out or cannot start is recorded like one that exits nonzero:
+            # doctor, the board and the streak alert read only last_run.json.
+            try:
+                r = run_bounded(argv, plain_dir(name))
+            except (RuntimeError, OSError) as e:
+                (state / "last_error.log").write_text(
+                    "%s\n%s\n%s: %s\n" % (now_iso(), " ".join(argv), type(e).__name__, e))
+                (state / "last_run.json").write_text(json.dumps(dict(
+                    index=name, kind="plain", finished=now_iso(), ok=False, error=str(e)), indent=1))
+                print("[%s] FAILED: %s (detail in %s)" % (name, e, state / "last_error.log"))
+                return False
             if r.returncode != 0:
                 (state / "last_error.log").write_text(
                     "%s\n%s\nexit %d\n%s\n%s" % (now_iso(), " ".join(argv), r.returncode,
@@ -855,7 +916,7 @@ def run_one(reg, name, opts, plan=None):
     with Lock(ix.state) as lock:
         if lock is None:
             print("[%s] refresh already running; skipping" % name)
-            return True
+            return SKIPPED
         try:
             info = ix.refresh(opts, lock.touch, plan=plan)
         except Exception as e:
@@ -1005,7 +1066,7 @@ def cmd_status(reg, full_reg=None):
         up = d / "state" / "usage.jsonl"
         if up.exists():
             tot, calls, cost = {}, 0, 0.0
-            for ln in up.read_text().splitlines():
+            for ln in session_parse.jsonl_lines(up.read_text()):
                 u = json.loads(ln)
                 calls += u.get("calls", 0)
                 cost += u.get("total_cost_usd", 0)
@@ -1187,7 +1248,10 @@ def _main(argv):
             # A plain index has no per-document conversion and no privacy block; its
             # refresh commands rebuild the whole corpus, so PATH only names what changed.
             o = argparse.Namespace(full=False, build=True)
-            sys.exit(0 if run_plain(name, reg["indexes"][name], o) else 1)
+            res = run_plain(name, reg["indexes"][name], o)
+            if res == SKIPPED:
+                sys.exit("[%s] refresh already running; try again shortly" % name)
+            sys.exit(0 if res else 1)
         else:
             ix = Index(name, reg["indexes"][name], reg["defaults"])
             with Lock(ix.state) as lock:
@@ -1209,15 +1273,47 @@ def _main(argv):
     if indexes.is_agent_caller(caller) and any(fleetwatch_settings.is_protected(reg["indexes"][name].get("group"),
                                                         SETTINGS.protected_groups) for name in names):
         sys.exit(3)
-    opts.routing_plan = resolve_routing(reg)
+    if opts.index:
+        opts.routing_plan = resolve_routing(reg)
+        return _run_all(reg, names, opts)
+    with run_lock() as held:
+        if not held:
+            print("a refresh run is already in progress; nothing started")
+            sys.exit(0)
+        # Routing can write sticky session placements, so it runs under the run lock.
+        opts.routing_plan = resolve_routing(reg)
+        _run_all(reg, names, opts)
+
+
+@contextlib.contextmanager
+def run_lock():
+    """One whole-registry run at a time: an flock on logs/refresh-run.lock, held for the run's
+    lifetime. The kernel drops it when the process exits, however it exits (SIGTERM, the memory
+    cap's os._exit, SIGKILL), so it needs no staleness rule and a run of any length keeps it.
+    open() makes the descriptor non-inheritable, so a child build never holds it past the run."""
+    path = ROOT / "logs" / "refresh-run.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
+def _run_all(reg, names, opts):
     print("=== run started %s (%d indexes)" % (now_iso(), len(names)), flush=True)
-    failed = []
+    failed, skipped = [], []
     t0, done = time.time(), []
     mark = not opts.index
     if mark:
         write_run_marker(t0, None, done)
     for name in names:
-        if run_one(reg, name, opts):
+        res = run_one(reg, name, opts)
+        if res == SKIPPED:
+            skipped.append(name)
+        elif res:
             record_streak(name, None)
             if refreshed_since(name, t0):
                 done.append(name)
@@ -1228,8 +1324,8 @@ def _main(argv):
             write_run_marker(t0, None, done)
     if mark:
         write_run_marker(t0, time.time(), done)
-    print("=== run finished %s: %d ok, %d failed%s" % (
-        now_iso(), len(names) - len(failed), len(failed),
+    print("=== run finished %s: %d ok, %d skipped, %d failed%s" % (
+        now_iso(), len(names) - len(failed) - len(skipped), len(skipped), len(failed),
         " (%s)" % ", ".join(failed) if failed else ""), flush=True)
     sys.exit(0 if not failed else 1)
 
@@ -1271,20 +1367,26 @@ def last_error(name):
 
 
 def record_streak(name, error):
+    """logs/streaks/NAME holds "RUNS SINCE": the failed runs in a row and the epoch second the streak began.
+    fleetwatch.index_health.read_streak reads it (a file holding RUNS alone has no start)."""
     streak_file = ROOT / "logs" / "streaks" / name
     try:
-        streak = int(streak_file.read_text()) if streak_file.exists() else 0
+        parts = streak_file.read_text().split() if streak_file.exists() else []
+        streak = int(parts[0]) if parts else 0
+        since = int(float(parts[1])) if len(parts) > 1 else None
     except ValueError:
-        streak = 0
+        streak, since = 0, None
     if error is None:
         if streak:
             with open(FAILURES_LOG, "a") as f:
                 f.write("%s %s recovered after %d failed run(s)\n" % (now_iso(), name, streak))
             streak_file.unlink()
         return
+    if not streak:
+        since = int(time.time())
     streak += 1
     streak_file.parent.mkdir(parents=True, exist_ok=True)
-    streak_file.write_text(str(streak))
+    streak_file.write_text(str(streak) if since is None else "%d %d" % (streak, since))
     with open(FAILURES_LOG, "a") as f:
         f.write("%s %s FAILED (%d in a row): %s\n" % (now_iso(), name, streak, error))
 

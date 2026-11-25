@@ -14,6 +14,9 @@ import standin  # noqa: E402
 from waiting import settle  # noqa: E402
 from fleetwatch import data, iterm, views  # noqa: E402
 
+# The session these tests end has only a status file, so its row is keyed by its name: it has no record ID.
+GONE = views.node_key("needs", ("n", "Gone Session"))
+
 ITEMS = [{"what": "send the form", "due": dstr(-1), "yours": True}]
 
 
@@ -90,15 +93,15 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("G")
-            await settle(pilot, lambda: "needs:Gone Session" in app.current._order)
-            app.current.move_to("needs:Gone Session")
+            await settle(pilot, lambda: GONE in app.current._order)
+            app.current.move_to(GONE)
             self.assertNotIn("Gone Session", app.snapshot.records)
             await pilot.press("p")
             await settle(pilot, lambda: type(app.screen).__name__ == "ParkScreen")
             await pilot.press("enter")
             await settle(pilot, lambda: "parked Gone Session" in (app.status_text or ""))
             self.assertIn(s, park.load())
-            app.current.move_to("needs:Gone Session")
+            app.current.move_to(GONE)
             await pilot.press("u")
             await settle(pilot, lambda: "unparked Gone Session" in (app.status_text or ""))
             self.assertNotIn(s, park.load())
@@ -117,8 +120,8 @@ class EnterTests(AppWorld):
 
         async def body(app, pilot):
             await pilot.press("G")
-            await settle(pilot, lambda: "needs:Gone Session" in app.current._order, "the needs row")
-            app.current.move_to("needs:Gone Session")
+            await settle(pilot, lambda: GONE in app.current._order, "the needs row")
+            app.current.move_to(GONE)
             self.assertNotIn("Gone Session", app.snapshot.records)
             await pilot.press("m")
             await settle(pilot, lambda: type(app.screen).__name__ == "GroupPicker", "the group picker")
@@ -131,11 +134,11 @@ class EnterTests(AppWorld):
             self.assertEqual(groups.overrides.get("Gone Session"), "Personal")
             self.assertEqual(groups.override_ids.get(s), "Personal")
             await settle(pilot, lambda: app.snapshot.grouping.of("Gone Session") == "Personal")
-            await settle(pilot, lambda: "needs:Gone Session" in app.current._order)
+            await settle(pilot, lambda: GONE in app.current._order)
             order = app.current._order
-            heads = [k for k in order[:order.index("needs:Gone Session")] if k.startswith("grp:")]
+            heads = [k for k in order[:order.index(GONE)] if k.startswith("grp:")]
             self.assertTrue(heads and heads[-1].endswith(":Personal"), heads)
-            app.current.move_to("needs:Gone Session")
+            app.current.move_to(GONE)
             await pilot.press("m")
             await settle(pilot, lambda: type(app.screen).__name__ == "GroupPicker", "the group picker")
             picker = app.screen.query_one("#choices")
