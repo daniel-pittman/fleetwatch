@@ -226,6 +226,70 @@ class Locks(unittest.TestCase):
             self.assertIs(refresh.run_plain("plain", self.entry, self.opts), True)
         run.assert_called_once()
 
+    def hung_entry(self):
+        """A plain index whose one refresh command sleeps far past a 1-second build timeout, after a
+        run that succeeded."""
+        self.entry["refresh"] = [["{python}", "-c", "import time; time.sleep(60)"]]
+        self.state.mkdir(parents=True)
+        (self.state / "last_run.json").write_text(json.dumps(dict(index="plain", ok=True)))
+        return {"defaults": {}, "indexes": {"plain": self.entry}}
+
+    def test_a_plain_build_that_times_out_is_recorded_as_failed(self):
+        reg = self.hung_entry()
+        with mock.patch.object(refresh, "BUILD_TIMEOUT_S", 1), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(refresh.run_one(reg, "plain", self.opts), False)
+        info = json.loads((self.state / "last_run.json").read_text())
+        self.assertIs(info["ok"], False)
+        self.assertIn("timed out after 1s", info["error"])
+        self.assertIn("timed out after 1s", (self.state / "last_error.log").read_text())
+        self.assertFalse((self.state / "refresh.lock.d").exists())
+
+    def test_a_plain_build_that_cannot_start_is_recorded_as_failed(self):
+        self.entry["refresh"] = [[str(self.root / "no-such-program")]]
+        reg = {"defaults": {}, "indexes": {"plain": self.entry}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(refresh.run_one(reg, "plain", self.opts), False)
+        info = json.loads((self.state / "last_run.json").read_text())
+        self.assertIs(info["ok"], False)
+        self.assertIn("no-such-program", info["error"])
+        self.assertTrue((self.state / "last_error.log").exists())
+
+    def test_a_timed_out_plain_build_counts_toward_its_failure_streak(self):
+        from fleetwatch import index_health
+        reg = self.hung_entry()
+        log = self.root / "logs" / "f.log"
+        with mock.patch.object(refresh, "BUILD_TIMEOUT_S", 1), \
+                mock.patch.object(refresh, "load_registry", return_value=reg), \
+                mock.patch.object(refresh, "FAILURES_LOG", log), \
+                mock.patch.object(refresh, "resolve_routing"), \
+                contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            refresh._main([])
+        self.assertEqual(cm.exception.code, 1)
+        self.assertIn("plain FAILED (1 in a row): timed out after 1s", log.read_text())
+        info = json.loads((self.state / "last_run.json").read_text())
+        h = index_health.Health(name="plain", group="g", kind="plain",
+                                state="ok" if info["ok"] else "failed", streak=3)
+        self.assertTrue(h.streak_problem(0))
+
+    def test_a_session_index_build_that_times_out_is_recorded_as_failed(self):
+        state = self.root / "sess" / "state"
+        state.mkdir(parents=True)
+        (state / "last_run.json").write_text(json.dumps(dict(index="sess", ok=True)))
+        ix = refresh.Index.__new__(refresh.Index)
+        ix.name, ix.dir, ix.state = "sess", self.root / "sess", state
+        ix.refresh = lambda *a, **k: ix.build()
+        (ix.dir / "search.py").write_text("import time; time.sleep(60)\n")
+        reg = {"defaults": {}, "indexes": {"sess": {}}}
+        with mock.patch.object(refresh, "Index", lambda *a: ix), \
+                mock.patch.object(refresh, "BUILD_PY", sys.executable), \
+                mock.patch.object(refresh, "BUILD_TIMEOUT_S", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertIs(refresh.run_one(reg, "sess", self.opts), False)
+        info = json.loads((state / "last_run.json").read_text())
+        self.assertIs(info["ok"], False)
+        self.assertIn("timed out after 1s", info["error"])
+        self.assertIn("timed out after 1s", (state / "last_error.log").read_text())
+
     def index_now(self):
         reg = {"defaults": {}, "indexes": {"plain": self.entry}}
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
