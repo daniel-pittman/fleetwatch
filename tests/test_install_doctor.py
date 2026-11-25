@@ -1,5 +1,5 @@
 """fleetwatch install, uninstall and doctor over the dependency inventory, the retirement of older jobs, and the
-index failure-streak alert. launchd is tests/fake_launchctl.py and systemd a recording runner; every folder
+index failure-streak alert. launchd is tests/fake_launchd.py and systemd a recording runner; every folder
 is a temporary one."""
 import contextlib
 import io
@@ -17,7 +17,7 @@ from unittest import mock
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import fake_launchctl  # noqa: E402
+import fake_launchd  # noqa: E402
 from fleetwatch import dependencies as deps  # noqa: E402
 from fleetwatch import index_health, install_cli, notify, services, views  # noqa: E402
 
@@ -75,7 +75,7 @@ class Home:
         return json.loads(self.state_file.read_text())
 
     def manager(self):
-        return services.Manager("darwin", fake_launchctl.runner(str(self.state_file), str(self.log)),
+        return services.Manager("darwin", fake_launchd.runner(str(self.state_file), str(self.log)),
                                 {"FLEETWATCH_LAUNCHCTL": "launchctl"}, uid=501)
 
     def calls(self, mutating_only=True):

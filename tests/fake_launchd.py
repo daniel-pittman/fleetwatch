@@ -5,7 +5,7 @@ Supported: `print gui/UID/LABEL`, `bootstrap gui/UID PLIST`, `bootout gui/UID/LA
 gui/UID/LABEL` (marks it running) and `list`. A label in
 the state's "fail" list makes bootstrap and bootout of it fail the way launchctl does. It never touches a
 real launchd. Use it from a test as a Manager runner (`runner(state, log)`) or as a command
-(FLEETWATCH_LAUNCHCTL="python tests/fake_launchctl.py").
+(FLEETWATCH_LAUNCHCTL="python tests/fake_launchd.py").
 """
 import json
 import os
