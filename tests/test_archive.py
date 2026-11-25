@@ -47,15 +47,15 @@ class Home(unittest.TestCase):
                "CLAUDE_SESSION_ARCHIVE_DEST": self.dest, "FLEETWATCH_LAUNCH_AGENTS_DIR": self.agents,
                "FLEETWATCH_SYSTEMD_USER_DIR": self.mk("systemd"), "FLEETWATCH_LAUNCHCTL": FAKE,
                "FAKE_LAUNCHCTL_DIR": self.loaded}
+        # Cleanups, not tearDown: a subclass may skip in setUp after this point, and tearDown does
+        # not run then, which would leave HOME patched for every later test in the process.
+        self.addCleanup(self.tmp.cleanup)
         self.env = mock.patch.dict(os.environ, env)
         self.env.start()
+        self.addCleanup(self.env.stop)
         for k in ("FLEETWATCH_ARCHIVE_DIR", "FLEETWATCH_RSYNC", "FAKE_LAUNCHCTL_FAIL"):
             os.environ.pop(k, None)
         self.paths = data.default_paths()
-
-    def tearDown(self):
-        self.env.stop()
-        self.tmp.cleanup()
 
     def mk(self, rel):
         path = os.path.join(self.root, rel)
@@ -431,10 +431,7 @@ class Install(Home):
         super().setUp()
         self.platform = mock.patch.object(sys, "platform", "darwin")
         self.platform.start()
-
-    def tearDown(self):
-        self.platform.stop()
-        super().tearDown()
+        self.addCleanup(self.platform.stop)
 
     def legacy(self, loaded=True):
         path = os.path.join(self.agents, archive.LEGACY_LABEL + ".plist")
