@@ -339,3 +339,38 @@ class Locks(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BoundedBuilds(unittest.TestCase):
+    """A refresh run holds its run lock for life, so a build command that never returns must be cut off."""
+
+    def test_a_hung_build_and_its_children_are_killed_and_reported(self):
+        import subprocess, sys, tempfile, time as _t
+        from fleetwatch.memory import refresh as rf
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "child.pid")
+            grandchild = os.path.join(d, "grandchild.py")
+            child = os.path.join(d, "child.py")
+            with open(grandchild, "w") as f:
+                f.write("import os, sys, time\nopen(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+            # The child starts a grandchild that records its pid, then both sleep far past the timeout.
+            with open(child, "w") as f:
+                f.write("import subprocess, sys, time\n"
+                        "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\ntime.sleep(60)\n")
+            t0 = _t.time()
+            with self.assertRaises(RuntimeError) as cm:
+                rf.run_bounded([sys.executable, child, grandchild, marker], d, timeout=2)
+            self.assertLess(_t.time() - t0, 20)
+            self.assertIn("timed out after 2s", str(cm.exception))
+            _t.sleep(0.5)
+            gpid = int(open(marker).read())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(gpid, 0)
+
+    def test_a_build_that_finishes_returns_its_output(self):
+        import sys, tempfile
+        from fleetwatch.memory import refresh as rf
+        with tempfile.TemporaryDirectory() as d:
+            r = rf.run_bounded([sys.executable, "-c", "print('Indexed 3 chunks')"], d, timeout=30)
+            self.assertEqual(r.returncode, 0)
+            self.assertIn("Indexed 3 chunks", r.stdout)

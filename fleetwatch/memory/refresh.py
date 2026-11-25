@@ -404,6 +404,32 @@ def now_iso():
     return datetime.now(PARSE_RULES.tz).isoformat(timespec="seconds")
 
 
+# A refresh run holds its run lock for its whole life, and the kernel frees that lock only when
+# the run ends, so a build that never returns would stop every later scheduled run. Each build
+# command is therefore bounded; on timeout its whole process group is killed, so a grandchild
+# (the engine build a refresh command starts) cannot keep the index's writer lock either.
+BUILD_TIMEOUT_S = 1800
+
+
+def run_bounded(argv, cwd, timeout=None):
+    """subprocess.run(argv, capture_output=True, text=True) in its own session, killed with its
+    whole process group after `timeout` seconds (BUILD_TIMEOUT_S by default). A timeout raises
+    RuntimeError naming the command, which fails that index only."""
+    timeout = BUILD_TIMEOUT_S if timeout is None else timeout
+    proc = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, 9)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise RuntimeError("timed out after %ds: %s" % (timeout, " ".join(str(a) for a in argv[1:])))
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
+
 class Lock:
     def __init__(self, state):
         self.path = state / "refresh.lock.d"
@@ -549,7 +575,7 @@ class Index:
         # data folder, so a module file where refresh was started is never imported.
         argv = ([BUILD_PY, str(wrapper), "build"] if wrapper.exists()
                 else [BUILD_PY, "-P", "-m", "fleetwatch", "index", "build", self.name])
-        p = subprocess.run(argv, capture_output=True, text=True, cwd=self.dir)
+        p = run_bounded(argv, self.dir)
         if p.returncode != 0:
             raise RuntimeError("engine build failed: " + p.stderr.strip()[-400:])
         line = next((ln for ln in p.stdout.splitlines() if ln.startswith("Indexed")), "")
@@ -835,8 +861,7 @@ def _run_plain_locked(name, entry, opts, state, lock):
         for cmd in entry["refresh"]:
             lock.touch()
             argv = plain_argv(cmd)
-            r = subprocess.run(argv, cwd=plain_dir(name), capture_output=True, text=True,
-                               timeout=1800)
+            r = run_bounded(argv, plain_dir(name))
             if r.returncode != 0:
                 (state / "last_error.log").write_text(
                     "%s\n%s\nexit %d\n%s\n%s" % (now_iso(), " ".join(argv), r.returncode,
