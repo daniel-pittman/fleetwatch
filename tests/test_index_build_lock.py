@@ -178,7 +178,7 @@ class Locks(unittest.TestCase):
     def test_a_plain_build_skips_when_the_lock_is_held(self):
         self.hold(self.state / "refresh.lock.d")
         out = io.StringIO()
-        with mock.patch.object(refresh.subprocess, "run") as run, contextlib.redirect_stdout(out):
+        with mock.patch.object(refresh, "run_bounded") as run, contextlib.redirect_stdout(out):
             self.assertEqual(refresh.run_plain("plain", self.entry, self.opts), refresh.SKIPPED)
         run.assert_not_called()
         self.assertIn("[plain] refresh already running; skipped", out.getvalue())
@@ -197,10 +197,10 @@ class Locks(unittest.TestCase):
     def test_a_plain_build_takes_and_releases_the_lock(self):
         seen = []
 
-        def run(argv, **k):
+        def run(argv, *a, **k):
             seen.append((self.state / "refresh.lock.d").exists())
             return mock.Mock(returncode=0, stdout="", stderr="")
-        with mock.patch.object(refresh.subprocess, "run", run), contextlib.redirect_stdout(io.StringIO()):
+        with mock.patch.object(refresh, "run_bounded", run), contextlib.redirect_stdout(io.StringIO()):
             self.assertIs(refresh.run_plain("plain", self.entry, self.opts), True)
         self.assertEqual(seen, [True])
         self.assertFalse((self.state / "refresh.lock.d").exists())
@@ -209,10 +209,10 @@ class Locks(unittest.TestCase):
         self.entry["refresh"] = [["{python}", "-c", "pass"], ["{python}", "-c", "pass"]]
         events = []
 
-        def run(argv, **k):
+        def run(argv, *a, **k):
             events.append("run")
             return mock.Mock(returncode=0, stdout="", stderr="")
-        with mock.patch.object(refresh.subprocess, "run", run), \
+        with mock.patch.object(refresh, "run_bounded", run), \
                 mock.patch.object(refresh.Lock, "touch", lambda self: events.append("touch")), \
                 contextlib.redirect_stdout(io.StringIO()):
             refresh.run_plain("plain", self.entry, self.opts)
@@ -220,7 +220,7 @@ class Locks(unittest.TestCase):
 
     def test_a_stale_plain_lock_does_not_block(self):
         self.hold(self.state / "refresh.lock.d", age=refresh.LOCK_STALE_S + 60)
-        with mock.patch.object(refresh.subprocess, "run",
+        with mock.patch.object(refresh, "run_bounded",
                                return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run, \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertIs(refresh.run_plain("plain", self.entry, self.opts), True)
@@ -229,7 +229,7 @@ class Locks(unittest.TestCase):
     def index_now(self):
         reg = {"defaults": {}, "indexes": {"plain": self.entry}}
         with mock.patch.object(refresh, "load_registry", return_value=reg), \
-                mock.patch.object(refresh.subprocess, "run") as run, \
+                mock.patch.object(refresh, "run_bounded") as run, \
                 self.assertRaises(SystemExit) as cm:
             refresh._main(["index-now", "plain", str(self.root / "src" / "a.md")])
         run.assert_not_called()
