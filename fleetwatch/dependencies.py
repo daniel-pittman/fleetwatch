@@ -222,7 +222,8 @@ class Job:
         elif loaded is False:
             res, verb = m.load(label, paths[0] if m.darwin else None), "loaded"
         else:
-            res, verb = services.Outcome(False, "%s cannot be asked whether it is loaded" % m.name, ran=False), ""
+            res, verb = services.Outcome(False, "%s cannot be asked whether it is loaded (%s)"
+                                         % (m.name, _why_unknown(m)), ran=False), ""
         if res.ok:
             ctx.say("  %s %s" % (verb, label))
             return True

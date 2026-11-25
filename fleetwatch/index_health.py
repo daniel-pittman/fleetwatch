@@ -71,7 +71,7 @@ class Health:
         if self.streak < runs and (lasted is None or lasted < hours * 3600):
             return ""
         text = "failed %d run%s in a row" % (self.streak, "" if self.streak == 1 else "s")
-        return text + (" over %s" % data.ago(lasted) if lasted else "")
+        return text + (" over %s" % data.ago(lasted) if lasted and lasted >= 60 else "")
 
     def age(self, now):
         """Seconds since the index was last known current: its own last refresh, or the end of the last
