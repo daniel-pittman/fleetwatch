@@ -17,9 +17,8 @@ from unittest import mock
 os.environ.setdefault("FLEETWATCH_NO_MIGRATE", "1")
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-import fake_launchd  # noqa: E402
 from fleetwatch import dependencies as deps  # noqa: E402
-from fleetwatch import index_health, install_cli, notify, services, views  # noqa: E402
+from fleetwatch import index_health, install_cli, notify, schedule, services, views  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 LEGACY_INDEX, LEGACY_ARCHIVE = "local.search-indexes.refresh", "local.claude-session-archive"
@@ -57,11 +56,13 @@ class Home:
         p = mock.patch.dict(os.environ, self.env)
         p.start()
         test.addCleanup(p.stop)
-        for k in ("FLEETWATCH_LAUNCHCTL", "FLEETWATCH_SYSTEMCTL"):
-            os.environ.pop(k, None)
+        os.environ.pop("FLEETWATCH_SYSTEMCTL", None)
         plat = mock.patch.object(sys, "platform", "darwin")
         plat.start()
         test.addCleanup(plat.stop)
+        os.environ["FLEETWATCH_LAUNCHCTL"] = "%s %s" % (sys.executable, REPO / "tests" / "fake_launchd.py")
+        os.environ["FAKE_LAUNCHCTL_STATE"] = str(self.state_file)
+        os.environ["FAKE_LAUNCHCTL_LOG"] = str(self.log)
         self.write_launchd({})
 
     @property
@@ -75,13 +76,13 @@ class Home:
         return json.loads(self.state_file.read_text())
 
     def manager(self):
-        return services.Manager("darwin", fake_launchd.runner(str(self.state_file), str(self.log)),
-                                {"FLEETWATCH_LAUNCHCTL": "launchctl"}, uid=501)
+        return services.Manager("darwin")
 
     def calls(self, mutating_only=True):
         if not self.log.exists():
             return []
-        lines = self.log.read_text().splitlines()
+        # The domain is this user's (schedule.gui_domain()); the expected lines spell it gui/501.
+        lines = [x.replace(schedule.gui_domain(), "gui/501") for x in self.log.read_text().splitlines()]
         return [x for x in lines if x.split()[0] in MUTATING] if mutating_only else lines
 
     def legacy(self, label, loaded=True, args=None):
@@ -150,7 +151,7 @@ class Install(unittest.TestCase):
         self.assertFalse((self.h.root / "data").exists())
         self.assertIn("would write", out)
         self.assertIn("would load local.fleetwatch.watch-run", out)
-        self.assertIn("would unload the older job %s" % LEGACY_INDEX, out)
+        self.assertIn("would unload the legacy agent %s" % LEGACY_INDEX, out)
 
     def test_install_writes_and_loads_every_job_and_creates_the_folders(self):
         code, out = run(install_cli.install_main, self.h)
@@ -202,8 +203,9 @@ class Install(unittest.TestCase):
         kept = self.h.state / "legacy"
         self.assertEqual((kept / (LEGACY_INDEX + ".plist")).read_bytes(), body)
         self.assertTrue((kept / (LEGACY_ARCHIVE + ".plist")).exists())
-        self.assertIn("unloaded the older job %s" % LEGACY_INDEX, out)
-        self.assertIn("kept, not deleted", out)
+        self.assertIn("unloaded the legacy agent %s" % LEGACY_INDEX, out)
+        self.assertIn("unloaded the legacy agent %s" % LEGACY_ARCHIVE, out)
+        self.assertIn("(kept as a backup)", out)
         # each older job is unloaded after its replacement loads
         calls = self.h.calls()
         self.assertLess(calls.index("bootstrap gui/501 %s" % (self.h.agents / "local.fleetwatch.index-refresh.plist")),
@@ -233,7 +235,7 @@ class Install(unittest.TestCase):
         code, out = run(install_cli.install_main, self.h)
         self.assertEqual(code, 1)
         self.assertTrue(index.exists())
-        self.assertIn("could not unload the older job", out)
+        self.assertIn("could not unload the legacy agent", out)
 
     def test_an_older_job_stays_when_its_replacement_does_not_start(self):
         index = self.h.legacy(LEGACY_INDEX)
@@ -245,6 +247,17 @@ class Install(unittest.TestCase):
         self.assertTrue(index.exists())
         self.assertIn(LEGACY_INDEX, self.h.launchd()["loaded"])
         self.assertIn("could not start local.fleetwatch.index-refresh", out)
+
+    def test_the_legacy_archiver_stays_when_the_archive_job_does_not_load(self):
+        old = self.h.legacy(LEGACY_ARCHIVE)
+        st = self.h.launchd()
+        st["fail"] = ["local.fleetwatch.archive"]
+        self.h.state_file.write_text(json.dumps(st))
+        code, out = run(install_cli.install_main, self.h)
+        self.assertEqual(code, 1)
+        self.assertTrue(old.exists())
+        self.assertIn(LEGACY_ARCHIVE, self.h.launchd()["loaded"])
+        self.assertNotIn("bootout gui/501/%s" % LEGACY_ARCHIVE, self.h.calls())
 
     def test_uninstall_unloads_and_removes_only_fleetwatchs_jobs(self):
         self.h.legacy(LEGACY_INDEX)
@@ -272,12 +285,14 @@ class Install(unittest.TestCase):
         self.assertIn("would unload local.fleetwatch.notify", out)
 
     def test_a_trial_folder_never_runs_the_real_launchctl(self):
-        runner = mock.Mock(side_effect=AssertionError("ran launchctl"))
-        m = services.Manager("darwin", runner, {"FLEETWATCH_LAUNCH_AGENTS_DIR": str(self.h.agents)}, uid=501)
+        m = services.Manager("darwin", environ={"FLEETWATCH_LAUNCH_AGENTS_DIR": str(self.h.agents)})
         self.h.legacy(LEGACY_INDEX)
         out = io.StringIO()
-        self.assertEqual(install_cli.install_main([], out, m), 0)
-        runner.assert_not_called()
+        with mock.patch.object(schedule, "launchctl", side_effect=AssertionError("ran launchctl")) as lc:
+            self.assertEqual(install_cli.install_main([], out, m), 0)
+        lc.assert_not_called()
+        self.assertTrue((self.h.agents / (LEGACY_INDEX + ".plist")).exists())
+        self.assertIn("not retired: %s (a trial folder is set)" % LEGACY_INDEX, out.getvalue())
         self.assertIn("not started: launchd cannot be asked whether it is loaded (a trial folder is set)", out.getvalue())
         self.assertIn("launchctl bootstrap", out.getvalue())
         self.assertTrue((self.h.agents / "local.fleetwatch.index-refresh.plist").exists())
@@ -288,7 +303,7 @@ class Install(unittest.TestCase):
         def runner(argv, **_kw):
             calls.append(argv[2:])
             return subprocess.CompletedProcess(argv, 3 if argv[2] == "is-active" else 0, "", "")
-        m = services.Manager("linux", runner, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"}, uid=501)
+        m = services.Manager("linux", runner, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"}, )
         with mock.patch.object(sys, "platform", "linux"):
             out = io.StringIO()
             self.assertEqual(install_cli.install_main([], out, m), 0, out.getvalue())
@@ -301,7 +316,7 @@ class Install(unittest.TestCase):
             self.assertFalse(any(c[0] in MUTATING for c in calls))
             calls.clear()
             runner2 = lambda argv, **_kw: (calls.append(argv[2:]), subprocess.CompletedProcess(argv, 0, "", ""))[1]
-            m2 = services.Manager("linux", runner2, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"}, uid=501)
+            m2 = services.Manager("linux", runner2, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"}, )
             self.assertEqual(install_cli.uninstall_main([], io.StringIO(), m2), 0)
             self.assertIn(["disable", "--now", "fleetwatch-index-refresh.timer"], calls)
             self.assertFalse((units / "fleetwatch-index-refresh.timer").exists())
@@ -428,8 +443,8 @@ class Doctor(unittest.TestCase):
         self.healthy()
         self.h.archive_run(ok=False, error="rsync exited 23\nsecond line with detail")
         bad = self.failing()[1]
-        detail = bad[("session archive", "last run")]["detail"]
-        self.assertEqual(detail, "the last run failed: rsync exited 23")
+        detail = bad[("session archive", "archive check")]["detail"]
+        self.assertEqual(detail, "the last archive run failed: rsync exited 23")
 
     def test_archive_coverage(self):
         self.healthy()
@@ -439,16 +454,18 @@ class Doctor(unittest.TestCase):
         self.h.transcript("-work-b/%s.jsonl" % sid(2))                    # written after the last run started: waits
         code, rows = self.rows()
         self.assertEqual(code, 0)
-        self.assertIn("1 newer one waiting", rows[("session archive", "coverage")]["detail"])
+        self.assertIn("1 newer waiting", rows[("session archive", "archive check")]["detail"])
         self.h.transcript("-work-b/%s.jsonl" % sid(3), age=3600)          # older than the last run, yet not archived
         bad = self.failing()[1]
-        self.assertIn("1 live transcript older than the last run has no archive copy",
-                      bad[("session archive", "coverage")]["detail"])
+        self.assertEqual(bad[("session archive", "archive check")]["detail"],
+                         "1 live transcript with no archive copy")
 
     def test_the_archive_job_running_late(self):
         self.healthy()
         self.h.archive_run(ago=3 * 3600)
-        self.assertEqual(list(self.failing()[1]), [("archive", "last run")])
+        bad = self.failing()[1]
+        self.assertEqual(list(bad), [("session archive", "archive check")])
+        self.assertIn("the last archive run was 3", bad[("session archive", "archive check")]["detail"])
 
     def test_a_missing_folder(self):
         self.healthy()
@@ -472,7 +489,7 @@ class Doctor(unittest.TestCase):
         self.assertFalse(legacy.exists())
         self.assertTrue((self.h.state / "legacy" / (LEGACY_INDEX + ".plist")).exists())
         bad = self.failing()[1]
-        self.assertEqual(sorted(bad), [("index refresh", "last run"), ("session archive", "coverage"),
+        self.assertEqual(sorted(bad), [("index refresh", "last run"), ("session archive", "archive check"),
                                        ("watch run", "last run")])
         # only the archive, whose plist went missing while it stayed loaded, is reloaded
         self.assertEqual([c for c in self.h.calls() if c.startswith("bootout gui/501/local.fleetwatch")],

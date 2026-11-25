@@ -23,8 +23,10 @@ def _context(out, dry_run=False, manager=None, now=None):
 
 def install(ctx):
     """Install every folder and job, then retire the older jobs each installed job replaces. True when every
-    step worked. An older job is retired only once its replacement is in place."""
+    step worked. An older job is retired only once its replacement is confirmed loaded; when the replacement
+    does not load, the older job keeps running and install fails, so the work is never left undone."""
     ok = True
+    m = ctx.manager
     ctx.say("folders%s:" % (" (dry run, nothing changes)" if ctx.dry_run else ""))
     if all(f.path().is_dir() for f in deps.FOLDERS if f.create):
         ctx.say("  in place")
@@ -34,14 +36,21 @@ def install(ctx):
         ctx.say("%s:" % job.name)
         done = job.install(ctx)
         ok = done and ok
-        if not done:
-            if job.legacy:
-                ctx.say("  the older job%s %s left as %s" % ("" if len(job.legacy) == 1 else "s",
-                                                             ", ".join(job.legacy),
-                                                             "it is" if len(job.legacy) == 1 else "they are"))
-            continue
-        for label in job.legacy:
-            ok = deps.retire(label, ctx, job.label) and ok
+        if not job.legacy or not m.darwin or (job.live_own(m) and not ctx.dry_run):
+            continue                  # no older job (they are launchd agents), or the job's own install retired it
+        if ctx.dry_run or (done and m.loaded(job.manager_label(m)) is True):
+            for label in job.legacy:
+                ok = deps.retire(label, ctx) and ok
+        elif done and m.available:
+            ok = False
+            ctx.say("  %s is not loaded, so %s left as %s" % (job.label, ", ".join(job.legacy),
+                                                            "it is" if len(job.legacy) == 1 else "they are"))
+        elif not done:
+            ctx.say("  the older job%s %s left as %s" % ("" if len(job.legacy) == 1 else "s", ", ".join(job.legacy),
+                                                         "it is" if len(job.legacy) == 1 else "they are"))
+        else:
+            for label in job.legacy:
+                deps.retire(label, ctx)    # says why it cannot run
     return ok
 
 
@@ -92,10 +101,11 @@ def fix(ctx, rows):
             ctx.say("%s:" % job.name)
             if job.restart(ctx):
                 done.append(job.name)
-        if (job.name, "no older job") in failing and job.installed(ctx.manager):
+        replacement_loaded = ctx.manager.loaded(job.manager_label(ctx.manager)) is True
+        if (job.name, "no older job") in failing and replacement_loaded:
             for label in job.legacy:
                 ctx.say("%s, older job %s:" % (job.name, label))
-                if deps.retire(label, ctx, job.label):
+                if deps.retire(label, ctx):
                     done.append(label)
     return done
 

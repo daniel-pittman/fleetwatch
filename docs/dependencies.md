@@ -2,7 +2,7 @@
 
 Generated from `fleetwatch/dependencies.py` by `fleetwatch doctor --inventory`; a test keeps them in step.
 
-`fleetwatch install` installs and starts every scheduled job and creates the folders, and retires the older jobs each one replaces: it unloads them and moves their plist into `legacy/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. `fleetwatch doctor` checks every row below and exits 1 when something is wrong; `fleetwatch doctor --fix` installs what is missing and retires older jobs, and reports the rest.
+`fleetwatch install` installs and starts every scheduled job and creates the folders, and retires the older jobs each one replaces once its replacement is loaded: it unloads them and moves their plist into `legacy/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. `fleetwatch doctor` checks every row below and exits 1 when something is wrong; `fleetwatch doctor --fix` installs what is missing and retires older jobs, and reports the rest.
 
 ## Scheduled jobs
 
@@ -45,5 +45,5 @@ All optional: a missing one is a warning, and doctor still exits 0.
 
 ## Other checks
 
-- **The archive:** the last archive run (from `archive/last_run.json` in the state folder), and coverage: a live transcript last written before the last run started that has no archive copy is a failure.
+- **The archive:** `fleetwatch.archive.check()`: the last archive run (from `archive/last_run.json` in the state folder) never happened, failed or is older than twice its interval, or a live transcript last written before the last run started has no archive copy. A job installed less than two intervals ago that has not run yet is fine.
 - **Indexes:** an index whose scheduled refresh has failed 3 runs in a row, or for 6 hours, is named with its last error's first line. `[alerts] index_failure_runs` and `index_failure_hours` in settings.toml change the limits. The same streak shows on the board's Needs you tab and is sent once per streak by `fleetwatch notify`.

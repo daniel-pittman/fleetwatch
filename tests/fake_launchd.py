@@ -3,13 +3,12 @@
 
 Supported: `print gui/UID/LABEL`, `bootstrap gui/UID PLIST` (a kept-alive job starts running), `bootout
 gui/UID/LABEL`, `kickstart -k gui/UID/LABEL` (marks it running) and `list`. A label in the state's "fail"
-list makes bootstrap and bootout of it fail the way launchctl does. It never touches a real launchd. Use it from a test as a Manager runner (`runner(state, log)`) or as a command
-(FLEETWATCH_LAUNCHCTL="python tests/fake_launchd.py").
+list makes bootstrap and bootout of it fail the way launchctl does. It never touches a real launchd.
+Run it as FLEETWATCH_LAUNCHCTL="python tests/fake_launchd.py".
 """
 import json
 import os
 import plistlib
-import subprocess
 import sys
 
 
@@ -78,14 +77,6 @@ def call(argv, state_path, log_path=None):
         rows = ["PID\tStatus\tLabel"] + ["%s\t0\t%s" % ("123" if lb in running else "-", lb) for lb in sorted(loaded)]
         return 0, "\n".join(rows) + "\n", ""
     return 64, "", "fake launchctl: unsupported: %s\n" % " ".join(argv)
-
-
-def runner(state_path, log_path=None):
-    """A subprocess.run stand-in for services.Manager that answers the launchctl part of argv."""
-    def run(argv, **_kw):
-        code, out, err = call(list(argv[1:]), state_path, log_path)
-        return subprocess.CompletedProcess(argv, code, out, err)
-    return run
 
 
 if __name__ == "__main__":
