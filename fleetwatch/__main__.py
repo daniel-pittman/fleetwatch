@@ -11,6 +11,8 @@ def build_parser():
                     "--once prints one snapshot.",
         epilog="commands (run `fleetwatch COMMAND --help` for each):\n"
                "  resume [NAME]       resume a named session in its folder\n"
+               "  restore [NAME|ID]   copy an archive-only transcript back, without starting it\n"
+               "  archive             run | install | uninstall | status: the transcript archive\n"
                "  park [NAME]         mark a session finished for now, with a note\n"
                "  unpark [NAME]       take a session off the parked list\n"
                "  prune               move finished sessions' status files to .pruned/\n"
@@ -84,6 +86,13 @@ def main(argv=None):
     if argv[:1] == ["resume"]:
         from . import resume
         return resume.main(argv[1:])
+    # The transcript archive and restoring from it.
+    if argv[:1] == ["archive"]:
+        from . import archive
+        return archive.main(argv[1:])
+    if argv[:1] == ["restore"]:
+        from . import restore
+        return restore.main(argv[1:])
     if argv[:1] == ["notify"]:
         from . import notify
         return notify.main(argv[1:])
