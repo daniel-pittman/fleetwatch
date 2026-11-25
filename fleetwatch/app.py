@@ -1,7 +1,6 @@
 """fleetwatch live view: a Textual app with tabs along the bottom and folding sections."""
 import asyncio
 import os
-import signal
 import sys
 import textwrap
 import time
@@ -19,7 +18,7 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, holds, index_health, iterm, park, prune, radar, resume, views, watches
+from . import config, data, find, hangup, holds, index_health, iterm, park, prune, radar, resume, views, watches
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
@@ -1171,12 +1170,7 @@ class FleetwatchApp(App):
         self.update_sortlines()
         self.query_one(TabBar).update_tabs(self.tab_counts(), 0)
         self.lists[0].focus()
-        try:
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGTERM, signal.SIGHUP):
-                loop.add_signal_handler(sig, self.exit)
-        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-            pass
+        self.event_loop = asyncio.get_running_loop()
         if self._state_warning:
             self.say(self._state_warning)
         self.refresh_now()
@@ -1990,7 +1984,20 @@ class FleetwatchApp(App):
         self.exit()
 
 
+def request_exit(app):
+    """App.exit, scheduled on the app's loop from any thread without waiting for it."""
+    loop = getattr(app, "event_loop", None)
+    if loop is not None:
+        loop.call_soon_threadsafe(app.exit)
+
+
 def run(paths, window_s, horizon, interval):
-    """Run the app. Returns the entry to resume in this terminal, once the terminal is restored."""
+    """Run the app. Returns the entry to resume in this terminal, once the terminal is restored.
+    SIGTERM, SIGHUP and a terminal that goes away end it (fleetwatch.hangup)."""
     app = FleetwatchApp(lambda: gather(paths, window_s, horizon), interval, paths=paths)
-    return app.run()
+    guard = hangup.Guard(lambda: request_exit(app), sys.__stdout__.fileno())
+    guard.install()
+    try:
+        return app.run()
+    finally:
+        guard.stop()
