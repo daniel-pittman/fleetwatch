@@ -10,71 +10,23 @@ or transcript text: an index's last error is reduced to its first line.
 import io
 import json
 import os
-import re
 import shutil
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import data, notify_schedule, schedule, services, settings
+from . import archive, data, notify_schedule, schedule, services, settings
 
-# ---- the archive's own module (fleetwatch.archive, schedule.ARCHIVE, settings.archive_root). This block
-# is the one place that reads it; each fallback answers the same way until that module is present.
-ARCHIVE = getattr(schedule, "ARCHIVE", None) or schedule.Job(
-    "local.fleetwatch.archive", "fleetwatch-archive", ("archive", "run"), 3600,
-    "fleetwatch archive run", "fleetwatch archive")
-try:
-    from . import archive as _archive
-except ImportError:
-    _archive = None
-MAIN_TRANSCRIPT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl")
+ARCHIVE = schedule.ARCHIVE
 
 
 def archive_root():
-    """The transcript archive (it holds projects/): CLAUDE_SESSION_ARCHIVE_DEST, else settings.toml
-    [archive] dest, else the folder the earlier archiver used, so an existing archive is adopted in place."""
-    if hasattr(settings, "archive_root"):
-        return Path(settings.archive_root())
-    return Path(os.environ.get("CLAUDE_SESSION_ARCHIVE_DEST")
-                or os.path.join(os.path.expanduser("~"), ".local", "share", "claude-session-archive", "archive"))
-
-
-def archive_state_path():
-    return _archive.state_path() if _archive else Path(settings.state_dir()) / "archive" / "last_run.json"
-
-
-def _main_transcripts(root):
-    """{relative path: mtime} of each <project>/<sessionId>.jsonl under root."""
-    out = {}
-    try:
-        projects = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
-    except OSError:
-        return out
-    for project in projects:
-        try:
-            for f in os.scandir(project.path):
-                if MAIN_TRANSCRIPT.fullmatch(f.name) and f.is_file(follow_symlinks=False):
-                    out[os.path.join(project.name, f.name)] = f.stat(follow_symlinks=False).st_mtime
-        except OSError:
-            continue
-    return out
-
-
-def archive_coverage(since=None):
-    """(missing, missing_before): live main transcripts with no archive copy, and how many of those were last
-    written before `since` (the last archive run's start), which that run should have copied."""
-    if _archive:
-        cov = _archive.coverage(since=since)
-        return cov["missing"], cov["missing_before"] or 0
-    live = _main_transcripts(projects_dir())
-    kept = _main_transcripts(Path(data.default_paths()["archive"]))
-    missing = [rel for rel in live if rel not in kept]
-    return len(missing), sum(1 for rel in missing if since is not None and live[rel] < since)
+    """The transcript archive (it holds projects/): archive.archive_root()."""
+    return Path(archive.archive_root())
 
 
 STALE_FACTOR = 2
-LEGACY_BACKUPS = "legacy"
 MAX_ERROR = 160
 OK, WARN, FAIL = "ok", "warn", "fail"
 
@@ -212,6 +164,14 @@ class Job:
     last_run: object        # a function returning epoch seconds of the last run, or None
     legacy: tuple = ()
     kind: str = "job"
+    # The job's own install and uninstall (each takes `out`, returns an exit code) for a live launchd. Its
+    # install loads the job and retires the older jobs it replaces itself, only once the job is loaded.
+    own_live_install: object = None
+    own_live_uninstall: object = None
+    checks_last_run: bool = True    # False: its own check reports how long ago it ran
+
+    def live_own(self, manager):
+        return manager.darwin and manager.available and self.own_live_install is not None
 
     def manager_label(self, manager):
         return self.label if manager.darwin else self.unit
@@ -241,6 +201,8 @@ class Job:
                             "%s is loaded%s" % (label, "" if same else "; would reload it") if loaded else
                             "would load %s (%s cannot be asked whether it is loaded)" % (label, m.name)))
             return True
+        if self.live_own(m):
+            return self._own_install(ctx, paths, before)
         buf = io.StringIO()
         self.write(buf)
         missing = [p for p in paths if not p.exists()]
@@ -256,24 +218,32 @@ class Job:
         if loaded is True and not changed:
             ctx.say("  %s is loaded" % label)
             return True
-        if loaded is True:
-            res, verb = m.reload(label, paths[0] if m.darwin else None), "reloaded"
-        elif loaded is False:
-            res, verb = m.load(label, paths[0] if m.darwin else None), "loaded"
-        else:
-            res, verb = services.Outcome(False, "%s cannot be asked whether it is loaded (%s)"
-                                         % (m.name, _why_unknown(m)), ran=False), ""
-        if res.ok:
-            ctx.say("  %s %s" % (verb, label))
-            return True
-        if not res.ran:
-            ctx.say("  not started: %s" % res.detail)
+        if loaded is None:
+            ctx.say("  not started: %s cannot be asked whether it is loaded (%s)" % (m.name, m.why_not()))
             for line in buf.getvalue().splitlines():
                 if line.startswith(("to start it", "or use cron")):
                     ctx.say("    " + line)
             return True
+        res = m.load(label)
+        if res.ok:
+            ctx.say("  %s %s" % ("reloaded" if loaded else "loaded", label))
+            return True
         ctx.say("  could not start %s: %s" % (label, res.detail))
         return False
+
+    def _own_install(self, ctx, paths, before):
+        """The job's own install, run only when there is something for it to do, so running install again
+        reloads nothing."""
+        m = ctx.manager
+        current = before[paths[0]] == self.expected_plist()
+        if current and m.loaded(self.label) and not any(legacy_state(x, m) != (False, None) for x in self.legacy):
+            ctx.say("  unchanged: %s" % _home(paths[0]))
+            ctx.say("  %s is loaded" % self.label)
+            return True
+        buf = io.StringIO()
+        code = self.own_live_install(buf)
+        _relay(ctx, buf)
+        return code == 0
 
     def restart(self, ctx):
         label = self.manager_label(ctx.manager)
@@ -284,6 +254,11 @@ class Job:
     def uninstall(self, ctx):
         m = ctx.manager
         label = self.manager_label(m)
+        if self.live_own(m) and self.own_live_uninstall is not None and not ctx.dry_run:
+            buf = io.StringIO()
+            code = self.own_live_uninstall(buf)
+            _relay(ctx, buf)
+            return code == 0
         ok = True
         loaded = m.loaded(label)
         if loaded:
@@ -297,7 +272,8 @@ class Job:
                     ok = False
                     ctx.say("  could not unload %s: %s" % (label, res.detail))
         elif loaded is None and self.installed(m):
-            ctx.say("  %s cannot be asked whether %s is loaded; if it is: %s" % (m.name, label, _unload_hint(m, label)))
+            ctx.say("  %s cannot be asked whether %s is loaded (%s); if it is: %s"
+                    % (m.name, label, m.why_not(), _unload_hint(m, label)))
         for p in self._files(m):
             if not p.exists():
                 continue
@@ -324,7 +300,7 @@ class Job:
             out.append(Check(self.name, "installed", OK, _home(self._files(m)[0])))
             loaded = m.loaded(label)
             if loaded is None:
-                out.append(Check(self.name, "loaded", WARN, "%s cannot be asked (%s)" % (m.name, _why_unknown(m))))
+                out.append(Check(self.name, "loaded", WARN, "%s cannot be asked (%s)" % (m.name, m.why_not())))
             elif not loaded:
                 out.append(Check(self.name, "loaded", FAIL, "installed but not loaded", "fleetwatch install"))
             elif self.interval_s is None:
@@ -334,7 +310,7 @@ class Job:
                                  "" if running else "fleetwatch doctor --fix (restarts it)"))
             else:
                 out.append(Check(self.name, "loaded", OK, label))
-            if self.interval_s is not None:
+            if self.interval_s is not None and self.checks_last_run:
                 out.append(self._recent(ctx))
         if m.darwin:
             out += [legacy_check(self.name, old, ctx) for old in self.legacy]
@@ -366,8 +342,10 @@ def _read(path):
         return None
 
 
-def _why_unknown(m):
-    return "a trial folder is set" if not m.live else "%s is not on the PATH" % m.argv[0]
+def _relay(ctx, buf):
+    for line in buf.getvalue().splitlines():
+        if line.strip():
+            ctx.say("  " + line)
 
 
 def _unload_hint(m, label):
@@ -385,34 +363,14 @@ def _log_mtime(job):
     return last
 
 
-def archive_last_run():
-    """When the last archive run ended (or started), from its state file; None when it never ran."""
-    info = read_archive_state()
-    if not info:
-        return None
-    for key in ("ended", "started"):
-        t = data.to_epoch(info.get(key))
-        if t is not None:
-            return t
-    return _mtime(archive_state_path())
-
-
-def read_archive_state():
-    try:
-        info = json.loads(archive_state_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
-        return None
-    return info if isinstance(info, dict) else None
-
-
-def _schedule_job(job, name, purpose, legacy=(), last_run=None):
+def _schedule_job(job, name, purpose, legacy=(), last_run=None, **own):
     return Job(
         name=name, purpose=purpose, label=job.label, unit=job.unit + ".timer", interval_s=job.interval_s,
         command="fleetwatch " + " ".join(job.args), own_install=job.usage + " install",
         write=lambda out, job=job: schedule.install(out, job),
         files=lambda darwin, job=job: [schedule._plist_path(job)] if darwin else schedule._units(job),
         expected_plist=lambda job=job: _plist_bytes(schedule.plist_dict(settings.state_dir(), job)),
-        last_run=last_run or _log_mtime(job), legacy=legacy)
+        last_run=last_run or _log_mtime(job), legacy=legacy, **own)
 
 
 def _plist_bytes(d):
@@ -421,7 +379,6 @@ def _plist_bytes(d):
 
 
 INDEX_LEGACY = ("local.search-indexes.refresh",)
-ARCHIVE_LEGACY = ("local.claude-session-archive",)
 
 JOBS = (
     _schedule_job(schedule.INDEX, "index refresh", "refreshes every registered session index",
@@ -435,7 +392,9 @@ JOBS = (
         expected_plist=lambda: _plist_bytes(notify_schedule.plist_dict(settings.state_dir())),
         last_run=lambda: None),
     _schedule_job(ARCHIVE, "archive", "copies Claude Code transcripts into the archive before the retention "
-                  "sweep removes them", legacy=ARCHIVE_LEGACY, last_run=archive_last_run),
+                  "sweep removes them", legacy=(archive.LEGACY_LABEL,), last_run=lambda: None,
+                  own_live_install=lambda out: archive.install(out),
+                  own_live_uninstall=lambda out: archive.uninstall(out), checks_last_run=False),
 )
 
 FOLDERS = (
@@ -480,19 +439,7 @@ def legacy_plist(label):
 
 
 def backup_dir():
-    return Path(settings.state_dir()) / LEGACY_BACKUPS
-
-
-def _backup_path(label, now):
-    """A path in the backup folder that holds no file yet: an earlier backup is never replaced."""
-    folder = backup_dir()
-    path = folder / (label + ".plist")
-    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-    n = 0
-    while path.exists():
-        n += 1
-        path = folder / ("%s.%s%s.plist" % (label, stamp, "" if n == 1 else "-%d" % n))
-    return path
+    return schedule.legacy_backup_dir()
 
 
 def legacy_state(label, manager):
@@ -501,40 +448,20 @@ def legacy_state(label, manager):
     return manager.loaded(label), (plist if plist.exists() else None)
 
 
-def retire(label, ctx, replaced_by=""):
-    """Unload an older job that does the work of one of ours, and move its plist into the backup folder in
-    fleetwatch's state folder. The plist is never deleted. Returns False when a step failed."""
+def retire(label, ctx):
+    """Retire an older job through schedule.retire_legacy: unloaded, its plist moved to the backup folder in
+    fleetwatch's state folder, never deleted. Returns False when a step failed or could not run."""
     m = ctx.manager
     if not m.darwin:
         return True
-    loaded, plist = legacy_state(label, m)
-    if not loaded and plist is None:
+    if not m.available:
+        if legacy_plist(label).exists():
+            ctx.say("  not retired: %s (%s); its plist stays where it is" % (label, m.why_not()))
         return True
-    why = " (replaced by %s)" % replaced_by if replaced_by else ""
-    if ctx.dry_run:
-        if loaded:
-            ctx.say("  would unload the older job %s%s" % (label, why))
-        if plist is not None:
-            ctx.say("  would move %s to %s/" % (_home(plist), _home(backup_dir())))
-        return True
-    if loaded:
-        res = m.unload(label)
-        if not res.ok:
-            ctx.say("  could not unload the older job %s: %s; its plist stays where it is" % (label, res.detail))
-            return False
-        ctx.say("  unloaded the older job %s%s" % (label, why))
-    elif loaded is None:
-        ctx.say("  %s cannot be asked whether %s is loaded; if it is: %s" % (m.name, label, _unload_hint(m, label)))
-    if plist is not None:
-        dest = _backup_path(label, ctx.time())
-        try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(plist), str(dest))
-        except OSError as e:
-            ctx.say("  could not move %s to %s: %s" % (_home(plist), _home(dest), _first_line(e)))
-            return False
-        ctx.say("  moved %s to %s (kept, not deleted)" % (_home(plist), _home(dest)))
-    return True
+    buf = io.StringIO()
+    ok, _actions = m.retire(label, buf, ctx.dry_run)
+    _relay(ctx, buf)
+    return ok
 
 
 def legacy_check(item, label, ctx):
@@ -556,7 +483,7 @@ def duplicate_checks(ctx):
         return []
     loaded = m.loaded_labels()
     if loaded is None:
-        return [Check("scheduled jobs", "no duplicates", WARN, "launchd cannot be asked (%s)" % _why_unknown(m))]
+        return [Check("scheduled jobs", "no duplicates", WARN, "launchd cannot be asked (%s)" % m.why_not())]
     by_sig = {}
     for label, path in services.agent_plists().items():
         if label not in loaded:
@@ -575,32 +502,24 @@ def duplicate_checks(ctx):
 # ---------------------------------------------------------------- the archive and the indexes
 
 def archive_checks(ctx):
-    """The last archive run's outcome and the archive's coverage. How long ago it ran is the archive job's own
-    check."""
-    info = read_archive_state()
-    out = []
-    if info is not None and info.get("ok") is False:
-        out.append(Check("session archive", "last run", FAIL, "the last run failed: %s"
-                         % (_first_line(info.get("error")) or "no error recorded"), "fleetwatch archive status"))
-    started = data.to_epoch(info.get("started")) if info else None
-    try:
-        missing, before = archive_coverage(since=started)
-    except OSError as e:
-        return out + [Check("session archive", "coverage", WARN, "could not be counted: %s" % _first_line(e))]
-    plural = lambda n: "" if n == 1 else "s"
-    if started is None:
-        out.append(Check("session archive", "coverage", WARN if missing else OK,
-                         "%d live transcript%s with no archive copy, and no archive run recorded"
-                         % (missing, plural(missing)) if missing else "every live transcript is archived",
-                         "fleetwatch archive run" if missing else ""))
-    elif before:
-        out.append(Check("session archive", "coverage", FAIL, "%d live transcript%s older than the last run %s "
-                         "no archive copy" % (before, plural(before), "has" if before == 1 else "have"),
-                         "fleetwatch archive run"))
-    else:
-        out.append(Check("session archive", "coverage", OK, "every transcript older than the last run is archived"
-                         + ("; %d newer one%s waiting for the next run" % (missing, plural(missing)) if missing else "")))
-    return out
+    """archive.check(): a run that never happened, failed or is stale, and live transcripts the last run
+    should have copied. A job installed less than two intervals ago that has not run yet is not a problem."""
+    res = archive.check(now=ctx.time())
+    st = res.get("status") or {}
+    problems = list(res.get("problems") or [])
+    if st.get("ended") is None:
+        since = _mtime(schedule._plist_path(ARCHIVE) if ctx.manager.darwin else schedule._units(ARCHIVE)[-1])
+        if since is not None and ctx.time() - since < STALE_FACTOR * ARCHIVE.interval_s:
+            return [Check("session archive", "last run", OK, "no run yet; installed %s ago, runs every %s"
+                          % (data.ago(ctx.time() - since), data.ago(ARCHIVE.interval_s)))]
+    if problems:
+        return [Check("session archive", "archive check", FAIL, _first_line(p), "fleetwatch archive status")
+                for p in problems]
+    cov = st.get("coverage") or {}
+    waiting = cov.get("missing") or 0
+    return [Check("session archive", "archive check", OK, "last run %s ago; every transcript older than it is "
+                  "archived%s" % (data.ago(st.get("age_s") or 0),
+                                  "; %d newer waiting for the next run" % waiting if waiting else ""))]
 
 
 def _index_error_line(root, name):
@@ -645,8 +564,8 @@ def markdown():
              "Generated from `fleetwatch/dependencies.py` by `fleetwatch doctor --inventory`; a test keeps them "
              "in step.", "",
              "`fleetwatch install` installs and starts every scheduled job and creates the folders, and retires "
-             "the older jobs each one replaces: it unloads them and moves their plist into `" + LEGACY_BACKUPS +
-             "/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. "
+             "the older jobs each one replaces once its replacement is loaded: it unloads them and moves their "
+             "plist into `legacy/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. "
              "`fleetwatch doctor` checks every row below and exits 1 when something is wrong; "
              "`fleetwatch doctor --fix` installs what is missing and retires older jobs, and reports the rest.",
              "", "## Scheduled jobs", "",
@@ -671,9 +590,10 @@ def markdown():
                                                    ", ".join("macOS" if p == "darwin" else "Linux" for p in t.platforms)
                                                    or "all"))
     lines += ["", "## Other checks", "",
-              "- **The archive:** the last archive run (from `archive/last_run.json` in the state folder), and "
-              "coverage: a live transcript last written before the last run started that has no archive copy is "
-              "a failure.",
+              "- **The archive:** `fleetwatch.archive.check()`: the last archive run (from `archive/last_run.json` "
+              "in the state folder) never happened, failed or is older than twice its interval, or a live "
+              "transcript last written before the last run started has no archive copy. A job installed less "
+              "than two intervals ago that has not run yet is fine.",
               "- **Indexes:** an index whose scheduled refresh has failed %d runs in a row, or for %d hours, is "
               "named with its last error's first line. `[alerts] index_failure_runs` and `index_failure_hours` in "
               "settings.toml change the limits. The same streak shows on the board's Needs you tab and is sent "

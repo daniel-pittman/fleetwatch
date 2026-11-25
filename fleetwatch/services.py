@@ -1,12 +1,13 @@
 """The service manager behind `fleetwatch install`, `uninstall` and `doctor`: launchd on macOS, systemd user
-units elsewhere. Every call goes through a Manager, so tests and trial installs hand it a fake.
+units elsewhere.
 
-The command is `launchctl` (or `systemctl --user`), replaced by FLEETWATCH_LAUNCHCTL (or
-FLEETWATCH_SYSTEMCTL), split like a shell command line. When FLEETWATCH_LAUNCH_AGENTS_DIR (or
+launchd is reached only through schedule.py's shared helpers (schedule.launchctl, is_loaded, load,
+retire_legacy), which run FLEETWATCH_LAUNCHCTL when it is set. systemd runs `systemctl --user`, or
+FLEETWATCH_SYSTEMCTL, through the Manager's runner. When FLEETWATCH_LAUNCH_AGENTS_DIR (or
 FLEETWATCH_SYSTEMD_USER_DIR) points the files at another folder and no replacement command is set, the
-manager never runs the real one: it would load a trial file into the live session. It reports each step as
-"not run" instead.
+Manager runs neither: it would load a trial file into the live session. Each step is reported as not run.
 """
+import io
 import os
 import plistlib
 import shlex
@@ -14,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from . import schedule
 
@@ -24,13 +26,18 @@ TIMEOUT_S = 30
 class Outcome:
     ok: bool
     detail: str = ""        # the first line of what the command printed when it failed
-    ran: bool = True        # False: the step was only described (a dry run or a trial folder)
+    ran: bool = True        # False: the step was only described (a trial folder, or no service manager)
+
+
+def _first(text, fallback):
+    lines = [x.strip() for x in (text or "").splitlines() if x.strip()]
+    return lines[0] if lines else fallback
 
 
 class Manager:
     """One service manager. `loaded(label)` is True, False, or None when it cannot be told."""
 
-    def __init__(self, platform=None, runner=subprocess.run, environ=None, uid=None):
+    def __init__(self, platform=None, runner=subprocess.run, environ=None):
         self.platform = platform or sys.platform
         self.runner = runner
         env = os.environ if environ is None else environ
@@ -43,85 +50,98 @@ class Manager:
             default = ["systemctl", "--user"]
         self.argv = shlex.split(override) if override else default
         self.live = bool(override) or not folder
-        self.uid = os.getuid() if uid is None else uid
-        self.domain = "gui/%d" % self.uid
         self.available = self.live and (bool(override) or shutil.which(self.argv[0]) is not None)
 
     @property
     def name(self):
         return "launchd" if self.darwin else "systemd"
 
-    def _run(self, args):
+    def why_not(self):
+        return "a trial folder is set" if not self.live else "%s is not on the PATH" % self.argv[0]
+
+    def _call(self, args):
+        """A CompletedProcess for one launchctl or systemctl call, or None when it may not run."""
         if not self.available:
-            return Outcome(False, "not run (%s)" % ("a trial folder is set" if not self.live
-                                                     else "%s is not on the PATH" % self.argv[0]), ran=False)
+            return None
+        if self.darwin:
+            return schedule.launchctl(*args)
         try:
-            p = self.runner(self.argv + list(args), capture_output=True, text=True, timeout=TIMEOUT_S)
+            return self.runner(self.argv + list(args), capture_output=True, text=True, timeout=TIMEOUT_S)
         except (OSError, subprocess.SubprocessError) as e:
-            return Outcome(False, str(e).splitlines()[0] if str(e) else type(e).__name__)
-        text = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
-        return Outcome(p.returncode == 0, "" if p.returncode == 0 else (text.splitlines() or ["exit %d" % p.returncode])[0],
-                       ran=True)
+            return subprocess.CompletedProcess(args, 127, "", str(e))
 
-    def _query(self, args):
-        """(returncode, stdout) for a read-only query, or (None, "") when it cannot run."""
-        if not self.available:
-            return None, ""
-        try:
-            p = self.runner(self.argv + list(args), capture_output=True, text=True, timeout=TIMEOUT_S)
-        except (OSError, subprocess.SubprocessError):
-            return None, ""
-        return p.returncode, p.stdout or ""
+    def _outcome(self, args):
+        p = self._call(args)
+        if p is None:
+            return Outcome(False, "not run (%s)" % self.why_not(), ran=False)
+        return Outcome(p.returncode == 0, "" if p.returncode == 0 else
+                       _first((p.stderr or "") + "\n" + (p.stdout or ""), "exit %d" % p.returncode))
 
-    # ---- launchd: a label and a plist; systemd: the unit that is enabled (a timer, or the service itself)
+    def _service(self, label):
+        return "%s/%s" % (schedule.gui_domain(), label)
+
+    # ---- launchd: a label and its plist; systemd: the unit that is enabled (a timer, or the service itself)
 
     def loaded(self, label):
-        rc, _out = self._query(["print", "%s/%s" % (self.domain, label)] if self.darwin else ["is-active", label])
-        return None if rc is None else rc == 0
+        if not self.available:
+            return None
+        if self.darwin:
+            return schedule.is_loaded(label)
+        return self._call(["is-active", label]).returncode == 0
 
     def running(self, label):
         """Whether a kept-alive job has a live process: launchd's `state = running`, systemd's active."""
-        rc, out = self._query(["print", "%s/%s" % (self.domain, label)] if self.darwin else ["is-active", label])
-        if rc is None:
+        p = self._call(["print", self._service(label)] if self.darwin else ["is-active", label])
+        if p is None:
             return None
         if not self.darwin:
-            return rc == 0
-        return rc == 0 and any(line.strip() == "state = running" for line in out.splitlines())
+            return p.returncode == 0
+        return p.returncode == 0 and any(line.strip() == "state = running" for line in (p.stdout or "").splitlines())
 
-    def load(self, label, path):
+    def load(self, label):
+        """Start an installed job, replacing a loaded copy so a rewritten file takes effect."""
+        if not self.available:
+            return Outcome(False, "not run (%s)" % self.why_not(), ran=False)
         if self.darwin:
-            return self._run(["bootstrap", self.domain, str(path)])
-        reload = self._run(["daemon-reload"])
-        return reload if not reload.ok else self._run(["enable", "--now", label])
-
-    def reload(self, label, path):
-        """Pick up a rewritten file for a job that is already loaded."""
-        if self.darwin:
-            out = self._run(["bootout", "%s/%s" % (self.domain, label)])
-            return out if not out.ok else self._run(["bootstrap", self.domain, str(path)])
-        out = self._run(["daemon-reload"])
-        return out if not out.ok else self._run(["restart", label])
+            # schedule.load finds the plist from the label alone.
+            buf = io.StringIO()
+            ok = schedule.load(buf, SimpleNamespace(label=label))
+            return Outcome(ok, "" if ok else _first(buf.getvalue().split(": ", 1)[-1], "it did not load"))
+        out = self._outcome(["daemon-reload"])
+        if not out.ok:
+            return out
+        if self.loaded(label):
+            return self._outcome(["restart", label])
+        return self._outcome(["enable", "--now", label])
 
     def restart(self, label):
         """Restart a kept-alive job that is loaded but not running."""
-        if self.darwin:
-            return self._run(["kickstart", "-k", "%s/%s" % (self.domain, label)])
-        return self._run(["restart", label])
+        return self._outcome(["kickstart", "-k", self._service(label)] if self.darwin else ["restart", label])
 
     def unload(self, label):
         if self.darwin:
-            return self._run(["bootout", "%s/%s" % (self.domain, label)])
-        return self._run(["disable", "--now", label])
+            out = self._outcome(["bootout", self._service(label)])
+            return out if out.ok or self.loaded(label) is not False else Outcome(True)
+        return self._outcome(["disable", "--now", label])
+
+    def retire(self, label, out, dry_run=False):
+        """Retire an older launchd job through schedule.retire_legacy (unloaded, plist kept in
+        schedule.legacy_backup_dir()). Returns (ok, actions); nothing runs when the Manager may not."""
+        if not self.darwin:
+            return True, []
+        if not self.available:
+            return False, []
+        return schedule.retire_legacy(label, out, dry_run)
 
     def loaded_labels(self):
         """Every label launchd has loaded in this session (from `launchctl list`), or None when unknown."""
         if not self.darwin:
             return None
-        rc, out = self._query(["list"])
-        if rc != 0:
+        p = self._call(["list"])
+        if p is None or p.returncode != 0:
             return None
         labels = set()
-        for line in out.splitlines()[1:]:
+        for line in (p.stdout or "").splitlines()[1:]:
             parts = line.split()
             if len(parts) >= 3:
                 labels.add(parts[-1])
