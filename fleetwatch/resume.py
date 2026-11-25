@@ -449,25 +449,46 @@ def window_command(entry):
     return shlex.join([os.environ.get("SHELL") or "/bin/bash", "-ilc", inner])
 
 
-def restore_from_archive(entry, paths):
-    """Copy an archive-only transcript back so Claude Code can find it, with the folder of subagents
-    and tool results beside it. The archive keeps its copy and nothing is ever overwritten."""
-    src = entry["path"]
-    slug = os.path.basename(os.path.dirname(src))
-    folder = os.path.join(paths["projects"], slug)
-    os.makedirs(folder, exist_ok=True)
-    dest = os.path.join(folder, entry["sid"] + ".jsonl")
+def _copy_new(src, dest):
+    """Copy src to dest through a temp file and a hard link: dest is never overwritten and never seen
+    half-written. Returns False, copying nothing, when dest already exists."""
     temp = "%s.fleetwatch-restore-%d" % (dest, os.getpid())
     shutil.copy2(src, temp)
     try:
         os.link(temp, dest)
+        return True
     except FileExistsError:
-        pass
+        return False
     finally:
         os.unlink(temp)
+
+
+def copy_back(src, sid, paths):
+    """Copy an archived transcript into the projects folder so Claude Code can find it, with the files of
+    its folder of subagents and tool results. Returns (dest, copied); copied is False when the projects
+    folder already had the transcript, which is left as it is. The archive keeps its copy, no file is
+    ever overwritten, and a side file the projects folder already has is left alone. `fleetwatch resume`
+    and `fleetwatch restore` both copy through here."""
+    slug = os.path.basename(os.path.dirname(src))
+    folder = os.path.join(paths["projects"], slug)
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, sid + ".jsonl")
+    copied = _copy_new(src, dest)
     side_src, side_dest = src[:-len(".jsonl")], dest[:-len(".jsonl")]
-    if os.path.isdir(side_src) and not os.path.exists(side_dest):
-        shutil.copytree(side_src, side_dest)
+    if os.path.isdir(side_src) and not os.path.islink(side_src):
+        for top, _dirs, files in os.walk(side_src):
+            here = os.path.join(side_dest, os.path.relpath(top, side_src))
+            os.makedirs(here, exist_ok=True)
+            for name in files:
+                s, d = os.path.join(top, name), os.path.join(here, name)
+                if os.path.isfile(s) and not os.path.islink(s) and not os.path.lexists(d):
+                    _copy_new(s, d)
+    return dest, copied
+
+
+def restore_from_archive(entry, paths):
+    """The entry with its archive-only transcript copied back (see copy_back)."""
+    dest, _copied = copy_back(entry["path"], entry["sid"], paths)
     return dict(entry, path=dest, archived=False)
 
 

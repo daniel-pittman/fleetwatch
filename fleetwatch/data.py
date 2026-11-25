@@ -11,7 +11,7 @@ import sys
 import time
 from datetime import date as date_cls, datetime, time as time_cls
 
-from .settings import LOCAL_TZ
+from .settings import LOCAL_TZ, archive_root
 
 WIDTH = 100
 DEFAULT_INTERVAL_S = 5.0
@@ -32,8 +32,7 @@ def default_paths():
         "status": os.environ.get("FLEETWATCH_STATUS_DIR", os.path.join(HOME, ".claude/state/fleetwatch")),
         "ps": os.environ.get("FLEETWATCH_PS_CMD", "ps -axo pid=,ppid="),
         "projects": os.environ.get("FLEETWATCH_PROJECTS_DIR", os.path.join(HOME, ".claude/projects")),
-        "archive": os.environ.get("FLEETWATCH_ARCHIVE_DIR", os.path.join(
-            HOME, ".local/share/claude-session-archive/archive/projects")),
+        "archive": os.environ.get("FLEETWATCH_ARCHIVE_DIR") or os.path.join(archive_root(), "projects"),
     }
 
 

@@ -301,9 +301,31 @@ fleetwatch unpark grant                                             # or `fleetw
 
 **A persona's loop does not come back.** Scheduled loops are session-only crons, so they do not survive a session ending. A resumed persona returns without its cron and you start its loop again. fleetwatch says so when it resumes a session whose status file names a persona.
 
-**Where it looks.** Transcripts are `~/.claude/projects/<slug>/<sessionId>.jsonl` (`FLEETWATCH_PROJECTS_DIR`, `--projects-dir`). The folder is the transcript's first `cwd`, the launch folder, since later records follow the session around. The name is its last `custom-title` record, since sessions get renamed. A transcript that Claude Code's retention sweep removed but `~/.local/share/claude-session-archive/archive/projects` still holds (`FLEETWATCH_ARCHIVE_DIR`, `--archive-dir`) shows as `archived`; resuming copies it back, with its folder of subagents and tool results, and the archive keeps its copy.
+**Where it looks.** Transcripts are `~/.claude/projects/<slug>/<sessionId>.jsonl` (`FLEETWATCH_PROJECTS_DIR`, `--projects-dir`). The folder is the transcript's first `cwd`, the launch folder, since later records follow the session around. The name is its last `custom-title` record, since sessions get renamed. A transcript that Claude Code's retention sweep removed but the archive's `projects` folder still holds (see [Archive and restore](#archive-and-restore); `FLEETWATCH_ARCHIVE_DIR`, `--archive-dir`) shows as `archived`; resuming copies it back, with its folder of subagents and tool results, and the archive keeps its copy.
 
 **Speed.** The scan runs on a worker thread that starts after the first snapshot and again every 60 seconds, so it never holds up startup or a refresh. Its cache, `~/.config/fleetwatch/resume-cache.json`, is keyed by file size and mtime: an unchanged transcript costs one stat, a grown one is read only from where it ended, and a helper is never read past its first records. Delete the cache at any time; the next scan rebuilds it. `FLEETWATCH_CLAUDE_CMD` and `FLEETWATCH_SELF_CMD` replace the `claude` and `fleetwatch` commands (used by the tests).
+
+### Archive and restore
+
+Claude Code's retention sweep deletes old transcripts. `fleetwatch archive run` copies them somewhere the sweep does not reach, and `fleetwatch archive install` runs it every hour.
+
+```
+fleetwatch archive install        # install and load the hourly job (local.fleetwatch.archive)
+fleetwatch archive run            # copy new and changed transcripts now
+fleetwatch archive status         # the last run, its age, and live transcripts with no archive copy
+fleetwatch archive status --json
+fleetwatch archive uninstall      # stop archiving; the archive keeps every copy
+fleetwatch restore --list         # sessions only the archive has, and any that cannot be restored
+fleetwatch restore NAME           # copy one back, by name, session ID prefix or project folder name
+```
+
+**What a run copies.** Each project folder's main transcripts (`<slug>/*.jsonl`), every file in a session's own folder beside it (`subagents/`, `tool-results/`), and `~/.claude/history.jsonl`. It never deletes from the archive, so a transcript the sweep removed stays there, and it never replaces an archive copy with an older or smaller file. It uses rsync when there is one (`-a --update`, with no delete option) and a built-in copy otherwise (`--python` forces it). One run at a time holds a lock in fleetwatch's state folder; each run records itself in `~/.local/state/fleetwatch/archive/last_run.json` and adds a line to `archive.log` beside it.
+
+**Where the archive is.** `CLAUDE_SESSION_ARCHIVE_DEST`, else `[archive] dest` in `settings.toml`, else `~/.local/share/claude-session-archive/archive`. It holds `projects/` and `history.jsonl`. An archive already in that folder is used as it is.
+
+**Replacing an older archiver.** If a LaunchAgent named `local.claude-session-archive` is installed, `archive install` loads the new job first, then unloads the old agent and moves its plist into `~/.local/state/fleetwatch/legacy/`, keeping it. If the new job cannot be loaded, the old agent is left running.
+
+**Restore** copies a transcript back without starting it, named or not, with its folder of side files, and prints the line that resumes it. The match is an exact name, then a session ID prefix, then part of a name, then part of the project folder's name; more than one match lists them and copies nothing. Nothing in the projects folder is ever overwritten, and the archive keeps its copy. A session folder whose side files survive with no main transcript in either place is reported as unrecoverable: the main transcript was deleted before it was archived.
 
 ### Prune
 
@@ -704,7 +726,9 @@ owner_name = "Your Name"      # optional
 
 The search indexer reads more keys from the same file (`[paths]`, `[transcripts]`, `[groups]`, `[scanner]`, `[docs]`, `[tagger]`, `[routing]`); they are documented at the top of `fleetwatch/settings.py`. The indexer reads the file strictly: an invalid value stops a refresh before any index is touched.
 
-**Other environment variables.** `FLEETWATCH_GH_CMD` replaces the `gh` command that watches run (it is split like a shell command line), and the scheduled watch job carries it along with `GH_CONFIG_DIR`. `FLEETWATCH_LAUNCH_AGENTS_DIR` and `FLEETWATCH_SYSTEMD_USER_DIR` move where `schedule install` writes its launchd and systemd files, which is useful for trying an install without touching your own. A scheduled job carries the folder overrides that are set when you install it (`FLEETWATCH_CONFIG_DIR`, `FLEETWATCH_STATUS_DIR`, `FLEETWATCH_SESSIONS_DIR`, `FLEETWATCH_PROJECTS_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`), so install it from the shell whose settings you want it to use.
+`[archive] dest` sets where `fleetwatch archive run` keeps its copies (see [Archive and restore](#archive-and-restore)).
+
+**Other environment variables.** `FLEETWATCH_GH_CMD` replaces the `gh` command that watches run (it is split like a shell command line), and the scheduled watch job carries it along with `GH_CONFIG_DIR`. `FLEETWATCH_LAUNCH_AGENTS_DIR` and `FLEETWATCH_SYSTEMD_USER_DIR` move where `schedule install` writes its launchd and systemd files, which is useful for trying an install without touching your own. `FLEETWATCH_LAUNCHCTL` replaces the `launchctl` that `archive install` and `uninstall` run, and `FLEETWATCH_RSYNC` the rsync an archive run uses (empty for the built-in copy). A scheduled job carries the folder overrides that are set when you install it (`FLEETWATCH_CONFIG_DIR`, `FLEETWATCH_STATUS_DIR`, `FLEETWATCH_SESSIONS_DIR`, `FLEETWATCH_PROJECTS_DIR`, `XDG_DATA_HOME`, `XDG_STATE_HOME`), so install it from the shell whose settings you want it to use.
 
 ## Upgrading from the earlier name
 
