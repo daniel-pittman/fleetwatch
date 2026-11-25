@@ -20,6 +20,9 @@ def build_parser():
                "  notify              desktop notifications when something new needs you\n"
                "  watch               run | report | ack | schedule: GitHub watches for stopped sessions\n"
                "  iterm               install | status | uninstall the hotkey window\n"
+               "  install [--dry-run] install and start every scheduled job, retiring older ones\n"
+               "  uninstall           stop and remove every scheduled job\n"
+               "  doctor [--fix]      check every job, folder and program fleetwatch relies on\n"
                "  search, index       session memory (need the search and memory extras)")
     p.add_argument("--window", type=data.parse_window, default=data.parse_window("24h"),
                    help="activity window, e.g. 90m, 6h, 3d (default 24h)")
@@ -63,6 +66,9 @@ def main(argv=None):
     if argv[:1] == ["iterm"]:
         from . import overlay
         return overlay.main(argv[1:])
+    if argv[:1] in (["install"], ["uninstall"], ["doctor"]):
+        from . import install_cli
+        return getattr(install_cli, argv[0] + "_main")(argv[1:])
     if argv[:1] == ["write-status"]:
         from . import write_status
         return write_status.main(argv[1:])

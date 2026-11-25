@@ -21,6 +21,10 @@ from .providers import PROVIDERS
 
 NO_SCHEDULE_STALE_S = 2 * 86400
 STALE_FACTOR = 2
+# A failure streak alerts once it reaches this many scheduled runs in a row, or lasts this long, whichever
+# comes first. settings.toml [alerts] index_failure_runs and index_failure_hours replace them.
+STREAK_RUNS = 3
+STREAK_HOURS = 6.0
 
 # The only words a failure or a refusal is ever shown as.
 FAIL_CATEGORIES = (("build", "build"), ("lock", "locked"), ("timed out", "timeout"), ("timeout", "timeout"),
@@ -53,6 +57,21 @@ class Health:
     covered: float = None          # epoch seconds the last completed `refresh --all` run ended, when it finished this index
     exchanges_by_provider: dict = None
     agent_runs: dict = None
+    streak: int = 0                # failed scheduled runs in a row (logs/streaks/NAME), 0 when none
+    streak_since: float = None     # epoch seconds the streak began, None when not recorded
+    streak_limits: tuple = (STREAK_RUNS, STREAK_HOURS)
+
+    def streak_problem(self, now):
+        """The words for a failure streak past its limits, else "". Only a failing index has one: a streak
+        file outlives a manual refresh that worked, because only a scheduled run clears it."""
+        if self.state != "failed" or self.streak < 1:
+            return ""
+        runs, hours = self.streak_limits
+        lasted = None if self.streak_since is None else max(now - self.streak_since, 0)
+        if self.streak < runs and (lasted is None or lasted < hours * 3600):
+            return ""
+        text = "failed %d run%s in a row" % (self.streak, "" if self.streak == 1 else "s")
+        return text + (" over %s" % data.ago(lasted) if lasted else "")
 
     def age(self, now):
         """Seconds since the index was last known current: its own last refresh, or the end of the last
@@ -74,13 +93,19 @@ class Health:
             out.append("protection check refused (%s)" % (self.refusal or REFUSED_SETTINGS))
         if self.is_stale(now) and not self.refresh_state:
             out.append("stale")
+        streak = self.streak_problem(now)
+        if streak:
+            out.append(streak)
         return out
 
     def next_steps(self, now):
         """One plain sentence per problem saying what to do. Commands and setting names only."""
         out = []
+        streak = self.streak_problem(now)
         for problem in self.problems(now):
-            if problem.startswith("last refresh failed"):
+            if problem == streak:
+                out.append("every scheduled refresh has failed for a while; fleetwatch doctor names the last error")
+            elif problem.startswith("last refresh failed"):
                 out.append("details: fleetwatch index status %s, and the failures log (logs/failures.log in the "
                            "index data folder)" % self.name)
             elif problem.startswith("protection"):
@@ -102,8 +127,11 @@ class Health:
         """The command to run for each problem, in the order next_steps explains them. The board shows
         these alone on one line, and y copies the first."""
         out = []
+        streak = self.streak_problem(now)
         for problem in self.problems(now):
-            if problem.startswith("last refresh failed"):
+            if problem == streak:
+                out.append("fleetwatch doctor")
+            elif problem.startswith("last refresh failed"):
                 out.append("fleetwatch index status %s" % self.name)
             elif problem.startswith("protection"):
                 out.append("fleetwatch index verify %s" % self.name)
@@ -225,6 +253,34 @@ def _lock_age(root, name):
 
 
 RUN_MARKER = os.path.join("logs", "refresh_run.json")
+STREAKS = os.path.join("logs", "streaks")
+
+
+def read_streak(root, name):
+    """(runs, since) from the refresh's streak file: "RUNS" or "RUNS SINCE" (epoch seconds the streak began).
+    (0, None) when the index has no streak."""
+    try:
+        parts = Path(root, STREAKS, name).read_text(encoding="utf-8").split()
+        runs = int(parts[0])
+    except (OSError, ValueError, IndexError, UnicodeDecodeError):
+        return 0, None
+    try:
+        since = float(parts[1]) if len(parts) > 1 else None
+    except ValueError:
+        since = None
+    return max(runs, 0), since
+
+
+def streak_limits(raw=None):
+    """(runs, hours) from settings.toml [alerts]; a value that is missing or not a positive number keeps
+    its default, because the board and the notifier must keep running on a bad setting."""
+    from . import settings
+    raw = settings.load() if raw is None else raw
+    t = raw.get("alerts") if isinstance(raw.get("alerts"), dict) else {}
+    runs, hours = t.get("index_failure_runs"), t.get("index_failure_hours")
+    ok_runs = isinstance(runs, int) and not isinstance(runs, bool) and runs >= 1
+    ok_hours = isinstance(hours, (int, float)) and not isinstance(hours, bool) and hours > 0
+    return (runs if ok_runs else STREAK_RUNS, float(hours) if ok_hours else STREAK_HOURS)
 
 
 @dataclass(frozen=True)
@@ -249,7 +305,7 @@ def _run_marker(root, lock_stale_s):
     return Run(started, ended, names, ended is None and time.time() - touched < lock_stale_s)
 
 
-def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False, run=None):
+def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False, run=None, limits=None):
     protection, refusal = _protection(mod, name, entry, cache)
     path = os.path.join(root, name, "state", "last_run.json")
     state, reason, finished, exchanges = "never", "", None, None
@@ -281,10 +337,12 @@ def _row(mod, name, entry, root, scheduled, interval_s, cache, run_active=False,
     if not refresh_state and run_active and state != "never" and current is not None \
             and time.time() - current > stale_after:
         refresh_state = "waiting"
+    streak, since = read_streak(root, name)
     return Health(data.clean(name), data.clean(entry.get("group") or "?"), kind, state, reason, finished,
                   stale_after, protection, refusal, exchanges, files, scheduled,
                   data.clean(str(entry.get("owner_session") or "")), data.clean(str(entry.get("owner_session_id") or "")),
-                  refresh_state, covered, exchanges_by_provider, agent_runs)
+                  refresh_state, covered, exchanges_by_provider, agent_runs, streak, since,
+                  limits or (STREAK_RUNS, STREAK_HOURS))
 
 
 def load(reg=None, root=None, scheduled=None, cache=None):
@@ -319,7 +377,8 @@ def load(reg=None, root=None, scheduled=None, cache=None):
     ages = [_lock_age(str(root), n) for n in names]
     run = _run_marker(str(root), mod.LOCK_STALE_S)
     run_active = any(a is not None and a < mod.LOCK_STALE_S for a in ages) or (run is not None and run.live)
-    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache, run_active, run)
+    limits = streak_limits()
+    rows = [_row(mod, name, entry, str(root), scheduled, max(minutes, 1) * 60, cache, run_active, run, limits)
             for name, entry in sorted((reg.get("indexes") or {}).items())]
     return Result(rows, "" if rows else NO_INDEXES)
 
