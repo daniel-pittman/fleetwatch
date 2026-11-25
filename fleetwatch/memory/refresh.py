@@ -861,7 +861,17 @@ def _run_plain_locked(name, entry, opts, state, lock):
         for cmd in entry["refresh"]:
             lock.touch()
             argv = plain_argv(cmd)
-            r = run_bounded(argv, plain_dir(name))
+            # A command that times out or cannot start is recorded like one that exits nonzero:
+            # doctor, the board and the streak alert read only last_run.json.
+            try:
+                r = run_bounded(argv, plain_dir(name))
+            except (RuntimeError, OSError) as e:
+                (state / "last_error.log").write_text(
+                    "%s\n%s\n%s: %s\n" % (now_iso(), " ".join(argv), type(e).__name__, e))
+                (state / "last_run.json").write_text(json.dumps(dict(
+                    index=name, kind="plain", finished=now_iso(), ok=False, error=str(e)), indent=1))
+                print("[%s] FAILED: %s (detail in %s)" % (name, e, state / "last_error.log"))
+                return False
             if r.returncode != 0:
                 (state / "last_error.log").write_text(
                     "%s\n%s\nexit %d\n%s\n%s" % (now_iso(), " ".join(argv), r.returncode,

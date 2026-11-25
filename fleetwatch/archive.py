@@ -2,7 +2,8 @@
 Claude Code's retention sweep cannot reach.
 
 The sweep deletes transcripts on its own schedule, so the archive never mirrors a deletion: nothing here
-removes a file from the archive, and a file in the archive is never replaced by an older or smaller one.
+removes a file from the archive, and a file in the archive is never replaced by an older or smaller one,
+except a cut-off copy that is the live file's first bytes (see wanted()).
 What is copied: each project folder's top-level `*.jsonl` (the main transcripts), every file under a
 session's own folder beside it (`<sessionId>/subagents/`, `<sessionId>/tool-results/`), and
 `history.jsonl` from the folder above the projects folder. Names with `.tmp.` in them are Claude Code's
@@ -120,17 +121,38 @@ def transcript_files(root):
                             yield os.path.relpath(full, root)
 
 
-def wanted(src_stat, dest_path):
+def is_prefix(short_path, long_path, size):
+    """Whether short_path holds exactly `size` bytes and they are the first `size` bytes of long_path."""
+    try:
+        with open(short_path, "rb") as a, open(long_path, "rb") as b:
+            while size > 0:
+                n = min(size, 1 << 20)
+                chunk = a.read(n)
+                if len(chunk) != n or chunk != b.read(n):
+                    return False
+                size -= n
+            return a.read(1) == b""
+    except OSError:
+        return False
+
+
+def wanted(src_stat, dest_path, src_path=None):
     """True when src should replace or create dest: dest is missing, or src is neither older nor smaller
     than dest and differs from it in size or time. Times compare in whole seconds, because some rsyncs
-    (macOS's openrsync among them) set only whole seconds; finer, every run would copy every file again."""
+    (macOS's openrsync among them) set only whole seconds; finer, every run would copy every file again.
+    One exception to "never older": an interrupted transfer leaves the first part of a transcript with a
+    later time than the live file, and a transcript only grows, so a dest shorter than src that is a
+    strict byte prefix of src_path is replaced whatever the times. A shorter dest that differs is kept."""
     try:
         d = os.stat(dest_path)
     except FileNotFoundError:
         return True
     src_s, dest_s = int(src_stat.st_mtime), int(d.st_mtime)
-    if src_stat.st_size < d.st_size or src_s < dest_s:
+    if src_stat.st_size < d.st_size:
         return False
+    if src_s < dest_s:
+        return (src_path is not None and src_stat.st_size > d.st_size
+                and is_prefix(dest_path, src_path, d.st_size))
     return src_stat.st_size != d.st_size or src_s != dest_s
 
 
@@ -142,9 +164,19 @@ def plan(src_root, dest_root, rels):
             st = os.stat(os.path.join(src_root, rel), follow_symlinks=False)
         except OSError:
             continue
-        if wanted(st, os.path.join(dest_root, rel)):
+        src = os.path.join(src_root, rel)
+        if wanted(st, os.path.join(dest_root, rel), src):
             out.append(rel)
     return out
+
+
+def dest_newer(src_root, dest_root, rel):
+    """Whether the archive copy of rel has a later time than the live file (rsync --update skips it)."""
+    try:
+        return os.stat(os.path.join(dest_root, rel)).st_mtime > os.stat(
+            os.path.join(src_root, rel), follow_symlinks=False).st_mtime
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------- copying
@@ -159,6 +191,35 @@ def rsync_command():
     return [found] if found else None
 
 
+TEMP_PREFIX = ".fleetwatch-archive-"
+LISTING_PREFIX, LISTING_SUFFIX = "fleetwatch-archive-", ".list"
+# tempfile.mkstemp's names: the prefix, then 8 characters from [a-z0-9_].
+_DEAD_TEMP = re.compile(re.escape(TEMP_PREFIX) + r"[a-z0-9_]{8}")
+_DEAD_LISTING = re.compile(re.escape(LISTING_PREFIX) + r"[a-z0-9_]{8}" + re.escape(LISTING_SUFFIX))
+
+
+def remove_dead_temps(tree, folder):
+    """Remove the temp copies and rsync listings a stopped run left (a SIGTERM skips copy_python's
+    cleanup): temp copies anywhere under `tree` (walked without following symlinks) and directly in
+    `folder`, and listings in the state folder. Called only while holding the run lock, so no live run
+    owns one."""
+    def sweep(top, names, pattern):
+        for name in names:
+            path = os.path.join(top, name)
+            if pattern.fullmatch(name) and os.path.isfile(path) and not os.path.islink(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    for top, _dirs, files in os.walk(tree):
+        sweep(top, files, _DEAD_TEMP)
+    for where, pattern in ((folder, _DEAD_TEMP), (str(state_dir()), _DEAD_LISTING)):
+        try:
+            sweep(where, os.listdir(where), pattern)
+        except OSError:
+            pass
+
+
 def copy_python(src_root, dest_root, rels):
     """Copy each relative path through a temp file and a rename, so the archive never holds half a file.
     The check against the archive copy is repeated after the temp file is complete, so a file that
@@ -168,14 +229,14 @@ def copy_python(src_root, dest_root, rels):
         src, dest = os.path.join(src_root, rel), os.path.join(dest_root, rel)
         folder = os.path.dirname(dest)
         os.makedirs(folder, exist_ok=True)
-        fd, temp = tempfile.mkstemp(prefix=".fleetwatch-archive-", dir=folder)
+        fd, temp = tempfile.mkstemp(prefix=TEMP_PREFIX, dir=folder)
         os.close(fd)
         try:
             try:
                 shutil.copy2(src, temp)
             except FileNotFoundError:
                 continue
-            if wanted(os.stat(temp), dest):
+            if wanted(os.stat(temp), dest, temp):
                 os.replace(temp, dest)
                 copied += 1
         finally:
@@ -188,15 +249,17 @@ def copy_rsync(rsync, src_root, dest_root, rels):
     """rsync the listed files. The flags are the old archiver's: -a and no --delete of any kind. It
     drops --partial, which leaves a cut-off transfer in place of the archive's whole copy. --update
     keeps a newer archive copy; the never-smaller rule is plan()'s, and holds because a transcript only
-    grows between plan() and the copy. Returns the count, or raises OSError on a failed rsync."""
+    grows between plan() and the copy. Returns the count of files rsync reports it transferred (an
+    itemized line starting ">f"), or raises OSError on a failed rsync."""
     if not rels:
         return 0
     os.makedirs(dest_root, exist_ok=True)
-    fd, listing = tempfile.mkstemp(prefix="fleetwatch-archive-", suffix=".list", dir=str(state_dir()))
+    fd, listing = tempfile.mkstemp(prefix=LISTING_PREFIX, suffix=LISTING_SUFFIX, dir=str(state_dir()))
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(b"\0".join(os.fsencode(r) for r in rels) + b"\0")
         argv = rsync + ["-a", "--update", "--exclude=*.tmp.*", "--from0", "--files-from=" + listing,
+                        "--out-format=%i %n",
                         src_root.rstrip("/") + "/", dest_root.rstrip("/") + "/"]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True, timeout=RSYNC_TIMEOUT_S)
@@ -207,7 +270,7 @@ def copy_rsync(rsync, src_root, dest_root, rels):
             raise OSError("rsync exited %d: %s" % (proc.returncode, first[0] if first else "no output"))
     finally:
         os.unlink(listing)
-    return len(rels)
+    return sum(1 for line in (proc.stdout or "").splitlines() if line.startswith(">f"))
 
 
 # ---------------------------------------------------------------- counting
@@ -234,13 +297,17 @@ def main_transcripts(root):
 def coverage(paths=None, since=None):
     """How well the archive covers the projects folder. `missing` counts live main transcripts with no
     archive copy; `missing_before` counts those whose last write was before `since` (a run's start),
-    which that run should have copied; `behind` counts archive copies smaller than the live file."""
+    which that run should have copied; `behind` counts archive copies smaller than the live file, and
+    `diverged` those among them that are not the live file's first bytes, which no run replaces."""
     src, dest, _, _ = roots(paths)
     live, kept = main_transcripts(src), main_transcripts(dest)
     missing = [rel for rel in live if rel not in kept]
+    behind = [rel for rel, st in live.items() if rel in kept and kept[rel].st_size < st.st_size]
     return {"live": len(live), "archived": len(kept), "missing": len(missing),
             "missing_before": None if since is None else sum(1 for rel in missing if live[rel].st_mtime < since),
-            "behind": sum(1 for rel, st in live.items() if rel in kept and kept[rel].st_size < st.st_size)}
+            "behind": len(behind),
+            "diverged": sum(1 for rel in behind if not is_prefix(os.path.join(dest, rel), os.path.join(src, rel),
+                                                                 kept[rel].st_size))}
 
 
 # ---------------------------------------------------------------- one run
@@ -311,10 +378,20 @@ def _run_locked(src, dest, hist_src, hist_dest, method, out):
         if not os.path.isdir(src):
             raise OSError("the projects folder %s does not exist" % src)
         os.makedirs(dest, exist_ok=True)
-        copy = (lambda s, d, r: copy_rsync(rsync, s, d, r)) if rsync else copy_python
+        remove_dead_temps(dest, os.path.dirname(hist_dest))
+
+        def copy(s, d, rels):
+            if not rsync:
+                return copy_python(s, d, rels)
+            # rsync --update skips an archive copy newer than the live file, which plan() wants
+            # replaced only when it is a cut-off prefix; the built-in copy re-checks and replaces it.
+            repair = {r for r in rels if dest_newer(s, d, r)}
+            return (copy_rsync(rsync, s, d, [r for r in rels if r not in repair])
+                    + copy_python(s, d, sorted(repair)))
         record["copied"] = copy(src, dest, plan(src, dest, transcript_files(src)))
         hist_dir, hist_name = os.path.split(hist_src)
-        if os.path.isfile(hist_src):
+        # A symlink is skipped, as in transcript_files: the archive keeps self-contained files.
+        if os.path.isfile(hist_src) and not os.path.islink(hist_src):
             record["copied"] += copy(hist_dir, os.path.dirname(hist_dest),
                                      plan(hist_dir, os.path.dirname(hist_dest), [hist_name]))
         record["ok"] = True

@@ -64,7 +64,6 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 | `terminal-notifier` (macOS, `brew install terminal-notifier`) | a click on a notification raising that session's tab | banners still appear through `osascript`; a click does nothing |
 | `notify-send` (Linux) | desktop notifications | notifications print one line instead |
 | `pdftotext`, `pandoc`, `soffice`, `tesseract` | reading PDF, Office and scanned files in reference folders | those files are skipped, listed as "conversion failed" in the run report |
-
 | `rsync` | the transcript archive's copy | the archive copies with Python instead |
 
 ### Background jobs: `fleetwatch install`, then `fleetwatch doctor`
@@ -75,7 +74,7 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
     fleetwatch doctor --fix         # make the safe repairs, report the rest
     fleetwatch uninstall            # stop and remove every job
 
-fleetwatch runs four background jobs, as launchd agents on macOS (in `~/Library/LaunchAgents`) or systemd user units elsewhere, each logging to fleetwatch's state folder:
+fleetwatch runs four background jobs, as launchd agents on macOS (in `~/Library/LaunchAgents`) or systemd user units elsewhere (systemd 240 or later), each logging to fleetwatch's state folder:
 
 | Job | What it does | Runs | Its own command |
 |---|---|---|---|
@@ -342,7 +341,7 @@ fleetwatch restore --list         # sessions only the archive has, and any that 
 fleetwatch restore NAME           # copy one back, by name, session ID prefix or project folder name
 ```
 
-**What a run copies.** Each project folder's main transcripts (`<slug>/*.jsonl`), every file in a session's own folder beside it (`subagents/`, `tool-results/`), and `~/.claude/history.jsonl`. It never deletes from the archive, so a transcript the sweep removed stays there, and it never replaces an archive copy with an older or smaller file. It uses rsync when there is one (`-a --update`, with no delete option) and a built-in copy otherwise (`--python` forces it). One run at a time holds a lock in fleetwatch's state folder; each run records itself in `~/.local/state/fleetwatch/archive/last_run.json` and adds a line to `archive.log` beside it.
+**What a run copies.** Each project folder's main transcripts (`<slug>/*.jsonl`), every file in a session's own folder beside it (`subagents/`, `tool-results/`), and `~/.claude/history.jsonl`. It never deletes from the archive, so a transcript the sweep removed stays there, and it never replaces an archive copy with an older or smaller file, except a cut-off copy (one an interrupted copy left) that is exactly the start of the live file, which it replaces whatever the times. `fleetwatch doctor` warns about a shorter archive copy that differs from the live file's start. It uses rsync when there is one (`-a --update`, with no delete option) and a built-in copy otherwise (`--python` forces it). One run at a time holds a lock in fleetwatch's state folder; each run records itself in `~/.local/state/fleetwatch/archive/last_run.json` and adds a line to `archive.log` beside it.
 
 **Where the archive is.** `CLAUDE_SESSION_ARCHIVE_DEST`, else `[archive] dest` in `settings.toml`, else `~/.local/share/claude-session-archive/archive`. It holds `projects/` and `history.jsonl`. An archive already in that folder is used as it is.
 

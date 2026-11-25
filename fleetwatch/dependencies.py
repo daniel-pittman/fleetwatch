@@ -269,8 +269,13 @@ class Job:
                 if res.ok:
                     ctx.say("  unloaded %s" % label)
                 else:
-                    ok = False
+                    # A loaded job whose file is gone can no longer be reloaded or inspected from it,
+                    # so its file stays until it unloads.
                     ctx.say("  could not unload %s: %s" % (label, res.detail))
+                    for p in self._files(m):
+                        if p.exists():
+                            ctx.say("  kept %s while %s is loaded" % (_home(p), label))
+                    return False
         elif loaded is None and self.installed(m):
             ctx.say("  %s cannot be asked whether %s is loaded (%s); if it is: %s"
                     % (m.name, label, m.why_not(), _unload_hint(m, label)))
@@ -507,19 +512,28 @@ def archive_checks(ctx):
     res = archive.check(now=ctx.time())
     st = res.get("status") or {}
     problems = list(res.get("problems") or [])
+    cov = st.get("coverage") or {}
+    diverged = cov.get("diverged") or 0
+    # A shorter archive copy that is not the live file's start is never repaired as a cut-off copy, and
+    # may hold lines the live file lacks, so it is reported whatever else the check finds.
+    warn = [Check("session archive", "archive copies", WARN,
+                  "%s shorter than %s live transcript and %s from its start"
+                  % (data.plural(diverged, "archive copy is", "archive copies are"),
+                     "its" if diverged == 1 else "their", "differs" if diverged == 1 else "differ"),
+                  "fleetwatch archive status")] if diverged else []
     if st.get("ended") is None:
         since = _mtime(schedule._plist_path(ARCHIVE) if ctx.manager.darwin else schedule._units(ARCHIVE)[-1])
         if since is not None and ctx.time() - since < STALE_FACTOR * ARCHIVE.interval_s:
             return [Check("session archive", "last run", OK, "no run yet; installed %s ago, runs every %s"
-                          % (data.ago(ctx.time() - since), data.ago(ARCHIVE.interval_s)))]
+                          % (data.ago(ctx.time() - since), data.ago(ARCHIVE.interval_s)))] + warn
     if problems:
         return [Check("session archive", "archive check", FAIL, _first_line(p), "fleetwatch archive status")
-                for p in problems]
-    cov = st.get("coverage") or {}
+                for p in problems] + warn
     waiting = cov.get("missing") or 0
-    return [Check("session archive", "archive check", OK, "last run %s ago; every transcript older than it is "
+    rows = [Check("session archive", "archive check", OK, "last run %s ago; every transcript older than it is "
                   "archived%s" % (data.ago(st.get("age_s") or 0),
-                                  "; %d newer waiting for the next run" % waiting if waiting else ""))]
+                                  "; %d newer waiting for the next run" % waiting if waiting else ""))] + warn
+    return rows
 
 
 def _index_error_line(root, name):
@@ -593,7 +607,8 @@ def markdown():
               "- **The archive:** `fleetwatch.archive.check()`: the last archive run (from `archive/last_run.json` "
               "in the state folder) never happened, failed or is older than twice its interval, or a live "
               "transcript last written before the last run started has no archive copy. A job installed less "
-              "than two intervals ago that has not run yet is fine.",
+              "than two intervals ago that has not run yet is fine. An archive copy shorter than its live "
+              "transcript that differs from the live file's start is a warning.",
               "- **Indexes:** an index whose scheduled refresh has failed %d runs in a row, or for %d hours, is "
               "named with its last error's first line. `[alerts] index_failure_runs` and `index_failure_hours` in "
               "settings.toml change the limits. The same streak shows on the board's Needs you tab and is sent "

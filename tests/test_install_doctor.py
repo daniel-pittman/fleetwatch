@@ -6,6 +6,7 @@ import io
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,7 @@ class Home:
         plat = mock.patch.object(sys, "platform", "darwin")
         plat.start()
         test.addCleanup(plat.stop)
-        os.environ["FLEETWATCH_LAUNCHCTL"] = "%s %s" % (sys.executable, REPO / "tests" / "fake_launchd.py")
+        os.environ["FLEETWATCH_LAUNCHCTL"] = shlex.join([sys.executable, str(REPO / "tests" / "fake_launchd.py")])
         os.environ["FAKE_LAUNCHCTL_STATE"] = str(self.state_file)
         os.environ["FAKE_LAUNCHCTL_LOG"] = str(self.log)
         self.write_launchd({})
@@ -275,6 +276,20 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out.count("not installed"), len(OURS))
 
+    def test_a_job_that_cannot_be_unloaded_keeps_its_plist_and_fails(self):
+        run(install_cli.install_main, self.h)
+        st = self.h.launchd()
+        st["fail"] = ["local.fleetwatch.index-refresh", "local.fleetwatch.notify"]
+        self.h.state_file.write_text(json.dumps(st))
+        code, out = run(install_cli.uninstall_main, self.h)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(sorted(p.name for p in self.h.agents.iterdir()),
+                         ["local.fleetwatch.index-refresh.plist", "local.fleetwatch.notify.plist"])
+        self.assertEqual(sorted(self.h.launchd()["loaded"]),
+                         ["local.fleetwatch.index-refresh", "local.fleetwatch.notify"])
+        self.assertIn("could not unload local.fleetwatch.index-refresh", out)
+        self.assertIn("kept %s" % deps._home(self.h.agents / "local.fleetwatch.index-refresh.plist"), out)
+
     def test_uninstall_dry_run_changes_nothing(self):
         run(install_cli.install_main, self.h)
         n, before = len(self.h.calls()), sorted(p.name for p in self.h.agents.iterdir())
@@ -320,6 +335,12 @@ class Install(unittest.TestCase):
             self.assertEqual(install_cli.uninstall_main([], io.StringIO(), m2), 0)
             self.assertIn(["disable", "--now", "fleetwatch-index-refresh.timer"], calls)
             self.assertFalse((units / "fleetwatch-index-refresh.timer").exists())
+
+    def test_the_fake_launchctl_command_survives_paths_with_spaces(self):
+        with mock.patch.object(sys, "executable", "/opt/my python/bin/python3"):
+            Home(self)
+        self.assertEqual(shlex.split(os.environ["FLEETWATCH_LAUNCHCTL"]),
+                         ["/opt/my python/bin/python3", str(REPO / "tests" / "fake_launchd.py")])
 
     def test_the_command_line_reaches_install_uninstall_and_doctor(self):
         from fleetwatch import __main__ as cli
@@ -417,6 +438,43 @@ class Doctor(unittest.TestCase):
             os.utime(p, (old, old))
         self.assertEqual(self.rows()[1][("index refresh", "last run")]["status"], "fail")
 
+    def test_on_linux_a_job_that_ran_is_seen_through_the_log_its_unit_names(self):
+        # systemd writes a run's output where the unit's StandardOutput= and StandardError= say; doctor
+        # reads <state>/<name>.log and .err, so a healthy Linux machine passes only if the two agree.
+        runner = lambda argv, **_kw: subprocess.CompletedProcess(argv, 0, "", "")
+        m = services.Manager("linux", runner, {"FLEETWATCH_SYSTEMCTL": "systemctl --user"})
+        with mock.patch.object(sys, "platform", "linux"):
+            self.assertEqual(install_cli.install_main([], io.StringIO(), m), 0)
+            units = self.h.root / "systemd"
+            old = time.time() - 3 * 3600
+            for p in units.iterdir():
+                os.utime(p, (old, old))
+            for unit, stream in (("fleetwatch-index-refresh", "StandardOutput"),
+                                 ("fleetwatch-watch-run", "StandardError")):
+                lines = (units / (unit + ".service")).read_text().splitlines()
+                target = {k: v for k, _, v in (ln.partition("=") for ln in lines)}.get(stream, "")
+                self.assertTrue(target.startswith("append:"), (unit, stream, lines))
+                with open(target[len("append:"):], "a") as f:      # what systemd does on a run
+                    f.write("=== run started\n")
+            self.h.transcript("-work-a/%s.jsonl" % sid(1), archived=True, age=7200)
+            self.h.archive_run()
+            out = io.StringIO()
+            install_cli.doctor_main(["--json"], out, m)
+        rows = {(c["item"], c["check"]): c for c in json.loads(out.getvalue())["checks"]}
+        for name in ("index refresh", "watch run"):
+            self.assertEqual(rows[(name, "last run")]["status"], "ok", rows[(name, "last run")])
+
+    def test_linux_units_append_to_the_state_folder_logs(self):
+        with mock.patch.object(sys, "platform", "linux"), mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(
+                self.h.root / "state 100%")}):
+            schedule.install(io.StringIO(), schedule.INDEX)
+            service = (self.h.root / "systemd" / "fleetwatch-index-refresh.service").read_text()
+            log_dir = Path(schedule.settings.state_dir())
+        self.assertTrue(log_dir.is_dir())
+        self.assertIn("StandardOutput=append:%s\n" % str(log_dir / "index-refresh.log").replace("%", "%%"), service)
+        self.assertIn("StandardError=append:%s\n" % str(log_dir / "index-refresh.err").replace("%", "%%"), service)
+        self.assertLess(service.index("StandardOutput="), service.index("ExecStart="))
+
     def test_an_older_job_still_loaded_or_installed(self):
         self.healthy()
         self.h.legacy(LEGACY_INDEX)
@@ -459,6 +517,22 @@ class Doctor(unittest.TestCase):
         bad = self.failing()[1]
         self.assertEqual(bad[("session archive", "archive check")]["detail"],
                          "1 live transcript with no archive copy")
+
+    def test_a_shorter_archive_copy_that_differs_is_a_warning(self):
+        self.healthy()
+        grown = self.h.transcript("-work-c/%s.jsonl" % sid(4), archived=True, age=7200)
+        grown.write_text(grown.read_text() + '{"type":"assistant"}\n')        # behind, a prefix: the next run copies it
+        code, rows = self.rows()
+        self.assertEqual(code, 0)
+        self.assertEqual(rows[("session archive", "archive check")]["status"], "ok")
+        self.assertNotIn(("session archive", "archive copies"), rows)
+        cut = self.h.archive / "projects" / "-work-a" / ("%s.jsonl" % sid(1))
+        cut.write_text("{}\n")                                               # shorter, and not the live file's start
+        code, rows = self.rows()
+        self.assertEqual(code, 0)
+        row = rows[("session archive", "archive copies")]
+        self.assertEqual(row["status"], "warn")
+        self.assertIn("1 archive copy is shorter than its live transcript and differs from its start", row["detail"])
 
     def test_the_archive_job_running_late(self):
         self.healthy()
