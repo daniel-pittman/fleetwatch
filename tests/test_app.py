@@ -15,6 +15,7 @@ atexit.register(_CONFIG.cleanup)
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import rowkeys  # noqa: E402
 import standin  # noqa: E402
 from waiting import settle  # noqa: E402
 from fleetwatch import app as fapp, config, data, iterm, prune  # noqa: E402
@@ -295,8 +296,8 @@ class AppTests(unittest.TestCase):
             async with app.run_test(size=(100, 30)) as pilot:
                 await boot(app, pilot)
                 keys = app.lists[0]._order
-                self.assertEqual(keys[0], "needs:Stuck Session")
-                self.assertEqual(app.lists[0].cursor, "needs:Stuck Session")
+                self.assertEqual(keys[0], rowkeys.needs("s1"))
+                self.assertEqual(app.lists[0].cursor, rowkeys.needs("s1"))
                 self.assertIn("stuck on a prompt 6m", app.lists[0].visible_text())
         run(go())
 
@@ -369,7 +370,7 @@ class AppTests(unittest.TestCase):
                 for head in ("▾ Working · 2", "▾ Gone quiet · 1", "▾ Idle · 2", "▸ Stale · 1"):
                     self.assertIn(head, text)
                 self.assertIn("1 helper", text)
-                lst.move_to("ses:Stuck Session")
+                lst.move_to(rowkeys.ses("s1"))
                 await pilot.press("space")
                 self.assertIn("↳ wt-helper-1", lst.visible_text())
         run(go())
@@ -396,7 +397,7 @@ class AppTests(unittest.TestCase):
                 await boot(app, pilot)
                 lst = app.lists[0]
                 await pilot.press("down")
-                self.assertEqual(lst.cursor, "needs:Asker Development")
+                self.assertEqual(lst.cursor, rowkeys.needs("s2"))
                 await pilot.press("space")
                 await pilot.press("2")
                 await pilot.press("down", "down")
@@ -408,10 +409,10 @@ class AppTests(unittest.TestCase):
                 self.w.drop(sid="n1", fname="n.json")
                 await refresh(app, pilot)
                 self.assertEqual(app.active, 0)
-                self.assertEqual(lst.cursor, "needs:Asker Development")
+                self.assertEqual(lst.cursor, rowkeys.needs("s2"))
                 self.assertIn("1. Approve the schema change?", lst.visible_text())
-                self.assertIn("needs:Another", lst._order)
-                self.assertNotIn("needs:Newcomer", lst._order)
+                self.assertIn(rowkeys.needs("n2"), lst._order)
+                self.assertNotIn(rowkeys.needs("n1"), lst._order)
                 self.assertEqual(app.lists[1].cursor, cursor2)
         run(go())
 
@@ -429,7 +430,7 @@ class AppTests(unittest.TestCase):
                 await pilot.press("s")      # most questions: Alpha and Beta tie on one question each
                 self.assertEqual(app.sorts[0], "count")
                 before = list(app.lists[0]._order)
-                self.assertLess(before.index("needs:Alpha"), before.index("needs:Beta"))
+                self.assertLess(before.index(rowkeys.needs("al")), before.index(rowkeys.needs("be")))
                 self.w.status("a1.json", session="Alpha", updated=standin.iso(-5), questions=["q?"])
                 self.w.reg("Alpha", "al", status="idle", age=5)
                 await refresh(app, pilot)
@@ -443,11 +444,11 @@ class AppTests(unittest.TestCase):
                 await boot(app, pilot)
                 lst = app.lists[0]
                 await pilot.press("down")
-                self.assertEqual(lst.cursor, "needs:Asker Development")
+                self.assertEqual(lst.cursor, rowkeys.needs("s2"))
                 self.w.drop(fname="asker.json")
                 await refresh(app, pilot)
-                self.assertEqual(lst.cursor, "needs:Quiet One")
-                self.assertNotIn("needs:Asker Development", lst._order)
+                self.assertEqual(lst.cursor, rowkeys.needs("s4"))
+                self.assertNotIn(rowkeys.needs("s2"), lst._order)
         run(go())
 
     def test_scroll_offset_and_screen_position_survive_a_refresh(self):

@@ -1,7 +1,6 @@
 """fleetwatch live view: a Textual app with tabs along the bottom and folding sections."""
 import asyncio
 import os
-import signal
 import sys
 import textwrap
 import time
@@ -19,7 +18,7 @@ from textual.strip import Strip
 from textual.widgets import ContentSwitcher, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import config, data, find, holds, index_health, iterm, park, prune, radar, resume, views, watches
+from . import config, data, find, hangup, holds, index_health, iterm, park, prune, radar, resume, views, watches
 
 STATUS_SECONDS = 10.0
 RESCAN_SECONDS = 60.0
@@ -175,14 +174,24 @@ class Snapshot:
         self.view = data.build_view(self.sections, now, self.horizon, stale, holds)
         self.counts = views.tab_counts(self.view, stale)
         self.warnings = self.base_warnings + self.view["up_warnings"]
-        self.records, self.helpers = {}, {}
+        # By name for what only has a name (Ctrl-K's list, the session picker, a record with no ID);
+        # by session ID for a board row, since two sessions can share a name.
+        self.records, self.helpers, self.by_sid, self.helpers_by_sid = {}, {}, {}, {}
         self.gone = {x["name"]: x["r"] for x in self.view["for_you"] if x.get("gone")}
+        self.gone_by_sid = {x["r"]["sessionId"]: x["r"] for x in self.view["for_you"]
+                            if x.get("gone") and x["r"].get("sessionId")}
         for x in self.view["rows"]:
             self.records.setdefault(x["name"], x["r"])
+            if x["r"].get("sessionId"):
+                self.by_sid[x["r"]["sessionId"]] = x["r"]
             for c in x["r"]["children"]:
                 self.helpers.setdefault(data.clean(c["name"]), c)
+                if c.get("sessionId"):
+                    self.helpers_by_sid[c["sessionId"]] = c
         for r in list(self.view["orphans"]) + list(stale):
             self.helpers.setdefault(data.clean(r["name"]), r)
+            if r.get("sessionId"):
+                self.helpers_by_sid.setdefault(r["sessionId"], r)
         self.grouping = views.Grouping(
             {x["name"]: self.groups.of(x["name"], x["r"]["cwd"], x["r"]["sessionId"]) for x in self.view["rows"]},
             self.groups.names(), fallback=lambda name: self.groups.of(
@@ -211,16 +220,25 @@ class Snapshot:
         """(tty, None) for a running session on the Resume tab, by ID since names can repeat."""
         return self._tty(self.held.get(sid), name)
 
-    def target(self, session, helper=None):
+    def record_for(self, sid, name):
+        """The record of a row's own session: by its session ID when the row has one, never then by
+        name, which another session can share; by name only for a row with no ID."""
+        if sid:
+            return self.by_sid.get(sid) or self.gone_by_sid.get(sid)
+        return self.records.get(name) or self.gone.get(name)
+
+    def target(self, session, helper=None, sid=None, helper_sid=None):
         """(tty, None, name raised) or (None, reason, None). A helper's own tab comes first,
-        then its parent session's."""
+        then its parent session's. A row passes the session IDs it carries, and those decide."""
         if helper:
-            tty, reason = self._tty(self.helpers.get(helper), helper)
+            rec = self.helpers_by_sid.get(helper_sid) if helper_sid else self.helpers.get(helper)
+            tty, reason = self._tty(rec, helper)
             if tty is not None:
                 return tty, None, helper
             if not session:
                 return None, reason, None
-        tty, reason = self._tty(self.records.get(session), session)
+        rec = self.by_sid.get(sid) if sid else self.records.get(session)
+        tty, reason = self._tty(rec, session)
         return (tty, None, session) if tty is not None else (None, reason, None)
 
 
@@ -791,7 +809,7 @@ class FindScreen(ModalScreen):
         return self.shown[i] if self.shown and i is not None and i < len(self.shown) else None
 
     def submit(self, entry):
-        self.app.find_jump(entry["name"])
+        self.app.find_jump(entry["name"], entry.get("sid"))
 
     def action_step(self, d):
         lst = self.query_one("#results", OptionList)
@@ -1171,12 +1189,7 @@ class FleetwatchApp(App):
         self.update_sortlines()
         self.query_one(TabBar).update_tabs(self.tab_counts(), 0)
         self.lists[0].focus()
-        try:
-            loop = asyncio.get_running_loop()
-            for sig in (signal.SIGTERM, signal.SIGHUP):
-                loop.add_signal_handler(sig, self.exit)
-        except (NotImplementedError, RuntimeError, ValueError):  # pragma: no cover
-            pass
+        self.event_loop = asyncio.get_running_loop()
         if self._state_warning:
             self.say(self._state_warning)
         self.refresh_now()
@@ -1487,7 +1500,7 @@ class FleetwatchApp(App):
         # carries the folder and session id when its status file names them, so
         # the move updates the same pins a live move wrote. With neither, the
         # session is pinned by name alone and its paths give no group (Other).
-        rec = snap.records.get(name) or snap.gone.get(name) or {}
+        rec = snap.record_for(node.sid, name) or {}
 
         def chosen(group):
             if group is None:
@@ -1509,7 +1522,7 @@ class FleetwatchApp(App):
         out = []
         for x in snap.view["rows"]:
             name = x["name"]
-            tty, reason, _ = snap.target(name)
+            tty, reason, _ = snap.target(name, sid=x["r"].get("sessionId"))
             if tty is None:
                 status = "not in iTerm"
             elif x["qs"]:
@@ -1521,7 +1534,7 @@ class FleetwatchApp(App):
             else:
                 status = "idle"
             out.append({"name": name, "persona": x["persona"], "group": snap.grouping.of(name),
-                        "status": status, "updated": x["updated"]})
+                        "status": status, "updated": x["updated"], "sid": x["r"].get("sessionId")})
         return out
 
     def action_find_sessions(self):
@@ -1603,8 +1616,8 @@ class FleetwatchApp(App):
                         "status": status})
         return out
 
-    def find_jump(self, name):
-        tty, reason, shown = self.snapshot.target(name)
+    def find_jump(self, name, sid=None):
+        tty, reason, shown = self.snapshot.target(name, sid=sid)
         if tty is None:
             self.say(reason)
             return
@@ -1619,9 +1632,11 @@ class FleetwatchApp(App):
         if node is not None and node.resume:
             self._jump_held(node.resume)
             return
-        if (node is not None and self.snapshot is not None and node.session in self.snapshot.gone
-                and node.helper is None and len(node.sessions) <= 1):
-            self.offer_reopen(node.session)
+        # A Needs-you row knows whether its own session has ended; an item row has only a name.
+        ended = node is not None and self.snapshot is not None and (
+            node.ended or (node.sid is None and node.session in self.snapshot.gone))
+        if ended and node.helper is None and len(node.sessions) <= 1:
+            self.offer_reopen(node.session, node.sid or self.snapshot.gone.get(node.session, {}).get("sessionId"))
             return
         if node is None or (node.session is None and node.helper is None):
             self.say("no session is highlighted")
@@ -1631,23 +1646,22 @@ class FleetwatchApp(App):
         if len(node.sessions) > 1:
             self.push_screen(SessionPicker(node.sessions), self._picked)
             return
-        tty, reason, name = self.snapshot.target(node.session, node.helper)
+        tty, reason, name = self.snapshot.target(node.session, node.helper, node.sid, node.helper_sid)
         if tty is None:
             self.say(reason)
             return
         self.run_worker(lambda: self._do_jump(name, tty), thread=True, group="jump")
 
-    def offer_reopen(self, name):
-        """Enter on a session that has ended: confirm, then open it as `o` does on the Resume tab."""
-        rec = self.snapshot.gone[name]
+    def offer_reopen(self, name, sid):
+        """Enter on a session that has ended: confirm, then open it as `o` does on the Resume tab.
+        `sid` is the row's own session ID, None when its status file named none."""
         if self.resume_data is None:
             self.say("fleetwatch is still reading the Resume list; try again in a moment")
             return
         held = self.snapshot.held if self.snapshot else {}
         entries = resume.mark_held(self.resume_data.entries(), held)
-        sid = rec.get("sessionId")
         entry = next((e for e in entries if sid and e["sid"] == sid), None)
-        if entry is None:
+        if entry is None and sid is None:
             entry = next((e for e in entries if e["name"].casefold() == name.casefold()), None)
         if entry is None:
             self.say("%s has no custom name, so fleetwatch can't reopen it; prune it with P if it's finished" % name)
@@ -1844,9 +1858,11 @@ class FleetwatchApp(App):
         if node.resume:
             e = self.resume_rows.get(node.resume)
             return (node.resume, e["name"]) if e else (None, None)
-        if node.session and self.snapshot is not None:
+        if node.sid:
             # A session that is not running has no live row; its status file may still name its id.
-            rec = self.snapshot.records.get(node.session) or self.snapshot.gone.get(node.session)
+            return node.sid, node.session
+        if node.session and self.snapshot is not None:
+            rec = self.snapshot.record_for(None, node.session)
             if rec is not None and rec.get("sessionId"):
                 return rec["sessionId"], node.session
         return None, None
@@ -1990,7 +2006,20 @@ class FleetwatchApp(App):
         self.exit()
 
 
+def request_exit(app):
+    """App.exit, scheduled on the app's loop from any thread without waiting for it."""
+    loop = getattr(app, "event_loop", None)
+    if loop is not None:
+        loop.call_soon_threadsafe(app.exit)
+
+
 def run(paths, window_s, horizon, interval):
-    """Run the app. Returns the entry to resume in this terminal, once the terminal is restored."""
+    """Run the app. Returns the entry to resume in this terminal, once the terminal is restored.
+    SIGTERM, SIGHUP and a terminal that goes away end it (fleetwatch.hangup)."""
     app = FleetwatchApp(lambda: gather(paths, window_s, horizon), interval, paths=paths)
-    return app.run()
+    guard = hangup.Guard(lambda: request_exit(app), sys.__stdout__.fileno())
+    guard.install()
+    try:
+        return app.run()
+    finally:
+        guard.stop()

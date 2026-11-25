@@ -312,6 +312,16 @@ def _file_only(r):
     return r
 
 
+def ident(r):
+    """A record's stable identity: ("s", its session ID), or ("n", its name) when it has no ID.
+
+    build_records keeps one record per session ID and one per name among those without an ID, so no two
+    records share an identity. Board row keys are built from it, never from a display name."""
+    if r.get("ident"):
+        return r["ident"]
+    return ("s", r["sessionId"]) if r.get("sessionId") else ("n", r["name"])
+
+
 def build_records(paths, now, warnings, ppids=None, failed=None):
     """failed, when given, collects the sources that could not be read ("agents")."""
     agents = read_agents(paths["command"], warnings)
@@ -540,10 +550,13 @@ def make_row(r, now):
         ((c, now - (c["state_since"] or now)) for c in live_kids if c["state"] in NEEDS_STATES),
         key=lambda t: -t[1])
     qs = [(t, s, None) for t, s in items_of(sf.get("questions"))]
+    q_helpers = [None] * len(qs)
     for c in r["children"]:
         csf = c["status"] or {}
         tag = clean(c["name"])
-        qs += [(t, s, tag) for t, s in items_of(csf.get("questions"))]
+        asked = [(t, s, tag) for t, s in items_of(csf.get("questions"))]
+        qs += asked
+        q_helpers += [c] * len(asked)
     busy_kids = [c for c in live_kids if c["state"] in WORKING_STATES]
     cad, upd = sf.get("cadence_min"), to_epoch(sf.get("updated"))
     quiet = None
@@ -553,6 +566,7 @@ def make_row(r, now):
     return {
         "r": r, "name": clean(r["name"]), "persona": clean(sf["persona"]) if sf.get("persona") else None,
         "stuck": stuck, "helper_stuck": helper_stuck, "qs": qs,
+        "q_helpers": q_helpers,    # per question: the helper record that asked it, None for the session's own
         "working": bool((r["live"] and r["state"] in WORKING_STATES) or busy_kids),
         "busy_helpers": len(busy_kids), "quiet": quiet,
         "updated": upd if upd is not None else r["last"],
@@ -638,9 +652,9 @@ def gone_row(r, name, now):
     sid = r.get("sessionId") or (sf.get("sessionId") if isinstance(sf.get("sessionId"), str) else None)
     return {
         "r": {"name": r["name"], "status": None, "children": [], "live": False, "state": "gone",
-              "cwd": r.get("cwd"), "sessionId": sid, "last": r.get("last")},
+              "cwd": r.get("cwd"), "sessionId": sid, "last": r.get("last"), "ident": ident(r)},
         "name": name, "persona": clean(sf["persona"]) if sf.get("persona") else None,
-        "stuck": None, "helper_stuck": [], "qs": [], "working": False, "busy_helpers": 0,
+        "stuck": None, "helper_stuck": [], "qs": [], "q_helpers": [], "working": False, "busy_helpers": 0,
         "quiet": None, "updated": upd if upd is not None else r.get("last"), "renamed_from": None,
         "working_on": "", "tasks": [], "for_you": False, "gone": True,
     }
@@ -672,7 +686,7 @@ def attach_tasks(timeline, by_name, now):
             if x is not None:
                 x["tasks"].append({"kind": kind, "what": row["what"], "due": row["due"],
                                    "has_time": row["has_time"], "item": row["kind"],
-                                   "keys": list(row.get("keys", ()))})
+                                   "keys": list(row.get("keys", ())), "id": dedup_key(row)})
     order = {k: i for i, k in enumerate(TASK_KINDS)}
     for x in by_name.values():
         x["tasks"].sort(key=lambda t: (order[t["kind"]], t["due"].timestamp() if t["due"] else 0,
