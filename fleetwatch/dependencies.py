@@ -10,21 +10,71 @@ or transcript text: an index's last error is reduced to its first line.
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import data, notify_schedule, schedule, services, settings
 
-# The archive job is defined beside the other jobs in schedule.py, and this is the one place that reads it.
+# ---- the archive's own module (fleetwatch.archive, schedule.ARCHIVE, settings.archive_root). This block
+# is the one place that reads it; each fallback answers the same way until that module is present.
 ARCHIVE = getattr(schedule, "ARCHIVE", None) or schedule.Job(
     "local.fleetwatch.archive", "fleetwatch-archive", ("archive", "run"), 3600,
     "fleetwatch archive run", "fleetwatch archive")
+try:
+    from . import archive as _archive
+except ImportError:
+    _archive = None
+MAIN_TRANSCRIPT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl")
+
+
+def archive_root():
+    """The transcript archive (it holds projects/): CLAUDE_SESSION_ARCHIVE_DEST, else settings.toml
+    [archive] dest, else the folder the earlier archiver used, so an existing archive is adopted in place."""
+    if hasattr(settings, "archive_root"):
+        return Path(settings.archive_root())
+    return Path(os.environ.get("CLAUDE_SESSION_ARCHIVE_DEST")
+                or os.path.join(os.path.expanduser("~"), ".local", "share", "claude-session-archive", "archive"))
+
+
+def archive_state_path():
+    return _archive.state_path() if _archive else Path(settings.state_dir()) / "archive" / "last_run.json"
+
+
+def _main_transcripts(root):
+    """{relative path: mtime} of each <project>/<sessionId>.jsonl under root."""
+    out = {}
+    try:
+        projects = [e for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return out
+    for project in projects:
+        try:
+            for f in os.scandir(project.path):
+                if MAIN_TRANSCRIPT.fullmatch(f.name) and f.is_file(follow_symlinks=False):
+                    out[os.path.join(project.name, f.name)] = f.stat(follow_symlinks=False).st_mtime
+        except OSError:
+            continue
+    return out
+
+
+def archive_coverage(since=None):
+    """(missing, missing_before): live main transcripts with no archive copy, and how many of those were last
+    written before `since` (the last archive run's start), which that run should have copied."""
+    if _archive:
+        cov = _archive.coverage(since=since)
+        return cov["missing"], cov["missing_before"] or 0
+    live = _main_transcripts(projects_dir())
+    kept = _main_transcripts(Path(data.default_paths()["archive"]))
+    missing = [rel for rel in live if rel not in kept]
+    return len(missing), sum(1 for rel in missing if since is not None and live[rel] < since)
+
 
 STALE_FACTOR = 2
-LEGACY_BACKUPS = "legacy-agents"
+LEGACY_BACKUPS = "legacy"
 MAX_ERROR = 160
 OK, WARN, FAIL = "ok", "warn", "fail"
 
@@ -48,7 +98,6 @@ class Context:
     out: object = None
     dry_run: bool = False
     now: float = None
-    failures: list = field(default_factory=list)
 
     def say(self, text):
         print(text, file=self.out or sys.stdout)
@@ -77,16 +126,6 @@ def _first_line(text, limit=MAX_ERROR):
 
 
 # ---------------------------------------------------------------- folders
-
-def archive_root():
-    """The transcript archive: CLAUDE_SESSION_ARCHIVE_DEST, else the folder the archiver has always used."""
-    return Path(os.environ.get("CLAUDE_SESSION_ARCHIVE_DEST")
-                or os.path.join(os.path.expanduser("~"), ".local", "share", "claude-session-archive", "archive"))
-
-
-def archive_state_path():
-    return Path(settings.state_dir()) / "archive" / "last_run.json"
-
 
 def projects_dir():
     return Path(data.default_paths()["projects"])
@@ -405,7 +444,8 @@ FOLDERS = (
     Folder("state folder", "job logs, notification state, the archive's last run, retired job backups",
            "$XDG_STATE_HOME/fleetwatch, else ~/.local/state/fleetwatch", lambda: Path(settings.state_dir())),
     Folder("session archive", "transcript copies that outlive Claude Code's retention sweep",
-           "CLAUDE_SESSION_ARCHIVE_DEST, else ~/.local/share/claude-session-archive/archive", archive_root),
+           "CLAUDE_SESSION_ARCHIVE_DEST, else settings.toml [archive] dest, else "
+           "~/.local/share/claude-session-archive/archive", archive_root),
     Folder("Claude projects folder", "the transcripts fleetwatch reads (Claude Code writes them)",
            "FLEETWATCH_PROJECTS_DIR, else ~/.claude/projects", projects_dir, create=False),
 )
@@ -533,25 +573,6 @@ def duplicate_checks(ctx):
 
 
 # ---------------------------------------------------------------- the archive and the indexes
-
-def archive_coverage(projects=None, archive=None, since=None):
-    """(missing, missing_before): live transcripts with no copy in the archive, and how many of those were
-    last written before `since` (the last archive run's start), which that run should have copied."""
-    projects = Path(projects or projects_dir())
-    archive = Path(archive or archive_root()) / "projects"
-    missing = before = 0
-    for root, _dirs, files in os.walk(projects):
-        for name in files:
-            if not name.endswith(".jsonl"):
-                continue
-            src = Path(root, name)
-            if (archive / src.relative_to(projects)).exists():
-                continue
-            missing += 1
-            if since is not None and (_mtime(src) or 0) < since:
-                before += 1
-    return missing, before
-
 
 def archive_checks(ctx):
     """The last archive run's outcome and the archive's coverage. How long ago it ran is the archive job's own

@@ -28,6 +28,10 @@ OURS = ("local.fleetwatch.index-refresh", "local.fleetwatch.watch-run", "local.f
 MUTATING = ("bootstrap", "bootout", "kickstart")
 
 
+def sid(n):
+    return "aa11bb22-0000-4000-8000-%012d" % n
+
+
 class Home:
     """A throwaway home: LaunchAgents, systemd, data, state, config, projects and archive folders, and a fake
     launchd whose state lives in a JSON file."""
@@ -48,6 +52,7 @@ class Home:
             "XDG_DATA_HOME": str(self.root / "data"), "XDG_STATE_HOME": str(self.root / "state"),
             "FLEETWATCH_CONFIG_DIR": str(self.root / "config"),
             "FLEETWATCH_PROJECTS_DIR": str(self.projects), "CLAUDE_SESSION_ARCHIVE_DEST": str(self.archive),
+            "FLEETWATCH_ARCHIVE_DIR": str(self.archive / "projects"),
         }
         p = mock.patch.dict(os.environ, self.env)
         p.start()
@@ -194,7 +199,7 @@ class Install(unittest.TestCase):
         self.assertNotIn(LEGACY_INDEX, loaded)
         self.assertNotIn(LEGACY_ARCHIVE, loaded)
         self.assertFalse(index.exists() or archive.exists())
-        kept = self.h.state / "legacy-agents"
+        kept = self.h.state / "legacy"
         self.assertEqual((kept / (LEGACY_INDEX + ".plist")).read_bytes(), body)
         self.assertTrue((kept / (LEGACY_ARCHIVE + ".plist")).exists())
         self.assertIn("unloaded the older job %s" % LEGACY_INDEX, out)
@@ -208,11 +213,11 @@ class Install(unittest.TestCase):
         index = self.h.legacy(LEGACY_INDEX, loaded=False)
         run(install_cli.install_main, self.h)
         self.assertFalse(index.exists())
-        self.assertTrue((self.h.state / "legacy-agents" / (LEGACY_INDEX + ".plist")).exists())
+        self.assertTrue((self.h.state / "legacy" / (LEGACY_INDEX + ".plist")).exists())
         self.assertNotIn("bootout gui/501/%s" % LEGACY_INDEX, self.h.calls())
 
     def test_an_earlier_backup_is_never_replaced(self):
-        kept = self.h.state / "legacy-agents"
+        kept = self.h.state / "legacy"
         kept.mkdir(parents=True)
         (kept / (LEGACY_INDEX + ".plist")).write_text("the first backup")
         self.h.legacy(LEGACY_INDEX)
@@ -250,7 +255,7 @@ class Install(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(self.h.launchd()["loaded"], {})
         self.assertEqual([p.name for p in self.h.agents.iterdir()], [other.name])
-        self.assertTrue((self.h.state / "legacy-agents" / (LEGACY_INDEX + ".plist")).exists())
+        self.assertTrue((self.h.state / "legacy" / (LEGACY_INDEX + ".plist")).exists())
         self.assertTrue(self.h.archive.is_dir())
         self.assertIn("are kept in", out)
         code, out = run(install_cli.uninstall_main, self.h)
@@ -325,7 +330,7 @@ class Doctor(unittest.TestCase):
         st["running"] = ["local.fleetwatch.notify"]
         self.h.state_file.write_text(json.dumps(st))
         self.h.job_logs()
-        self.h.transcript("-work-a/one.jsonl", archived=True, age=7200)
+        self.h.transcript("-work-a/%s.jsonl" % sid(1), archived=True, age=7200)
         self.h.archive_run()
 
     def doctor(self, *argv):
@@ -428,11 +433,14 @@ class Doctor(unittest.TestCase):
 
     def test_archive_coverage(self):
         self.healthy()
-        self.h.transcript("-work-b/new.jsonl")                    # written after the last run started: waits
+        side = self.h.projects / "-work-a" / sid(1) / "subagents" / "agent-x.jsonl"
+        side.parent.mkdir(parents=True)
+        side.write_text("{}")                                      # a side file is not a main transcript
+        self.h.transcript("-work-b/%s.jsonl" % sid(2))                    # written after the last run started: waits
         code, rows = self.rows()
         self.assertEqual(code, 0)
         self.assertIn("1 newer one waiting", rows[("session archive", "coverage")]["detail"])
-        self.h.transcript("-work-b/old.jsonl", age=3600)          # older than the last run, yet not archived
+        self.h.transcript("-work-b/%s.jsonl" % sid(3), age=3600)          # older than the last run, yet not archived
         bad = self.failing()[1]
         self.assertIn("1 live transcript older than the last run has no archive copy",
                       bad[("session archive", "coverage")]["detail"])
@@ -457,12 +465,12 @@ class Doctor(unittest.TestCase):
         legacy = self.h.legacy(LEGACY_INDEX)
         os.rmdir(self.h.root / "data" / "fleetwatch")
         self.h.job_logs(ago=3 * 3600)                             # stale: reported, not repaired
-        self.h.transcript("-work-b/old.jsonl", age=3600)          # uncovered: reported, not repaired
+        self.h.transcript("-work-b/%s.jsonl" % sid(3), age=3600)          # uncovered: reported, not repaired
         code, out = self.doctor("--fix")
         self.assertEqual(code, 1)
         self.assertIn("fixed: data folder, %s, watch run, notify, archive" % LEGACY_INDEX, out)
         self.assertFalse(legacy.exists())
-        self.assertTrue((self.h.state / "legacy-agents" / (LEGACY_INDEX + ".plist")).exists())
+        self.assertTrue((self.h.state / "legacy" / (LEGACY_INDEX + ".plist")).exists())
         bad = self.failing()[1]
         self.assertEqual(sorted(bad), [("index refresh", "last run"), ("session archive", "coverage"),
                                        ("watch run", "last run")])

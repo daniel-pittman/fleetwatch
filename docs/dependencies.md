@@ -2,7 +2,7 @@
 
 Generated from `fleetwatch/dependencies.py` by `fleetwatch doctor --inventory`; a test keeps them in step.
 
-`fleetwatch install` installs and starts every scheduled job and creates the folders, and retires the older jobs each one replaces: it unloads them and moves their plist into `legacy-agents/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. `fleetwatch doctor` checks every row below and exits 1 when something is wrong; `fleetwatch doctor --fix` installs what is missing and retires older jobs, and reports the rest.
+`fleetwatch install` installs and starts every scheduled job and creates the folders, and retires the older jobs each one replaces: it unloads them and moves their plist into `legacy/` in the state folder, never deleting it. `fleetwatch uninstall` stops and removes the jobs. `fleetwatch doctor` checks every row below and exits 1 when something is wrong; `fleetwatch doctor --fix` installs what is missing and retires older jobs, and reports the rest.
 
 ## Scheduled jobs
 
@@ -21,7 +21,7 @@ Doctor checks each job: installed, loaded (a kept-running job: running), the las
 |---|---|---|---|
 | data folder | indexes and fleetwatch's own data | $XDG_DATA_HOME/fleetwatch, else ~/.local/share/fleetwatch | yes |
 | state folder | job logs, notification state, the archive's last run, retired job backups | $XDG_STATE_HOME/fleetwatch, else ~/.local/state/fleetwatch | yes |
-| session archive | transcript copies that outlive Claude Code's retention sweep | CLAUDE_SESSION_ARCHIVE_DEST, else ~/.local/share/claude-session-archive/archive | yes |
+| session archive | transcript copies that outlive Claude Code's retention sweep | CLAUDE_SESSION_ARCHIVE_DEST, else settings.toml [archive] dest, else ~/.local/share/claude-session-archive/archive | yes |
 | Claude projects folder | the transcripts fleetwatch reads (Claude Code writes them) | FLEETWATCH_PROJECTS_DIR, else ~/.claude/projects | no (read only) |
 
 Doctor checks that each folder exists and that fleetwatch can write the ones it creates.
