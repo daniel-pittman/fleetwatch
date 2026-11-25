@@ -480,6 +480,20 @@ class Install(Home):
         self.assertEqual(code, 0)
         self.assertIn("not installed", out)
 
+    def test_a_trial_folder_without_a_stand_in_never_runs_the_real_launchctl(self):
+        path = self.legacy()
+        del os.environ["FLEETWATCH_LAUNCHCTL"]
+        with mock.patch.object(schedule.subprocess, "run") as run:
+            code, out = self.quiet(archive.main, ["install"])
+            self.assertFalse(schedule.is_loaded("local.fleetwatch.archive"))
+            ok, actions = schedule.retire_legacy(archive.LEGACY_LABEL, io.StringIO(), dry_run=True)
+            self.assertEqual(self.quiet(archive.main, ["uninstall"])[0], 0)
+        run.assert_not_called()
+        self.assertEqual(code, 1)
+        self.assertIn("not run (a trial folder is set", out)
+        self.assertTrue(os.path.exists(path))
+        self.assertEqual(self.backups(), [])
+
     def test_linux_writes_a_timer_and_never_calls_launchctl(self):
         self.platform.stop()
         with mock.patch.object(sys, "platform", "linux"):

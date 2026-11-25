@@ -67,10 +67,19 @@ def systemd_dir(environ=None):
 LAUNCHCTL_TIMEOUT_S = 30
 
 
+TRIAL_REFUSED = 126
+
+
 def launchctl(*args):
     """Run launchctl (FLEETWATCH_LAUNCHCTL names a stand-in) and return the CompletedProcess. A launchctl
-    that cannot be started reads as a failed call, exit 127."""
-    argv = shlex.split(os.environ.get("FLEETWATCH_LAUNCHCTL") or "launchctl") + list(args)
+    that cannot be started reads as a failed call, exit 127. With a trial LaunchAgents folder
+    (FLEETWATCH_LAUNCH_AGENTS_DIR) and no stand-in, the real launchctl is never run, exit 126: it would
+    load a trial plist into the live login session or unload a real agent."""
+    stand_in = os.environ.get("FLEETWATCH_LAUNCHCTL")
+    if not stand_in and os.environ.get("FLEETWATCH_LAUNCH_AGENTS_DIR"):
+        return subprocess.CompletedProcess(["launchctl"] + list(args), TRIAL_REFUSED, "",
+                                           "not run (a trial folder is set: FLEETWATCH_LAUNCH_AGENTS_DIR)")
+    argv = shlex.split(stand_in or "launchctl") + list(args)
     try:
         return subprocess.run(argv, capture_output=True, text=True, timeout=LAUNCHCTL_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired) as e:
