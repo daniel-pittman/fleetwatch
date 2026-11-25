@@ -422,10 +422,50 @@ class BoundedBuilds(unittest.TestCase):
                 rf.run_bounded([sys.executable, child, grandchild, marker], d, timeout=2)
             self.assertLess(_t.time() - t0, 20)
             self.assertIn("timed out after 2s", str(cm.exception))
-            _t.sleep(0.5)
-            gpid = int(open(marker).read())
+            for _ in range(40):  # the kernel reaps the group asynchronously
+                try:
+                    os.kill(int(Path(marker).read_text()), 0)
+                except ProcessLookupError:
+                    break
+                _t.sleep(0.1)
+            with open(marker) as f:
+                gpid = int(f.read())
             with self.assertRaises(ProcessLookupError):
                 os.kill(gpid, 0)
+
+    def test_an_interrupted_build_takes_its_process_group_down(self):
+        import sys, tempfile, time as _t
+        from fleetwatch.memory import refresh as rf
+        with tempfile.TemporaryDirectory() as d:
+            marker = os.path.join(d, "child.pid")
+            child = os.path.join(d, "child.py")
+            with open(child, "w") as f:
+                f.write("import os, sys, time\nopen(sys.argv[1], 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+            real = subprocess.Popen.communicate
+            calls = []
+
+            def communicate(self, *a, **k):
+                if not calls:
+                    calls.append(1)
+                    for _ in range(100):
+                        if os.path.exists(marker) and Path(marker).read_text():
+                            break
+                        _t.sleep(0.05)
+                    raise KeyboardInterrupt
+                return real(self, *a, **k)
+            with mock.patch.object(subprocess.Popen, "communicate", communicate):
+                with self.assertRaises(KeyboardInterrupt):
+                    rf.run_bounded([sys.executable, child, marker], d, timeout=30)
+            with open(marker) as f:
+                pid = int(f.read())
+            for _ in range(40):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                _t.sleep(0.1)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     def test_a_build_that_finishes_returns_its_output(self):
         import sys, tempfile

@@ -95,6 +95,16 @@ def is_loaded(label):
     return launchctl("print", "%s/%s" % (gui_domain(), label)).returncode == 0
 
 
+LOAD_SETTLE_S = 5.0
+
+
+def _wait_unloaded(label, timeout=None):
+    """Poll until launchd no longer lists `label`, for at most LOAD_SETTLE_S seconds."""
+    deadline = time.monotonic() + (LOAD_SETTLE_S if timeout is None else timeout)
+    while is_loaded(label) and time.monotonic() < deadline:
+        time.sleep(0.2)
+
+
 def _first_line(proc):
     text = (proc.stderr or proc.stdout or "").strip()
     return text.splitlines()[0] if text else "exit %d" % proc.returncode
@@ -107,7 +117,13 @@ def load(out=None, job=INDEX):
     path = _plist_path(job)
     if is_loaded(job.label):
         launchctl("bootout", "%s/%s" % (gui_domain(), job.label))
+        # bootout returns before launchd finishes the teardown, and a bootstrap in that window fails
+        # with "Input/output error" (5); wait for the job to read as unloaded, then retry once.
+        _wait_unloaded(job.label)
     proc = launchctl("bootstrap", gui_domain(), str(path))
+    if proc.returncode != 0 and not is_loaded(job.label):
+        _wait_unloaded(job.label)
+        proc = launchctl("bootstrap", gui_domain(), str(path))
     if proc.returncode != 0 or not is_loaded(job.label):
         print("could not load %s: %s" % (job.label, _first_line(proc)), file=out)
         return False

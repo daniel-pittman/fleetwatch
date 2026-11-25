@@ -332,11 +332,11 @@ fleetwatch unpark grant                                             # or `fleetw
 Claude Code's retention sweep deletes old transcripts. `fleetwatch archive run` copies them somewhere the sweep does not reach, and `fleetwatch archive install` runs it every hour.
 
 ```
-fleetwatch archive install        # install and load the hourly job (local.fleetwatch.archive)
+fleetwatch archive install        # install the hourly job (local.fleetwatch.archive); on macOS it also loads it, on Linux `fleetwatch install` starts the timer
 fleetwatch archive run            # copy new and changed transcripts now
 fleetwatch archive status         # the last run, its age, and live transcripts with no archive copy
 fleetwatch archive status --json
-fleetwatch archive uninstall      # stop archiving; the archive keeps every copy
+fleetwatch archive uninstall      # remove the job (on Linux `fleetwatch uninstall` stops the timer); the archive keeps every copy
 fleetwatch restore --list         # sessions only the archive has, and any that cannot be restored
 fleetwatch restore NAME           # copy one back, by name, session ID prefix or project folder name
 ```

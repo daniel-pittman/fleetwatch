@@ -411,6 +411,14 @@ def now_iso():
 BUILD_TIMEOUT_S = 1800
 
 
+def _kill_group(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except ProcessLookupError:
+        pass
+    proc.communicate()
+
+
 def run_bounded(argv, cwd, timeout=None):
     """subprocess.run(argv, capture_output=True, text=True) in its own session, killed with its
     whole process group after `timeout` seconds (BUILD_TIMEOUT_S by default). A timeout raises
@@ -421,12 +429,13 @@ def run_bounded(argv, cwd, timeout=None):
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, 9)
-        except ProcessLookupError:
-            pass
-        proc.communicate()
+        _kill_group(proc)
         raise RuntimeError("timed out after %ds: %s" % (timeout, " ".join(str(a) for a in argv[1:])))
+    except BaseException:
+        # Ctrl-C, or launchd stopping the job: the build runs in its own session, so it would
+        # otherwise keep running, and keep holding the index's writer lock, after this run ends.
+        _kill_group(proc)
+        raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 
