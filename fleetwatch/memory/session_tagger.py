@@ -40,7 +40,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from .render import render_exchange
-from .session_parse import DEFAULT_RULES
+from .session_parse import DEFAULT_RULES, jsonl_lines
 
 TOKEN_KEYS = ("inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens",
               "webSearchRequests", "costUSD")
@@ -223,10 +223,9 @@ def normalize_topics(topics):
 def load_tags(path):
     cache = {}
     if path.exists():
-        for line in path.read_text().splitlines():
-            if line.strip():
-                rec = json.loads(line)
-                cache[rec["id"]] = rec
+        for line in jsonl_lines(path.read_text()):
+            rec = json.loads(line)
+            cache[rec["id"]] = rec
     return cache
 
 

@@ -18,6 +18,10 @@ class EmptyCorpus(SearchError):
     """A build found no chunks under the configured roots."""
 
 
+class BuildBusy(SearchError):
+    """Another build of the same index held its lock for longer than a build waits."""
+
+
 class IndexMissing(SearchError):
     """No SQLite index exists at the configured index_path."""
 
