@@ -44,8 +44,9 @@ class Guard:
     """Installs the handlers and the probe for one board run. `request_exit` must be safe to call
     from any thread and must not block; the board passes one that schedules App.exit on its loop."""
 
-    def __init__(self, request_exit, fd, deadline_s=DEADLINE_S, probe_s=PROBE_S):
+    def __init__(self, request_exit, fd, deadline_s=DEADLINE_S, probe_s=PROBE_S, hard_exit=os._exit):
         self.request_exit = request_exit
+        self.hard_exit = hard_exit
         self.fd = fd
         self.deadline_s = deadline_s
         self.probe_s = probe_s
@@ -74,7 +75,7 @@ class Guard:
         if self.ending:
             return
         self.ending = True
-        timer = threading.Timer(self.deadline_s, os._exit, (code,))
+        timer = threading.Timer(self.deadline_s, self.hard_exit, (code,))
         timer.daemon = True
         timer.start()
         try:

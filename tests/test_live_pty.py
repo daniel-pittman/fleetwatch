@@ -177,11 +177,11 @@ class ProbeTests(unittest.TestCase):
                 os.close(master)
 
     def test_the_probe_ends_the_run_once_and_stop_restores_the_handlers(self):
-        calls = []
+        calls, exits = [], []
         before = signal.getsignal(signal.SIGTERM)
         master, slave = pty.openpty()
         self.addCleanup(os.close, slave)
-        guard = hangup.Guard(lambda: calls.append(1), slave, deadline_s=60, probe_s=0.05)
+        guard = hangup.Guard(lambda: calls.append(1), slave, deadline_s=0.3, probe_s=0.05, hard_exit=exits.append)
         guard.install()
         try:
             self.assertIsNot(signal.getsignal(signal.SIGTERM), before)
@@ -189,11 +189,13 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(calls, [])
             os.close(master)
             until = time.time() + 3
-            while not calls and time.time() < until:
+            while not exits and time.time() < until:
                 time.sleep(0.05)
             self.assertEqual(calls, [1])
+            self.assertEqual(exits, [128 + signal.SIGHUP])
             guard.end(1)
-            self.assertEqual(calls, [1])
+            time.sleep(0.5)
+            self.assertEqual((calls, exits), ([1], [128 + signal.SIGHUP]))
         finally:
             guard.stop()
         self.assertIs(signal.getsignal(signal.SIGTERM), before)
