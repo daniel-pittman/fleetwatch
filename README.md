@@ -64,7 +64,6 @@ Reference folders with PDF, Office or scanned files also use `pdftotext`, `pando
 | `terminal-notifier` (macOS, `brew install terminal-notifier`) | a click on a notification raising that session's tab | banners still appear through `osascript`; a click does nothing |
 | `notify-send` (Linux) | desktop notifications | notifications print one line instead |
 | `pdftotext`, `pandoc`, `soffice`, `tesseract` | reading PDF, Office and scanned files in reference folders | those files are skipped, listed as "conversion failed" in the run report |
-
 | `rsync` | the transcript archive's copy | the archive copies with Python instead |
 
 ### Background jobs: `fleetwatch install`, then `fleetwatch doctor`

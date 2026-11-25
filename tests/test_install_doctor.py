@@ -6,6 +6,7 @@ import io
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -60,7 +61,7 @@ class Home:
         plat = mock.patch.object(sys, "platform", "darwin")
         plat.start()
         test.addCleanup(plat.stop)
-        os.environ["FLEETWATCH_LAUNCHCTL"] = "%s %s" % (sys.executable, REPO / "tests" / "fake_launchd.py")
+        os.environ["FLEETWATCH_LAUNCHCTL"] = shlex.join([sys.executable, str(REPO / "tests" / "fake_launchd.py")])
         os.environ["FAKE_LAUNCHCTL_STATE"] = str(self.state_file)
         os.environ["FAKE_LAUNCHCTL_LOG"] = str(self.log)
         self.write_launchd({})
@@ -334,6 +335,12 @@ class Install(unittest.TestCase):
             self.assertEqual(install_cli.uninstall_main([], io.StringIO(), m2), 0)
             self.assertIn(["disable", "--now", "fleetwatch-index-refresh.timer"], calls)
             self.assertFalse((units / "fleetwatch-index-refresh.timer").exists())
+
+    def test_the_fake_launchctl_command_survives_paths_with_spaces(self):
+        with mock.patch.object(sys, "executable", "/opt/my python/bin/python3"):
+            Home(self)
+        self.assertEqual(shlex.split(os.environ["FLEETWATCH_LAUNCHCTL"]),
+                         ["/opt/my python/bin/python3", str(REPO / "tests" / "fake_launchd.py")])
 
     def test_the_command_line_reaches_install_uninstall_and_doctor(self):
         from fleetwatch import __main__ as cli

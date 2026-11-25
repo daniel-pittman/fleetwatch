@@ -401,10 +401,6 @@ class Locks(unittest.TestCase):
         self.assertEqual(marker["finished"], [])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class BoundedBuilds(unittest.TestCase):
     """A refresh run holds its run lock for life, so a build command that never returns must be cut off."""
 
@@ -438,3 +434,7 @@ class BoundedBuilds(unittest.TestCase):
             r = rf.run_bounded([sys.executable, "-c", "print('Indexed 3 chunks')"], d, timeout=30)
             self.assertEqual(r.returncode, 0)
             self.assertIn("Indexed 3 chunks", r.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
