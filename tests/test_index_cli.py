@@ -1094,6 +1094,589 @@ class Add(unittest.TestCase):
         self.assertEqual(entry["transcripts"]["path"], str(codex))
 
 
+class AddDocs(unittest.TestCase):
+    """`index add --docs` (several folders, glob warnings, match counts) and `index docs add`."""
+
+    def setUp(self):
+        base = tmp(self)
+        self.cfg, self.data, self.projects = base / "config", base / "data", base / "projects"
+        self.sessions = base / "sessions"
+        self.sessions.mkdir()
+        for folder, sid in (("-a-fleet", SID), ("-c-other", SID2)):
+            (self.projects / folder).mkdir(parents=True)
+            (self.projects / folder / (sid + ".jsonl")).write_text("{}\n")
+        (self.sessions / "700.json").write_text(json.dumps({"name": "Fleet Dev", "sessionId": SID}))
+        (self.cfg).mkdir(parents=True, exist_ok=True)
+        (self.cfg / "pack.yaml").write_text(PACK)
+        use_layout(self, self.cfg, self.data, self.projects, packs=("education", "pack.yaml"))
+        os.environ["FLEETWATCH_SESSIONS_DIR"] = str(self.sessions)
+        self.addCleanup(os.environ.pop, "FLEETWATCH_SESSIONS_DIR")
+        os.environ["FLEETWATCH_PS_CMD"] = "true"
+        self.addCleanup(os.environ.pop, "FLEETWATCH_PS_CMD")
+        self.who = indexes.Caller("owner")
+        patcher = mock.patch.object(indexes, "classify_caller", side_effect=lambda *a, **k: self.who)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.notes = base / "notes"
+        (self.notes / "sub").mkdir(parents=True)
+        (self.notes / "top.md").write_text("# Top\n\nA note about lanterns.\n")
+        (self.notes / "sub" / "deep.md").write_text("# Deep\n\nA note about seed trays.\n")
+        self.emails = base / "emails"
+        self.emails.mkdir()
+        (self.emails / "one.md").write_text("# One\n\nAn email filed here.\n")
+
+    def digest(self):
+        """The config folder's content, without the lock file a docs change leaves beside the
+        registry entries."""
+        h = hashlib.sha256()
+        for p in sorted(self.cfg.rglob("*")):
+            if p.name != ".docs-add.lock":
+                h.update(str(p.relative_to(self.cfg)).encode())
+                if p.is_file():
+                    h.update(p.read_bytes())
+        return h.hexdigest()
+
+    def run_cli(self, *argv):
+        return capture(index_cli.main, list(argv))
+
+    def entry_file(self):
+        return self.cfg / "indexes" / "registry.d" / "fleet-dev-session.yaml"
+
+    def entry(self):
+        return yaml.safe_load(self.entry_file().read_text())["indexes"]["fleet-dev-session"]
+
+    def join(self, *extra, group="oss"):
+        code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", group, *extra)
+        self.assertEqual(code, 0, err)
+        return out
+
+    def as_owner_session(self):
+        self.who = indexes.Caller("session", ("Fleet Dev", SID))
+
+    def test_a_label_that_could_leave_the_corpus_is_refused(self):
+        self.join()
+        self.as_owner_session()
+        before = self.digest()
+        for label in ("../x", "/tmp/x", "a/b", "..", ".hidden", "x..y", "", "a\\b"):
+            code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs",
+                                          str(self.emails), "--label", label)
+            self.assertEqual(code, 2, label)
+            self.assertIn("label", err, label)
+        self.assertEqual(self.digest(), before)
+        outside = self.cfg.parent / "x"
+        self.assertFalse(outside.exists())
+
+    def test_add_refuses_a_traversing_label_before_writing_anything(self):
+        for label in ("../x", "/tmp/x"):
+            code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", "oss", "--docs",
+                                          str(self.notes), "--label", label)
+            self.assertEqual(code, 2, label)
+            self.assertFalse(self.entry_file().exists())
+            self.assertFalse((self.cfg / "indexes" / "fleet-dev-session").exists())
+
+    def test_a_folder_name_with_odd_characters_gets_a_safe_default_label(self):
+        odd = self.cfg.parent / "my notes (old)"
+        odd.mkdir()
+        (odd / "a.md").write_text("# A\n\ntext\n")
+        self.join()
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(odd))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.entry()["docs"][-1]["label"], "my notes -old-")
+
+    # -- #41 item 3: two --docs paths
+    def test_two_docs_paths_make_two_docs_entries(self):
+        self.join("--docs", str(self.notes), "--docs", str(self.emails), "--include", "**/*.md")
+        docs = self.entry()["docs"]
+        self.assertEqual([d["path"] for d in docs], [str(self.notes), str(self.emails)])
+        self.assertEqual([d["label"] for d in docs], ["notes", "emails"])
+        self.assertEqual([d["include"] for d in docs], [["**/*.md"]] * 2)
+
+    def test_one_docs_path_keeps_the_label_docs_and_labels_must_match_folders(self):
+        self.join("--docs", str(self.notes))
+        self.assertEqual(self.entry()["docs"][0]["label"], "docs")
+        code, out, err = self.run_cli("add", "--session", "Other", "--session-id", SID2, "--name", "o",
+                                      "--group", "oss", "--docs", str(self.notes), "--docs",
+                                      str(self.emails), "--label", "only-one")
+        self.assertEqual(code, 2)
+        self.assertIn("one --label per --docs", err)
+
+    def test_two_docs_folders_with_one_name_are_refused(self):
+        code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", "oss", "--docs",
+                                      str(self.notes), "--docs", str(self.notes))
+        self.assertEqual(code, 2)
+        self.assertIn("its own path", err)
+        self.assertFalse(self.entry_file().exists())
+
+    # -- #41 item 2: glob warning and counts
+    def test_add_warns_when_no_glob_reaches_subfolders_and_counts_matches(self):
+        out = self.join("--docs", str(self.notes), "--include", "*.md")
+        self.assertIn("warning: no --include glob contains '**/'", out)
+        self.assertIn("1 subfolder (sub)", out)
+        self.assertIn("docs docs: 1 docs matched of 2 files", out)
+
+    def test_no_warning_with_a_recursive_glob_or_without_subfolders(self):
+        out = self.join("--docs", str(self.notes), "--include", "*.md", "--include", "**/*.md")
+        self.assertNotIn("warning", out)
+        self.assertIn("2 docs matched of 2 files", out)
+        code, out, err = self.run_cli("add", "--session", "Other", "--session-id", SID2, "--name", "o",
+                                      "--group", "oss", "--docs", str(self.emails), "--include", "*.md")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("warning", out)
+        self.assertIn("1 docs matched of 1 files", out)
+
+    # -- #41 item 1: index docs add
+    def test_the_owner_session_adds_a_docs_entry(self):
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        head = self.entry_file().read_text().splitlines()[0]
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails),
+                                      "--include", "*.md")
+        self.assertEqual(code, 0, err)
+        docs = self.entry()["docs"]
+        self.assertEqual([d["label"] for d in docs], ["docs", "emails"])
+        self.assertEqual(docs[1], {"label": "emails", "path": str(self.emails), "include": ["*.md"]})
+        self.assertEqual(self.entry_file().read_text().splitlines()[0], head)
+        self.assertIn("1 docs matched of 1 files", out)
+        reg = indexes.load_registry()
+        ix = refresh.Index("fleet-dev-session", reg["indexes"]["fleet-dev-session"], reg["defaults"])
+        self.assertEqual(len(ix.docs_specs()), 2)
+
+    def test_docs_add_warns_about_subfolders(self):
+        self.join()
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.notes),
+                                      "--include", "*.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning: no --include glob contains '**/'", out)
+        self.assertIn("1 docs matched of 2 files", out)
+
+    def test_another_session_cannot_add_docs_to_an_index_it_can_read(self):
+        self.join()
+        self.who = indexes.Caller("session", ("Peer", SID2))
+        self.join_peer_group()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 3)
+        self.assertIn("not owned by this session", err)
+        self.assertEqual(self.digest(), before)
+
+    def join_peer_group(self):
+        """A second index in the same group, so the peer is a reader of the owner's index."""
+        reg = self.cfg / "indexes" / "registry.d" / "peer.yaml"
+        reg.write_text(yaml.safe_dump({"indexes": {"peer": {
+            "group": "oss", "owner_session": "Peer", "owner_session_id": SID2,
+            "transcripts": {"project_dir": ["~/x"], "sessions": [SID2]},
+            "privacy": {"allowlist": "peer/scan_allowlist.yaml"}, "tags": "peer/tags.yaml"}}}))
+        self.assertIsNone(indexes.read_refusal(indexes.load_registry(), ("Peer", SID2),
+                                               "fleet-dev-session"))
+
+    def test_a_session_that_may_not_read_a_protected_index_gets_the_read_refusal(self):
+        self.join(group="ferpa")
+        self.who = indexes.Caller("session", ("Peer", SID2))
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 3)
+        self.assertIn("protected group", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_an_unidentified_or_delegated_caller_is_refused(self):
+        self.join()
+        before = self.digest()
+        for caller in (indexes.Caller("untrusted", sign="no session"),
+                       indexes.Caller("delegated", ("Fleet Dev", SID), "agent")):
+            self.who = caller
+            code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+            self.assertEqual(code, 3, caller)
+            self.assertIn("requires a Claude session", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_an_unknown_index_and_a_bad_name_are_refused(self):
+        self.join()
+        self.as_owner_session()
+        before = self.digest()
+        for name, why in (("nope", "no index 'nope'"), ("../x", "not valid"), ("Fleet-Dev", "not valid")):
+            code, out, err = self.run_cli("docs", "add", name, "--docs", str(self.emails))
+            self.assertEqual(code, 2, name)
+            self.assertIn(why, err)
+        self.assertEqual(self.digest(), before)
+
+    def test_never_index_folders_are_refused_by_add_and_by_docs_add(self):
+        base = self.cfg.parent
+        for bad in ("grades", "Roster-2026", "student_identity", "instructor-only"):
+            (base / bad).mkdir()
+            (base / bad / "x.md").write_text("# x\n")
+        link = base / "innocent"
+        link.symlink_to(base / "grades")
+        for bad in ("grades", "Roster-2026", "student_identity", "instructor-only", "innocent"):
+            code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", "oss",
+                                          "--docs", str(base / bad))
+            self.assertEqual(code, 3, bad)
+            self.assertIn("never indexed", err, bad)
+            self.assertFalse(self.entry_file().exists(), bad)
+        code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", "oss",
+                                      "--docs", str(self.notes), "--include", "grades/**/*.md")
+        self.assertEqual(code, 3)
+        self.join("--docs", str(self.notes))
+        self.as_owner_session()
+        before = self.digest()
+        for bad in ("grades", "Roster-2026", "student_identity", "instructor-only", "innocent"):
+            code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(base / bad))
+            self.assertEqual(code, 3, bad)
+            self.assertIn("never indexed", err, bad)
+        self.assertEqual(self.digest(), before)
+
+    def test_a_recursive_glob_skips_a_never_index_subfolder_on_refresh(self):
+        (self.notes / "grades").mkdir()
+        (self.notes / "grades" / "b.md").write_text("# B\n\nstudent marks\n")
+        out = self.join("--docs", str(self.notes), "--include", "**/*.md")
+        self.assertIn("2 docs matched of 3 files", out)
+        reg = indexes.load_registry()
+        ix = refresh.Index("fleet-dev-session", reg["indexes"]["fleet-dev-session"], reg["defaults"])
+        found = sorted(p.name for spec in ix.docs_specs()
+                       for p, _l, _r in refresh.doc_corpus.discover(spec))
+        self.assertEqual(found, ["deep.md", "top.md"])
+
+    def test_a_rule_pack_private_path_is_refused_and_an_unloadable_pack_fails_closed(self):
+        (self.cfg / "paths.yaml").write_text("private_paths: ['secretcourse']\n")
+        use_layout(self, self.cfg, self.data, self.projects, packs=("education", "paths.yaml"))
+        folder = self.cfg.parent / "SecretCourse-notes"
+        folder.mkdir()
+        code, out, err = self.run_cli("add", "--session", "Fleet Dev", "--group", "oss",
+                                      "--docs", str(folder))
+        self.assertEqual(code, 3)
+        self.assertIn("names 'SecretCourse'", err)
+        with mock.patch("fleetwatch.memory.privacy_scan.RuleSet", side_effect=ValueError("pack gone")):
+            why = indexes.docs_path_problem(self.notes)
+        self.assertIn("could not be loaded", why)
+
+    def test_a_private_path_rule_with_a_separator_refuses_the_folder(self):
+        (self.cfg / "paths.yaml").write_text("private_paths: ['blind/', 'exports/restricted/']\n")
+        use_layout(self, self.cfg, self.data, self.projects, packs=("education", "paths.yaml"))
+        base = self.cfg.parent
+        for bad in ("blind", "exports/restricted", "course/blind"):
+            (base / bad).mkdir(parents=True)
+            (base / bad / "x.md").write_text("# x\n")
+        for bad in ("blind", "exports/restricted", "course/blind"):
+            self.assertIn("never indexed", indexes.docs_path_problem(base / bad) or "", bad)
+        self.assertIn("never indexed", indexes.docs_path_problem(base / "exports", ["restricted/*.md"]))
+        self.assertIsNone(indexes.docs_path_problem(base / "exports"))
+        self.join()
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(base / "blind"))
+        self.assertEqual(code, 3, err)
+        self.assertIn("never indexed", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_compound_never_index_folder_names_are_refused_and_lookalikes_pass(self):
+        base = self.cfg.parent
+        for name in ("FinalGrades", "grades2026", "gradesheets", "FinalGrades2026"):
+            self.assertIn("never indexed", indexes.docs_path_problem(base / name) or "", name)
+        for name in ("upgrade-notes", "graduate"):
+            self.assertIsNone(indexes.docs_path_problem(base / name), name)
+        self.join()
+        self.as_owner_session()
+        (base / "FinalGrades2026").mkdir()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs",
+                                      str(base / "FinalGrades2026"))
+        self.assertEqual(code, 3, err)
+        self.assertEqual(self.digest(), before)
+
+    def test_triage_reads_no_document_a_private_paths_rule_excludes(self):
+        (self.cfg / "paths.yaml").write_text("private_paths: ['sub/']\n")
+        use_layout(self, self.cfg, self.data, self.projects, packs=("education", "paths.yaml"))
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        reg = indexes.load_registry()
+        code, out, err = capture(refresh.cmd_triage, reg, "fleet-dev-session")
+        self.assertIn("; 1 docs;", out)
+        with mock.patch.object(refresh, "RuleSet", side_effect=ValueError("pack gone")):
+            with self.assertRaises(ValueError):
+                capture(refresh.cmd_triage, reg, "fleet-dev-session")
+        scanner = mock.Mock(rules=object(), scan_groups=mock.Mock())
+        with mock.patch.object(refresh, "Scanner", return_value=scanner), \
+                mock.patch.object(refresh, "check_protected"):
+            with self.assertRaises(AttributeError):
+                capture(refresh.cmd_triage, reg, "fleet-dev-session")
+        scanner.scan_groups.assert_not_called()
+
+    def refresh_and_search(self, word, fail_build=False):
+        """Refresh the index (TF-IDF, built in process, no tagging; or a build that fails), then
+        the chunks that hold `word`; an index with no SQLite file finds nothing."""
+        name = "fleet-dev-session"
+        cdir = Path(refresh.CONFIG_ROOT) / name
+        (cdir / indexes.OVERRIDES).write_text(yaml.safe_dump({"similarity": dict(SIM)}))
+
+        def build(ix):
+            if fail_build:
+                raise RuntimeError("engine build failed: forced")
+            loc = indexes.locate(indexes.load_registry(), ix.name)
+            engine.build(engine.Index(loc.cfg_dir, indexes.search_config(loc)))
+            return 0.1, "Indexed"
+        reg = indexes.load_registry()
+        opts = refresh.argparse.Namespace(full=False, no_tag=True, tag_budget=None, build=False,
+                                          retag_all=False)
+        with mock.patch.object(refresh.Index, "build", build), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            refresh.run_one(reg, name, opts)
+        loc = indexes.locate(indexes.load_registry(), name)
+        eng = engine.Index(loc.cfg_dir, indexes.search_config(loc))
+        try:
+            return [r for r, _s in eng.search(word).results if word in r["text"]]
+        except engine.IndexMissing:
+            return []
+
+    def test_a_session_that_leaves_the_index_is_not_searchable_after_a_failed_build(self):
+        self.join()
+        for folder, sid, word in (("-a-fleet", SID, "lanternfish"), ("-c-other", SID2, "quokkapeer")):
+            (self.projects / folder / (sid + ".jsonl")).write_text(json.dumps(
+                {"type": "user", "message": {"role": "user", "content": "Notes on the %s survey." % word},
+                 "timestamp": "2026-04-01T10:00:00Z"}) + "\n")
+        e = self.entry()
+        e["transcripts"]["project_dir"] = [str(self.projects / "-a-fleet"), str(self.projects / "-c-other")]
+        e["transcripts"]["sessions"] = [SID, SID2]
+        self.rewrite_entry(yaml.safe_dump({"indexes": {"fleet-dev-session": e}}))
+        self.assertTrue(self.refresh_and_search("quokkapeer"))
+        e["transcripts"]["sessions"] = [SID]
+        self.rewrite_entry(yaml.safe_dump({"indexes": {"fleet-dev-session": e}}))
+        self.assertEqual(self.refresh_and_search("quokkapeer", fail_build=True), [])
+
+    def test_a_skipped_file_leaves_the_search_index_even_when_the_rebuild_finds_nothing(self):
+        (self.notes / "grades").mkdir()
+        (self.notes / "grades" / "marks.md").write_text("# Marks\n\nThe zanzibarite marks list.\n")
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        self.assertTrue(str(self.data) in str(refresh.ROOT) and str(self.cfg) in str(refresh.CONFIG_ROOT))
+        with mock.patch.object(refresh.doc_corpus, "NEVER_INDEX_WORDS", ()):
+            self.assertTrue(self.refresh_and_search("zanzibarite"))
+        (self.notes / "sub" / "deep.md").unlink()
+        (self.notes / "top.md").write_text("# Note\n")
+        self.assertEqual(self.refresh_and_search("zanzibarite"), [])
+
+    # -- registry writes
+    def rewrite_entry(self, text):
+        self.entry_file().write_text(text)
+        indexes.load_registry()
+
+    def commented_entry(self, docs=True):
+        """The joined index's entry file with a trailing, an indented and a mid-file comment."""
+        e = self.entry()
+        lines = ["# Registry entry for the session Fleet Dev.", "indexes:", "  fleet-dev-session:",
+                 "    group: %s" % e["group"], "    owner_session: Fleet Dev",
+                 "    owner_session_id: %s   # recorded from the session (owner approved)" % SID,
+                 "    transcripts:"]
+        lines += ["      " + ln for ln in yaml.safe_dump(e["transcripts"], sort_keys=False).splitlines()]
+        lines += ["# a mid-file note about the docs below"]
+        if docs:
+            lines += ["    docs:", "    - label: docs", "      path: %s" % self.notes,
+                      "      # the notes folder, indented note", "      include:",
+                      "      - '**/*.md'"]
+        lines += ["    privacy:", "      allowlist: fleet-dev-session/scan_allowlist.yaml",
+                  "    tags: fleet-dev-session/tags.yaml   # trailing", "", "# closing note", ""]
+        return "\n".join(lines)
+
+    def assert_lines_kept(self, old, new):
+        it = iter(new.splitlines())
+        for line in old.splitlines():
+            self.assertIn(line, it, "lost or moved: %r" % line)
+
+    def test_docs_add_keeps_every_comment_in_place(self):
+        for has_docs in (True, False):
+            with self.subTest(has_docs=has_docs):
+                self.entry_file().unlink(missing_ok=True)
+                self.join()
+                old = self.commented_entry(docs=has_docs)
+                self.rewrite_entry(old)
+                self.as_owner_session()
+                code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs",
+                                              str(self.emails))
+                self.assertEqual(code, 0, err)
+                new = self.entry_file().read_text()
+                self.assert_lines_kept(old, new)
+                want = (["docs"] if has_docs else []) + ["emails"]
+                self.assertEqual([d["label"] for d in self.entry()["docs"]], want)
+                self.assertEqual(self.entry()["docs"][-1],
+                                 {"label": "emails", "path": str(self.emails), "include": ["**/*.md"]})
+                self.who = indexes.Caller("owner")
+
+    def test_a_file_that_defines_another_index_or_uses_aliases_is_refused(self):
+        self.join()
+        e = self.entry()
+        other = dict(yaml.safe_load(yaml.safe_dump(e)), owner_session_id=SID2)
+        two = yaml.safe_dump({"indexes": {"fleet-dev-session": e, "other": other}})
+        self.assertNotIn("&", two)
+        anchored = self.entry_file().read_text().replace("    group: oss\n", "    group: &g oss\n")
+        self.assertIn("&g", anchored)
+        self.as_owner_session()
+        for text in (two, anchored):
+            self.rewrite_entry(text)
+            before = self.digest()
+            code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+            self.assertEqual(code, 2, err)
+            self.assertIn("by hand", err)
+            self.assertEqual(self.digest(), before)
+
+    def test_an_entry_the_line_insert_cannot_extend_exactly_is_refused(self):
+        self.join("--docs", str(self.notes))
+        text = self.entry_file().read_text()
+        dup = text.replace("    privacy:", "    docs:\n    - label: second\n      path: /x\n    privacy:")
+        self.assertNotEqual(dup, text)
+        self.rewrite_entry(dup)
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 2, err)
+        self.assertIn("by hand", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_a_symlinked_lock_file_is_refused_and_its_target_kept(self):
+        self.join()
+        peer = self.cfg / "indexes" / "registry.d" / "peer.yaml"
+        peer.write_text("indexes: {}\n# peer entry\n")
+        (self.entry_file().parent / ".docs-add.lock").symlink_to(peer)
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 2, err)
+        self.assertEqual(peer.read_text(), "indexes: {}\n# peer entry\n")
+        self.assertNotIn("docs", self.entry())
+
+    def test_a_session_only_listed_beside_an_explicit_owner_may_not_add_docs(self):
+        self.join()
+        e = self.entry()
+        e["transcripts"]["sessions"] = [SID, SID2]
+        self.rewrite_entry(yaml.safe_dump({"indexes": {"fleet-dev-session": e}}))
+        self.who = indexes.Caller("session", ("Peer", SID2))
+        self.assertIsNotNone(refresh.owner_refusal(indexes.load_registry(), "fleet-dev-session",
+                                                   "add docs to"))
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 3, err)
+        self.assertEqual(self.digest(), before)
+        self.as_owner_session()
+        self.assertIsNone(refresh.owner_refusal(indexes.load_registry(), "fleet-dev-session"))
+
+    def test_an_index_in_an_undeclared_group_is_refused(self):
+        self.join()
+        e = self.entry()
+        e["group"] = "fepra"
+        self.rewrite_entry(yaml.safe_dump({"indexes": {"fleet-dev-session": e}}))
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 2, err)
+        self.assertIn("not declared", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_a_bad_include_glob_is_refused_before_any_write(self):
+        self.join()
+        self.as_owner_session()
+        before = self.digest()
+        for glob in ("/abs/*.md", str(self.emails / "*.md"), "~/notes/*.md", "**x/*.md", ""):
+            code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs",
+                                          str(self.emails), "--include", glob)
+            self.assertEqual(code, 2, (glob, err))
+            self.assertIn("glob", err, glob)
+        self.assertEqual(self.digest(), before)
+        code, out, err = self.run_cli("add", "--session", "Other", "--session-id", SID2, "--name", "o",
+                                      "--group", "oss", "--docs", str(self.emails), "--include", "/abs/*.md")
+        self.assertEqual(code, 2, err)
+        self.assertFalse((self.cfg / "indexes" / "registry.d" / "o.yaml").exists())
+
+    def test_labels_that_differ_only_in_case_are_duplicates(self):
+        self.join("--docs", str(self.notes))
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails),
+                                      "--label", "DOCS")
+        self.assertEqual((code, "labeled" in err), (2, True), err)
+        self.assertEqual(self.digest(), before)
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails),
+                                      "--docs", str(self.cfg.parent / "projects"), "--label", "Mail",
+                                      "--label", "mail")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.digest(), before)
+
+    def test_a_refresh_never_sweeps_a_linked_corpus_folder(self):
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        peer = self.data / "peer-corpus"
+        (peer / "docs" / "n").mkdir(parents=True)
+        (peer / "docs" / "n" / "theirs.md").write_text("# Theirs\n\nA peer note.\n")
+        index_dir = Path(refresh.ROOT) / "fleet-dev-session"
+        self.assertTrue(index_dir.is_relative_to(self.data))
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / "corpus").symlink_to(peer)
+        self.refresh_and_search("lanterns")
+        self.assertEqual(sorted(str(p.relative_to(peer)) for p in peer.rglob("*.md")),
+                         ["docs/n/theirs.md"])
+
+    def test_a_duplicate_folder_or_label_changes_nothing(self):
+        self.join("--docs", str(self.notes))
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.notes))
+        self.assertEqual((code, "already has a docs entry for" in err), (2, True))
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails),
+                                      "--label", "docs")
+        self.assertEqual((code, "labeled" in err), (2, True))
+        self.assertEqual(self.digest(), before)
+
+    def test_a_missing_folder_is_refused(self):
+        self.join()
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs",
+                                      str(self.cfg.parent / "absent"))
+        self.assertEqual((code, "does not exist" in err), (2, True))
+
+    def test_a_protected_index_takes_docs_only_while_its_scanner_rules_hold(self):
+        self.join(group="ferpa")
+        self.as_owner_session()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails))
+        self.assertEqual(code, 0, err)
+        use_layout(self, self.cfg, self.data, self.projects, packs=("education",))
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.notes))
+        self.assertEqual(code, 2)
+        self.assertIn("ferpa index cannot take a docs entry", err)
+        self.assertEqual(self.digest(), before)
+
+    def test_an_entry_outside_registry_d_is_refused(self):
+        write_registry(self.cfg / "indexes", entries={})
+        reg_file = self.cfg / "indexes" / "registry.yaml"
+        reg = yaml.safe_load(reg_file.read_text())
+        reg["indexes"] = {"inline": {"group": "oss", "owner_session": "Fleet Dev",
+                                     "owner_session_id": SID,
+                                     "privacy": {"allowlist": "inline/a.yaml"}, "tags": "inline/t.yaml"}}
+        reg_file.write_text(yaml.safe_dump(reg))
+        self.as_owner_session()
+        before = self.digest()
+        code, out, err = self.run_cli("docs", "add", "inline", "--docs", str(self.emails))
+        self.assertEqual((code, "by hand" in err), (2, True))
+        self.assertEqual(self.digest(), before)
+
+    def test_index_file_refusal_names_the_docs_add_command(self):
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        self.as_owner_session()
+        doc = self.emails / "new.md"
+        doc.write_text("# New\n\nFiled outside every docs entry.\n")
+        code, out, err = self.run_cli("file", str(doc))
+        self.assertIn("is not selected by any docs entry", str(code))
+        self.assertIn("fleetwatch index docs add fleet-dev-session --docs %s --include '**/*.md'"
+                      % self.emails, str(code))
+
+    def test_the_printed_command_runs_and_the_file_is_then_selected(self):
+        self.join("--docs", str(self.notes), "--include", "**/*.md")
+        self.as_owner_session()
+        doc = self.emails / "new.md"
+        doc.write_text("# New\n\nFiled outside every docs entry.\n")
+        code, out, err = self.run_cli("docs", "add", "fleet-dev-session", "--docs", str(self.emails),
+                                      "--include", "**/*.md")
+        self.assertEqual(code, 0, err)
+        reg = indexes.load_registry()
+        ix = refresh.Index("fleet-dev-session", reg["indexes"]["fleet-dev-session"], reg["defaults"])
+        found = [p.name for spec in ix.docs_specs() for p, _l, _r in refresh.doc_corpus.discover(spec)]
+        self.assertIn("new.md", found)
+
+
 # ----------------------------------------------------------------- guard on index commands
 
 class IndexNames(unittest.TestCase):

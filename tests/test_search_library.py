@@ -194,6 +194,109 @@ class SyntheticIndexes(unittest.TestCase):
         self.assertEqual(rows[0]["tags"], ["area:garden", "topic:soil"])
 
 
+HYPHEN = {
+    "colloquium.md": "# Honors colloquium\n\nThe colloquium proposal keeps seminars as a one-off "
+                     "event each spring, with a pushback plan for the fixed course model.",
+    "catalog.md": "# Catalog years\n\nThe 2026-2027 catalog lists the GT-Pathways courses and "
+                  "each co-requisite pairing.",
+    "other.md": "# Parking\n\nThe lot by the quay fills early on market days.",
+}
+
+
+class HyphenatedQueries(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.ix = engine.Index(make_index(cls.tmp.name, "hyphen", HYPHEN))
+        cls.ix.build()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_sentence_with_a_hyphenated_word_matches(self):
+        q = "advisor feedback fixed course model colloquium one-off seminars"
+        for similar in (False, True):
+            res = self.ix.search(q, similar=similar)
+            self.assertEqual(top_files(res, 1), ["colloquium.md"], similar)
+
+    def test_hyphenated_and_numeric_terms_match(self):
+        for q, want in (("one-off", "colloquium.md"), ("2026-2027", "catalog.md"),
+                        ("GT-Pathways", "catalog.md"), ("co-requisite", "catalog.md"),
+                        ("which co-requisite goes with GT-Pathways", "catalog.md"),
+                        ("2026-2027 requirements", "catalog.md")):
+            self.assertEqual(top_files(self.ix.search(q), 1), [want], q)
+
+    def test_deliberate_fts_syntax_still_runs_as_written(self):
+        self.assertEqual(top_files(self.ix.search('"one off"'), 1), ["colloquium.md"])
+        self.assertEqual(top_files(self.ix.search("quay NOT colloquium"), 1), ["other.md"])
+        self.assertEqual(top_files(self.ix.search("NEAR(colloquium seminars, 5)"), 1),
+                         ["colloquium.md"])
+        self.assertEqual(top_files(self.ix.search("heading:colloquium"), 1), ["colloquium.md"])
+        self.assertEqual(self.ix.search("colloquium AND quay").results, [])
+
+    def test_malformed_fts_syntax_is_not_broadened(self):
+        self.assertEqual(self.ix.search("colloquium AND (quay").results, [])
+
+    def test_unmatched_hyphenated_query_still_returns_nothing(self):
+        self.assertEqual(self.ix.search("zzz-qqq").results, [])
+
+
+REJECTED = {
+    "budget.md": "# Budget\n\nThe budget request covers lab supplies and travel this year.",
+    "deadline.md": "# Deadline\n\nThe deadline for every request is the first Friday of the term.",
+    "calendar.md": "# 2027 calendar\n\nThe 2027 term dates: 2027 spring, 2027 summer, 2027 fall.",
+    "catalog.md": "# Catalog years\n\nThe 2026-2027 catalog lists the CS-3600 course once.",
+    "other.md": "# Parking\n\nThe CS lab lot by the quay fills early on market days.",
+}
+
+
+class RejectedQueries(unittest.TestCase):
+    """Queries FTS5 rejects keep the results develop gave them; the punctuation rescue only adds
+    what the any-word retry would otherwise lose."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.ix = engine.Index(make_index(cls.tmp.name, "rejected", REJECTED))
+        cls.ix.build()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def bm25(self, query, loose):
+        con = engine.connect(self.ix.cfg)
+        self.addCleanup(con.close)
+        notes = []
+        rows = engine.bm25_search(con, query, engine.SearchOptions(), 20, loose=loose, notes=notes)
+        return sorted(Path(r["path"]).name for r, _s in rows), notes
+
+    def test_a_rejected_query_matches_its_words_as_before(self):
+        res = self.ix.search("budget 2027 deadline?")
+        self.assertEqual(sorted(top_files(res, 10)), ["budget.md", "deadline.md"])
+
+    def test_the_rescue_still_finds_a_range_no_other_word_matches(self):
+        files, notes = self.bm25("2026-2027 requirements", loose=False)
+        self.assertEqual(files, ["catalog.md"])
+        self.assertIn("FTS5 rejected the query's punctuation", " ".join(t for _k, t in notes))
+
+    def test_the_any_word_fallback_quotes_each_word(self):
+        self.assertEqual(engine.quoted_or(["one-off", 'say "hi"', "plain"]),
+                         '"one-off" OR "say  hi " OR "plain"')
+        files, notes = self.bm25("budget deadline supplies-list", loose=False)
+        self.assertEqual(files, ["budget.md", "deadline.md"])
+        self.assertEqual([k for k, _t in notes], ["any-word"])
+        self.assertIn("no chunk contains every word", notes[0][1])
+
+    def test_hybrid_keyword_search_keeps_ranges_and_codes(self):
+        self.assertEqual(self.bm25("2026-2027 funding timeline", loose=True)[0], ["catalog.md"])
+        self.assertEqual(self.bm25("CS-3600 syllabus policy", loose=True)[0], ["catalog.md"])
+        self.assertEqual(self.bm25("budget deadline", loose=True)[0], ["budget.md", "deadline.md"])
+        # An underscore separates words, as it does for the FTS5 tokenizer.
+        self.assertIn("deadline.md", self.bm25("friday_lab parking", loose=True)[0])
+
+
 class Errors(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

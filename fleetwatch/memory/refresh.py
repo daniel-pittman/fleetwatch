@@ -40,6 +40,7 @@ import json
 import os
 import re
 import resource
+import shlex
 import shutil
 import subprocess
 import sys
@@ -691,7 +692,7 @@ class Index:
         if self.docs_specs():
             docs = doc_corpus.convert_docs(self.docs_specs(), self.dir / "corpus" / "docs",
                                            self.state / "docs-manifest.json", self.scanner,
-                                           full=opts.full, opts=self.doc_options())
+                                           full=opts.full, opts=self.doc_options(), root=self.dir)
         beat()
         t_docs = time.time()
         if st["new"] or st.get("removed") or docs["changed"] or docs["removed"] or docs.get("dropped"):
@@ -701,8 +702,19 @@ class Index:
         beat()
         has_corpus = n_live > 0 or bool(docs["changed"]) or docs["unchanged"] > 0
         if has_corpus:
-            built, build_s, idx_line, retried = self.build_if(
-                changed or opts.build or not self.index_file.exists())
+            try:
+                built, build_s, idx_line, retried = self.build_if(
+                    changed or opts.build or not self.index_file.exists())
+            except BaseException:
+                # The old index still holds what this run removed or scrubbed: a session that
+                # left, withheld or rescrubbed records, dropped exchanges, a never-index or
+                # deleted document. A failed rebuild, such as one whose remaining corpus yields
+                # no chunks, must not leave that searchable, so after any corpus change the old
+                # index goes and the next refresh rebuilds it.
+                if (changed or st.get("removed") or withheld or rescrubbed or stale
+                        or any(r.get("dropped") for r in records) or docs.get("dropped")):
+                    self.index_file.unlink(missing_ok=True)
+                raise
         else:
             if self.index_file.exists():
                 self.index_file.unlink()
@@ -726,6 +738,7 @@ class Index:
             docs_unchanged=docs["unchanged"], doc_errors=docs["errors"],
             doc_converted_by_type=docs["by_type"],
             doc_skipped=[list(x) for x in docs["skipped"]],
+            doc_never_index=docs.get("never_index", 0),
             doc_columns_dropped=docs["dropped_columns"],
             doc_recalculated=docs.get("recalculated", 0),
             doc_recalc_failed=docs.get("recalc_failed", 0), ok=True)
@@ -781,7 +794,7 @@ class Index:
         t0 = time.time()
         docs = doc_corpus.convert_docs(self.docs_specs(), self.dir / "corpus" / "docs",
                                        self.state / "docs-manifest.json", self.scanner, only=path,
-                                       opts=self.doc_options())
+                                       opts=self.doc_options(), root=self.dir)
         built, build_s, _line, _retried = self.build_if(bool(docs["changed"] or docs["removed"]))
         return dict(index=self.name, path=path, reconverted=docs["changed"],
                     unchanged=docs["unchanged"], errors=docs["errors"], built=built,
@@ -899,6 +912,22 @@ def _run_plain_locked(name, entry, opts, state, lock):
     return True
 
 
+def print_docs_detail(name, info):
+    """The docs lines of a run summary. Files the never-index rule skips are counted, never
+    named."""
+    if info.get("doc_converted_by_type") or info.get("doc_skipped") or info.get("doc_errors"):
+        print("[%s] docs converted by type %s; %d skipped, %d failed, %d columns dropped"
+              % (name, json.dumps(info.get("doc_converted_by_type", {}), sort_keys=True),
+                 len(info.get("doc_skipped", [])), len(info.get("doc_errors", [])),
+                 sum((info.get("doc_columns_dropped") or {}).values())))
+        for fn, why in info.get("doc_skipped", []):
+            print("[%s]   skipped %s (%s)" % (name, fn, why))
+    if info.get("doc_never_index"):
+        n = info["doc_never_index"]
+        print("[%s] skipped %d file%s by the never-index rule (folder or file name)"
+              % (name, n, "" if n == 1 else "s"))
+
+
 def run_one(reg, name, opts, plan=None):
     if plan is None:
         plan = getattr(opts, "routing_plan", None)
@@ -940,13 +969,7 @@ def run_one(reg, name, opts, plan=None):
     if info.get("sessions_removed") or info.get("sessions_held"):
         print("[%s] sessions without a transcript: %d held from stored records, %d removed "
               "from the index" % (name, info.get("sessions_held", 0), info.get("sessions_removed", 0)))
-    if info.get("doc_converted_by_type") or info.get("doc_skipped") or info.get("doc_errors"):
-        print("[%s] docs converted by type %s; %d skipped, %d failed, %d columns dropped"
-              % (name, json.dumps(info.get("doc_converted_by_type", {}), sort_keys=True),
-                 len(info.get("doc_skipped", [])), len(info.get("doc_errors", [])),
-                 sum((info.get("doc_columns_dropped") or {}).values())))
-        for fn, why in info.get("doc_skipped", []):
-            print("[%s]   skipped %s (%s)" % (name, fn, why))
+    print_docs_detail(name, info)
     print("[%s] tags: %d attempted, %d tagged, %d failed, %d deferred (%d cached)"
           % (name, t["attempted"], t["tagged"], t["failed"], t["deferred"], info["tags_cached"]))
     if t.get("usage"):
@@ -1094,12 +1117,15 @@ def cmd_status(reg, full_reg=None):
 
 def cmd_triage(reg, name):
     ix = Index(name, reg["indexes"][name], reg["defaults"])
+    # Triage prints names found in documents, so it reads only the documents a refresh would
+    # index: the rule packs' private_paths apply, and a scanner without rules stops it here.
+    private_re = ix.scanner.rules.private_path_re
     tri = {}
     _, _, st = ix.transcripts(triage=tri)
     texts = []
     for spec in ix.docs_specs():
         ctx = doc_corpus.Ctx(ix.doc_options(), ix.state)
-        for p, _label, _rel in doc_corpus.discover(spec, ctx.opts):
+        for p, _label, _rel in doc_corpus.discover(spec, ctx.opts, private_path_re=private_re):
             try:
                 texts.append([doc_corpus.to_markdown(p, ctx)])
             except Exception:
@@ -1124,12 +1150,18 @@ def guard(reg, name):
         sys.exit(3)
 
 
-def owner_refusal(reg, name):
-    """Why the calling session may not change index `name` destructively, or None. Reading
-    is not enough: only the owner at an interactive terminal or the session that
-    owns the index may."""
+def owner_refusal(reg, name, action="remove sessions from"):
+    """Why the calling session may not change index `name` (`action` names the change in the
+    refusal), or None. Reading is not enough: only the owner at an interactive terminal or the
+    session that owns the index may."""
     from fleetwatch import indexes
     caller = indexes.classify_caller()
+    owner_id = (indexes.all_entries(reg).get(name) or {}).get("owner_session_id")
+    # An explicit owner id names the one session that may change the index; a session merely
+    # listed in its transcripts.sessions may read it but not change it.
+    if caller.kind == "session" and owner_id and str(owner_id) != str(caller.session[1]):
+        return ("refused: index %r is not owned by this session; only the session its "
+                "owner_session_id names, or the owner at a terminal, may %s it" % (name, action))
     if caller.kind == "owner" or (caller.kind == "session" and
                                    name in indexes.owned_by(reg, *caller.session)):
         return None
@@ -1137,7 +1169,7 @@ def owner_refusal(reg, name):
         return ("refused: index %r cannot be changed because the caller was not identified "
                 "as a Claude session or the owner (%s)" % (name, caller.sign))
     return ("refused: index %r is not owned by this session; only its owner session, or the "
-            "owner at a terminal, may remove sessions from it" % name)
+            "owner at a terminal, may %s it" % (name, action))
 
 
 def owner_guard(reg, name):
@@ -1191,6 +1223,20 @@ def private_dirs(*dirs):
             pass
 
 
+def not_selected_hint(argv):
+    """For `index-now NAME PATH` refused because no docs entry selects PATH: the command that
+    adds the file's folder to an index the caller owns (empty for any other command)."""
+    if len(argv) < 3 or argv[0] != "index-now":
+        return ""
+    path = Path(os.path.abspath(os.path.expanduser(argv[2])))
+    if not path.parent.is_dir():
+        return ""
+    return ("\nTo index it, the index's owner session adds its folder:\n"
+            "  fleetwatch index docs add %s --docs %s --include %s"
+            % (shlex.quote(argv[1]), shlex.quote(str(path.parent)),
+               shlex.quote("**/*" + (path.suffix.lower() or ".md"))))
+
+
 def main(argv=None):
     """CLI entry point. Library failures that today's commands report as a message and exit
     1 (an unknown index name, a path no docs entry selects) are caught here. Everything it
@@ -1201,7 +1247,9 @@ def main(argv=None):
         sys.exit("settings: %s" % SETTINGS_ERROR)
     try:
         return _main(sys.argv[1:] if argv is None else list(argv))
-    except (UnknownIndex, doc_corpus.NotSelected, routing.RoutingError) as e:
+    except doc_corpus.NotSelected as e:
+        sys.exit(str(e) + not_selected_hint(sys.argv[1:] if argv is None else list(argv)))
+    except (UnknownIndex, routing.RoutingError) as e:
         sys.exit(str(e))
 
 
