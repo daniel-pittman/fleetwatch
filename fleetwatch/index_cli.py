@@ -350,6 +350,11 @@ def _docs_entries(paths, include, labels, single_label="docs"):
     for i, raw in enumerate(paths):
         folder = os.path.abspath(os.path.expanduser(raw))
         for g in include:
+            # Python 3.13 and later accept "**x" and read it as "*", where 3.11 and 3.12 raise,
+            # so a "**" that is not a whole path part is refused here on every version.
+            if any("**" in part and part != "**" for part in g.split("/")):
+                raise IndexesError("--include glob %r is not valid ('**' must be a whole path "
+                                   "part, as in '**/*.md')" % g)
             try:
                 next(iter(Path(folder).glob(g)), None)
             except (ValueError, NotImplementedError) as e:
