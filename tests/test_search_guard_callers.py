@@ -227,7 +227,12 @@ class CallerGuardTests(unittest.TestCase):
                 indexer.return_value.main.assert_not_called()
 
     def test_direct_refresh_all_refuses_agent_but_allows_scheduler(self):
-        with mock.patch.object(refresh, "load_registry", return_value=REG), \
+        # The whole-registry run lock lives under refresh.ROOT; a private folder keeps the test
+        # off the real data folder and clear of a scheduled refresh holding the real lock.
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        with mock.patch.object(refresh, "ROOT", Path(folder.name)), \
+                mock.patch.object(refresh, "load_registry", return_value=REG), \
                 mock.patch.object(refresh, "SETTINGS") as settings, \
                 mock.patch.object(refresh, "resolve_routing", side_effect=RuntimeError("reached routing")):
             settings.protected_groups = PROTECTED

@@ -62,6 +62,122 @@ CHUNK_CHARS = 1200         # a table chunk stays under the 1500-character search
 CELL_MAX = 300
 SKIP_DIRS = {"node_modules", ".git", "__pycache__", ".venv", "venv"}
 
+# A docs entry never indexes a file below a folder whose name holds one of these words:
+# identity, roster, grade and instructor-only folders hold student records. A folder name is
+# split into words at punctuation, camelCase and letter/digit boundaries, and a word matches
+# when it starts with one of these ("FinalGrades2026", "gradesheets"; not "upgrade" or
+# "graduate"). A file name is split the same way and is never-index only when its first word
+# starts with a record-shaped stem (FILE_WORDS: "roster.md", "Gradebook2026.md"), since notes
+# are often named for such a topic ("grading-rubric.md", "feedback-on-grades.md"); the
+# scanner's rule-pack `private_paths` apply to file and folder names alike.
+# `discover` enforces both on every refresh, for the docs folder itself and every path below
+# it, so a glob such as **/*.md cannot reach such a folder, and indexes built before the rule
+# lose those files on their next refresh.
+NEVER_INDEX_WORDS = ("roster", "grade", "grading", "identity", "identities", "instructor")
+FILE_WORDS = ("roster", "grade", "identity", "instructor")
+
+NAME_WORD_RE = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
+def name_words(name):
+    """The lowercase words of a folder name: split at every character that is not an ASCII
+    letter or digit, at camelCase humps and at letter/digit boundaries."""
+    return [w.lower() for piece in re.split(r"[^A-Za-z0-9]+", str(name))
+            for w in NAME_WORD_RE.findall(piece)]
+
+
+def folder_word(name):
+    """The never-index word a folder name starts one of its words with, or None."""
+    for word in name_words(name):
+        for bad in NEVER_INDEX_WORDS:
+            if word.startswith(bad):
+                return bad
+    return None
+
+
+def file_word(name):
+    """The record-shaped stem a file name's first word starts with, or None."""
+    words = name_words(name)
+    return next((bad for bad in FILE_WORDS if words and words[0].startswith(bad)), None)
+
+
+def rule_hit(text, private_path_re):
+    """The text a private_paths rule matches in `text`, or None. A zero-width match is a
+    match too, reported by a fixed non-empty label so a caller's truth test sees it."""
+    if private_path_re is None:
+        return None
+    m = private_path_re.search(str(text))
+    if m is None:
+        return None
+    return m.group(0) or "a private_paths rule"
+
+
+def never_index_hit(parts, private_path_re=None, is_file=True):
+    """Why the path made of `parts` is never-index, or None. The words apply to its folder
+    parts (every part when `is_file` is false), and FILE_WORDS to the first word of a file's
+    name. A private_paths rule is tried against each
+    part, each folder part followed by `/`, and the parts joined by `/` with and without a
+    leading `/` (a folder ends in `/`), so a rule such as `exports/restricted/` matches."""
+    parts = [str(x) for x in parts if str(x) not in ("", os.sep)]
+    folders = parts if not is_file else parts[:-1]
+    for f in folders:
+        hit = folder_word(f)
+        if hit:
+            return hit
+    if is_file and parts:
+        hit = file_word(parts[-1])
+        if hit:
+            return hit
+    if private_path_re is None:
+        return None
+    joined = "/".join(parts) + ("" if is_file else "/")
+    for text in parts + [f + "/" for f in folders] + [joined, "/" + joined]:
+        hit = rule_hit(text, private_path_re)
+        if hit:
+            return hit
+    return None
+
+
+def link_below(root, target):
+    """The first symbolic link among the folders from `root` (not itself checked) down to
+    `target` (checked), compared without resolving, or None. A target outside `root` is
+    returned as it is, so a caller refuses it."""
+    root, target = Path(os.path.abspath(root)), Path(os.path.abspath(target))
+    if not target.is_relative_to(root):
+        return target
+    p = root
+    for part in target.relative_to(root).parts:
+        p = p / part
+        if p.is_symlink():
+            return p
+    return None
+
+
+def safe_corpus_path(corpus_dir, rel, root=None):
+    """corpus_dir / rel, resolved, when it stays inside the corpus folder and no folder from
+    `root` (default: the corpus folder's parent) down to it is a symbolic link. A linked corpus
+    folder would let a refresh write into, or sweep, another index's corpus. Raises ValueError
+    otherwise, before anything is written or deleted."""
+    link = link_below(Path(corpus_dir).parent if root is None else root, Path(corpus_dir) / rel)
+    if link is not None:
+        raise ValueError("corpus path %r passes through the symbolic link %s; nothing is written "
+                         "or removed through a link" % (str(rel), link))
+    base = Path(corpus_dir).resolve()
+    dest = (base / rel).resolve()
+    if not dest.is_relative_to(base):
+        raise ValueError("corpus path %r leaves the corpus folder" % str(rel))
+    return dest
+
+
+def check_label(label):
+    """A docs label becomes the first folder of its corpus paths, so it is one plain path
+    part: not empty, not . or .., no separator, not absolute."""
+    text = str(label)
+    if (not text or text in (".", "..") or "/" in text or "\\" in text or "\0" in text
+            or os.path.isabs(text)):
+        raise ValueError("docs label %r is not a single plain path part" % text)
+    return text
+
 
 class Skip(Exception):
     """A file that is deliberately not converted; the message is the counted reason."""
@@ -670,14 +786,17 @@ def supported_exts(opts):
     return exts | IMAGE_EXTS if opts.get("ocr") else exts
 
 
-def discover(spec, opts=None, skipped=None):
+def discover(spec, opts=None, skipped=None, private_path_re=None, never=None):
     """Yield (source Path, label, relative Path) for every file the spec selects. A selected
     file that is not converted is appended to `skipped` as ((source, label, relative), reason);
-    convert_docs reports it under its scrubbed name."""
+    convert_docs reports it under its scrubbed name. A file whose full path, as listed or as
+    a link resolves, is never-index (never_index_hit: the words on its folders, which include
+    the docs folder and the folders above it, and `private_path_re`) is not yielded; each one
+    is appended to `never` (a list) when given, so the caller can report the count."""
     opts = dict(DEFAULT_OPTS, **(opts or {}))
     exts = supported_exts(opts)
     base = Path(os.path.expanduser(spec["path"]))
-    label = spec.get("label") or base.name
+    label = check_label(spec.get("label") or base.name)
     seen = set()
     if not base.exists():
         return
@@ -692,9 +811,17 @@ def discover(spec, opts=None, skipped=None):
             seen.add(p)
             # A link to a file outside the folder would index text the folder's audience was
             # never given (a cloned repo or an unpacked archive can carry such links).
-            if not p.resolve().is_relative_to(root):
+            real = p.resolve()
+            if not real.is_relative_to(root):
                 if skipped is not None:
                     skipped.append(((p, label, rel), "symlink outside the folder"))
+                continue
+            # The check covers the path as listed and the path the link resolves to, each
+            # from the file system root, so the docs folder itself and a root link are checked.
+            if (never_index_hit(base.absolute().parts + rel.parts, private_path_re)
+                    or never_index_hit(real.parts, private_path_re)):
+                if never is not None:
+                    never.append(p)
                 continue
             ext = p.suffix.lower()
             if ext not in exts:
@@ -712,7 +839,8 @@ def options_key(opts):
     return hashlib.sha1(json.dumps([CONV_VERSION, opts], sort_keys=True).encode()).hexdigest()[:12]
 
 
-def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=False, opts=None):
+def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=False, opts=None,
+                 root=None):
     """Convert changed documents. `only` (a path) limits the run to that one source file and
     skips the deletion sweep. Returns dict(changed, removed, unchanged, errors, categories,
     skipped, by_type, dropped_columns, dropped). `opts` overrides DEFAULT_OPTS (the index's
@@ -726,7 +854,16 @@ def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=Fals
     A document the scanner drops (an anonymous id paired with a name, in its text or in its
     names) is never written: its manifest entry records the reason as `skip`, it is listed in
     `skipped` and `dropped`, its scan categories are counted, and an earlier copy of it in the
-    corpus is removed."""
+    corpus is removed.
+
+    `root` is the index's data folder (default: the corpus folder's parent). When the corpus
+    folder or a folder between `root` and it is a symbolic link, nothing is converted, written
+    or swept (ValueError)."""
+    root = Path(corpus_dir).parent if root is None else Path(root)
+    link = link_below(root, corpus_dir)
+    if link is not None:
+        raise ValueError("the corpus folder %s passes through the symbolic link %s; nothing was "
+                         "converted, written or removed" % (corpus_dir, link))
     ctx = Ctx(opts, manifest_path.parent)
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     stored_version = manifest.get("_scan_version")
@@ -739,8 +876,10 @@ def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=Fals
         full = True
     found_skipped = []
     files = {}
+    private_re = getattr(getattr(scanner, "rules", None), "private_path_re", None)
+    never = []
     for spec in specs:
-        for p, label, rel in discover(spec, ctx.opts, found_skipped):
+        for p, label, rel in discover(spec, ctx.opts, found_skipped, private_re, never):
             files[manifest_key(p)] = (p, label, rel)
     named = corpus_names(scanner, dict(files, **{manifest_key(f[0]): f for f, _w in found_skipped}))
     skipped = [(named[manifest_key(f[0])]["name"], why) for f, why in found_skipped]
@@ -752,7 +891,7 @@ def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=Fals
     new_entries = dict(stored) if only else {}
     res = dict(changed=[], removed=[], unchanged=0, errors=[], categories={}, skipped=skipped,
                by_type={}, dropped_columns=ctx.dropped, recalculated=0, recalc_failed=0,
-               dropped=[])
+               dropped=[], never_index=len(never))
     targets = files
     if only:
         want = str(Path(os.path.expanduser(only)).resolve())
@@ -830,8 +969,8 @@ def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=Fals
                 old_out = (stored.get(key) or {}).get("out")
                 new_entries[key] = dict(mtime=st.st_mtime, size=st.st_size, sha1=sha, out=None,
                                         scan=cats, skip=why)
-                if old_out and (corpus_dir / old_out).exists():
-                    (corpus_dir / old_out).unlink()
+                if old_out and safe_corpus_path(corpus_dir, old_out, root).exists():
+                    safe_corpus_path(corpus_dir, old_out, root).unlink()
                     res["removed"].append(old_out)
                 continue
             body = fields[0].rstrip() + "\n"
@@ -844,15 +983,15 @@ def convert_docs(specs, corpus_dir, manifest_path, scanner, only=None, full=Fals
                                         skip="same text as another file")
                 continue
             seen_text[tsha] = key
-            dest = corpus_dir / out
+            dest = safe_corpus_path(corpus_dir, out, root)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(body)
             # A one-file run skips the sweep, so this file's copy under its old spelling (an
             # older rule left more of its name) is removed here.
             old_out = (stored.get(key) or {}).get("out")
-            if (only and old_out and old_out != out and (corpus_dir / old_out).exists()
+            if (only and old_out and old_out != out and safe_corpus_path(corpus_dir, old_out, root).exists()
                     and not any(e.get("out") == old_out for k, e in new_entries.items() if k != key)):
-                (corpus_dir / old_out).unlink()
+                safe_corpus_path(corpus_dir, old_out, root).unlink()
                 res["removed"].append(old_out)
             new_entries[key] = dict(mtime=st.st_mtime, size=st.st_size, sha1=sha,
                                     out=out, scan=cats, text_sha=tsha)

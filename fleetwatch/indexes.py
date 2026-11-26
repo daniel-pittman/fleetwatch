@@ -416,3 +416,76 @@ def tilde(path):
 
 def slug(text):
     return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "session"
+
+
+# ------------------------------------------------------------------ docs entries
+
+# A docs entry never points at identity, roster, grade or instructor-only folders. The word
+# list and the match live in doc_corpus (NEVER_INDEX_WORDS, never_index_hit), which also
+# applies them to the docs folder and every file below it on each refresh; the scanner's
+# `private_paths` (rule packs) are applied as well. Both `index add --docs` and `index docs add`
+# call docs_path_problem.
+
+def docs_path_problem(path, include=()):
+    """Why a docs entry may not select `path` (a folder) with these include globs, or None.
+    The folder is checked as given and as it resolves, and each glob joined to it. Refuses when
+    it cannot decide: a rule pack that fails to load is a refusal."""
+    from .memory import doc_corpus
+    given = os.path.abspath(os.path.expanduser(str(path)))
+    checks = [(given, Path(given).parts, False),
+              (os.path.realpath(given), Path(os.path.realpath(given)).parts, False)]
+    checks += [(str(g), Path(given).parts + Path(str(g)).parts, True) for g in include]
+    try:
+        from .memory.privacy_scan import RuleSet
+        rx = RuleSet(refresh().SETTINGS.rule_packs).private_path_re
+    except Exception as e:
+        return "refused: the privacy rules could not be loaded to check %s (%s)" % (tilde(given), e)
+    for text, parts, is_file in checks:
+        hit = doc_corpus.never_index_hit(parts, rx, is_file=is_file)
+        if hit:
+            return ("refused: %r names %r; identity, roster, grade and instructor-only folders "
+                    "are never indexed" % (text, hit))
+    return None
+
+
+def subfolders(folder):
+    """Folders directly under `folder` that a docs glob can reach (no dot-folders, no
+    SKIP_DIRS)."""
+    from .memory import doc_corpus
+    try:
+        return sorted(p.name for p in Path(folder).iterdir()
+                      if p.is_dir() and not p.name.startswith(".") and p.name not in doc_corpus.SKIP_DIRS)
+    except OSError:
+        return []
+
+
+def include_warning(folder, include):
+    """A warning when no include glob contains `**/` and the folder has subfolders, else None."""
+    if any("**/" in g for g in include):
+        return None
+    subs = subfolders(folder)
+    if not subs:
+        return None
+    return ("warning: no --include glob contains '**/' and %s has %d subfolder%s (%s), so the "
+            "documents inside them are not indexed. Add --include '**/*.md' (or the extension "
+            "you need)." % (tilde(folder), len(subs), "" if len(subs) == 1 else "s",
+                            ", ".join(subs[:3]) + (", ..." if len(subs) > 3 else "")))
+
+
+def match_counts(spec):
+    """(documents the docs entry selects, supported files in its folder) for one docs spec."""
+    from .memory import doc_corpus
+    base = Path(os.path.expanduser(spec["path"]))
+    exts = doc_corpus.supported_exts(doc_corpus.DEFAULT_OPTS)
+    total = 0
+    if base.is_dir():
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in doc_corpus.SKIP_DIRS and not d.startswith(".")]
+            total += sum(1 for f in files if not f.startswith(".") and Path(f).suffix.lower() in exts)
+    try:
+        from .memory.privacy_scan import RuleSet
+        rx = RuleSet(refresh().SETTINGS.rule_packs).private_path_re
+    except Exception:
+        rx = None
+    matched = sum(1 for _ in doc_corpus.discover(spec, private_path_re=rx))
+    return matched, total

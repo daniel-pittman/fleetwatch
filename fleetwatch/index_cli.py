@@ -6,7 +6,8 @@
     build NAME                        rebuild the search engine's index only
     retag NAME [--all] | discover | triage NAME
     forget NAME SESSION_ID [--force]  remove one session from an index (records, tags, corpus)
-    add [--session NAME] --group G [--docs PATH --include GLOB ...]
+    add [--session NAME] --group G [--docs PATH ... --include GLOB ...]
+    docs add NAME --docs PATH [--include GLOB ...] [--label L]   add a docs folder to your index
     add --source codex|antigravity --group G [--path DIR] [--name INDEX]
     migrate NAME --from OLD_ROOT [--force]
     verify NAME [--baseline FILE] [--compare-old OLD_ROOT]
@@ -20,6 +21,7 @@ named index run the same trust guard as `search` first and exit 3 when it refuse
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -29,6 +31,8 @@ from . import data, indexes
 from .indexes import IndexesError, tilde
 
 USAGE = __doc__
+
+LABEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]*")
 
 TAGS_TEMPLATE = """\
 # Taxonomy for the tagger: what a session is about, and which areas and kinds an exchange has.
@@ -224,9 +228,13 @@ def cmd_add(reg, args):
     ap.add_argument("--path", help="the sessions folder of --source codex (default "
                                    "~/.codex/sessions) or antigravity (default "
                                    "~/.gemini/antigravity-cli/conversations)")
-    ap.add_argument("--docs", help="a folder of reference documents to index")
-    ap.add_argument("--include", action="append", help="glob under --docs (repeatable; default **/*.md)")
-    ap.add_argument("--label", default="docs", help="label of the --docs folder")
+    ap.add_argument("--docs", action="append",
+                    help="a folder of reference documents to index (repeatable: one docs entry each)")
+    ap.add_argument("--include", action="append",
+                    help="glob under every --docs folder (repeatable; default **/*.md)")
+    ap.add_argument("--label", action="append",
+                    help="label of a --docs folder (default docs for one folder, else the folder's "
+                         "name); give one per --docs, in order")
     a = ap.parse_args(args)
     r = indexes.refresh()
     paths = data.default_paths()
@@ -272,6 +280,7 @@ def cmd_add(reg, args):
     if groups and a.group not in groups:
         return _fail("group %r is not declared in the registry (have: %s)"
                      % (a.group, ", ".join(sorted(groups))))
+    docs = _docs_entries(a.docs or [], a.include, a.label)
     if whole:
         entry = {"group": a.group,
                  "transcripts": {"source": a.source, "path": tilde(folder)}}
@@ -279,9 +288,8 @@ def cmd_add(reg, args):
         entry = {"group": a.group, "owner_session": sname, "owner_session_id": sid,
                  "transcripts": {"project_dir": [tilde(f) for f in folders], "sessions": [sid],
                                  "exclude_automated": True}}
-    if a.docs:
-        entry["docs"] = [{"label": a.label, "path": tilde(os.path.abspath(os.path.expanduser(a.docs))),
-                          "include": a.include or ["**/*.md"]}]
+    if docs:
+        entry["docs"] = docs
     entry["privacy"] = {"allowlist": "%s/scan_allowlist.yaml" % name}
     entry["tags"] = "%s/tags.yaml" % name
     cfg = Path(r.CONFIG_ROOT) / name
@@ -319,6 +327,251 @@ def cmd_add(reg, args):
     print("registry entry: %s" % tilde(entry_file))
     print("config folder: %s (tags.yaml, probes.yaml, scan_allowlist.yaml are templates to edit)"
           % tilde(cfg))
+    _print_docs_report(docs)
+    print("next: fleetwatch index refresh %s" % name)
+    return 0
+
+
+def _docs_entries(paths, include, labels, single_label="docs"):
+    """The registry `docs:` entries for `--docs` folders, each refused by docs_path_problem
+    before anything is written. One folder is labeled `docs` unless told otherwise; several are
+    labeled by folder name (`single_label=None` labels one by folder name too), and every label
+    and folder must be distinct."""
+    include = list(include or ["**/*.md"])
+    labels = list(labels or [])
+    for g in include:
+        if not g or os.path.isabs(os.path.expanduser(g)):
+            raise IndexesError("--include glob %r is not allowed: a glob is relative to its --docs "
+                               "folder and not empty" % g)
+    if labels and len(labels) != len(paths):
+        raise IndexesError("give one --label per --docs folder, or none (got %d labels for %d folders)"
+                           % (len(labels), len(paths)))
+    out = []
+    for i, raw in enumerate(paths):
+        folder = os.path.abspath(os.path.expanduser(raw))
+        for g in include:
+            try:
+                next(iter(Path(folder).glob(g)), None)
+            except (ValueError, NotImplementedError) as e:
+                raise IndexesError("--include glob %r is not valid (%s)" % (g, e))
+        why = indexes.docs_path_problem(folder, include)
+        if why:
+            raise Refused(why)
+        if labels:
+            label = labels[i]
+        elif single_label and len(paths) == 1:
+            label = single_label
+        else:
+            label = re.sub(r"[^A-Za-z0-9._ -]+", "-", Path(folder).name).lstrip("._ -") or "docs"
+        if not LABEL_RE.fullmatch(label) or ".." in label:
+            raise IndexesError("docs label %r is not allowed: a label becomes a folder name in the "
+                               "corpus, so use letters, digits, '.', '_', '-' and spaces, starting "
+                               "with a letter or digit, with no '..' or separator" % label)
+        out.append({"label": label, "path": tilde(folder), "include": list(include)})
+    seen_paths = [os.path.realpath(os.path.expanduser(d["path"])) for d in out]
+    # Labels are compared without case: each is a corpus folder, one folder on macOS.
+    if len(set(seen_paths)) != len(seen_paths) or len({d["label"].casefold() for d in out}) != len(out):
+        raise IndexesError("every --docs folder needs its own path and its own --label")
+    return out
+
+
+def _print_docs_report(entries):
+    """After a docs entry is written: the glob warning, and how many documents it selects."""
+    for d in entries:
+        warn = indexes.include_warning(os.path.expanduser(d["path"]), d["include"])
+        if warn:
+            print(warn)
+        matched, total = indexes.match_counts(d)
+        print("docs %s: %d docs matched of %d files" % (d["label"], matched, total))
+
+
+def _entry_file(name):
+    """The one registry.d file that defines index `name`. Refuses an entry that lives in
+    registry.yaml or in two files, since there is then no single file this session owns."""
+    rdir = Path(indexes.refresh().REGISTRY_DIR)
+    hits = []
+    for f in sorted(rdir.glob("*.yaml")) if rdir.is_dir() else []:
+        try:
+            part = yaml.safe_load(f.read_text()) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if name in (part.get("indexes") or {}):
+            hits.append(f)
+    if len(hits) != 1:
+        raise IndexesError("the registry entry for %s is not in exactly one registry.d file, so "
+                           "nothing was changed; edit its docs list by hand" % name)
+    return hits[0]
+
+
+def _lone_entry(text, name, fname):
+    """The parsed registry.d file when it defines index `name` and nothing else, with no YAML
+    anchors or aliases; refuses otherwise. A docs change then cannot reach another index's
+    entry, through a shared mapping or a second key."""
+    try:
+        part = yaml.safe_load(text) or {}
+        tokens = list(yaml.scan(text))
+    except yaml.YAMLError as e:
+        raise IndexesError("%s does not parse (%s); nothing was changed" % (fname, e))
+    if any(isinstance(t, (yaml.AnchorToken, yaml.AliasToken)) for t in tokens):
+        raise IndexesError("%s uses YAML anchors or aliases, so nothing was changed; edit its "
+                           "docs list by hand" % fname)
+    ents = part.get("indexes") if isinstance(part, dict) else None
+    if not isinstance(ents, dict) or list(part) != ["indexes"] or list(ents) != [name]:
+        raise IndexesError("%s holds more than the entry for %s, so nothing was changed; edit its "
+                           "docs list by hand" % (fname, name))
+    if not isinstance(ents[name], dict):
+        raise IndexesError("index %s is no longer in %s; nothing was changed" % (name, fname))
+    return part
+
+
+def _last_line(node):
+    """The 0-based line after which text can follow `node`: the line its last scalar ends on."""
+    while isinstance(node, (yaml.MappingNode, yaml.SequenceNode)) and node.value:
+        last = node.value[-1]
+        node = last[1] if isinstance(node, yaml.MappingNode) else last
+    end = node.end_mark
+    return end.line if end.column > 0 else end.line - 1
+
+
+def _docs_text(text, name, docs):
+    """`text` with `docs` appended to the docs list of index `name`, by inserting lines only, so
+    every comment and line of the file stays as written and in place. Returns None when the
+    entry is not in the block layout this can extend."""
+    root = yaml.compose(text)
+    ents = next(v for k, v in root.value if k.value == "indexes")
+    entry = next(v for k, v in ents.value if k.value == name)
+    if not isinstance(entry, yaml.MappingNode) or entry.flow_style or not entry.value:
+        return None
+    seq = next((v for k, v in entry.value if k.value == "docs"), None)
+    if seq is None:
+        col = entry.value[0][0].start_mark.column
+        block = yaml.safe_dump({"docs": docs}, sort_keys=False, default_flow_style=False)
+        after = _last_line(entry)
+    elif isinstance(seq, yaml.SequenceNode) and not seq.flow_style and seq.value:
+        col = seq.start_mark.column
+        block = yaml.safe_dump(docs, sort_keys=False, default_flow_style=False)
+        after = _last_line(seq)
+    else:
+        return None
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    add = ["%s%s\n" % (" " * col, ln) if ln else "\n" for ln in block.splitlines()]
+    return "".join(lines[:after + 1] + add + lines[after + 1:])
+
+
+def _lock(folder):
+    """An exclusive lock on folder/.docs-add.lock, opened without following a link and never
+    truncated, so a lock file linked to another file cannot change that file."""
+    import fcntl
+    import stat
+    path = folder / ".docs-add.lock"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as e:
+        raise IndexesError("the lock file %s could not be opened safely (%s); nothing was changed"
+                           % (tilde(path), e.strerror))
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise IndexesError("the lock file %s is not a regular file; nothing was changed" % tilde(path))
+    lock = os.fdopen(fd, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def _append_docs(name, docs):
+    """Append docs entries to index `name` in its registry.d file, under a lock and through a
+    temp file. The file must hold only that entry; the new entries are inserted as lines, so
+    every comment stays where it was. A docs entry already there for the same folder or label
+    (labels compared without case) refuses the whole change."""
+    import copy
+    from . import config
+    entry_file = _entry_file(name)
+    with _lock(entry_file.parent):
+        text = entry_file.read_text()
+        part = _lone_entry(text, name, entry_file.name)
+        entry = part["indexes"][name]
+        have = entry.get("docs") or []
+        if not isinstance(have, list) or not all(isinstance(d, dict) for d in have):
+            raise IndexesError("the docs list of %s in %s is not a list of entries; edit it by hand"
+                               % (name, entry_file.name))
+        real = {os.path.realpath(os.path.expanduser(str(d.get("path")))) for d in have}
+        labels = {str(d.get("label") or Path(os.path.expanduser(str(d.get("path")))).name).casefold()
+                  for d in have}
+        for d in docs:
+            if os.path.realpath(os.path.expanduser(d["path"])) in real:
+                raise IndexesError("index %s already has a docs entry for %s; nothing was changed"
+                                   % (name, d["path"]))
+            if d["label"].casefold() in labels:
+                raise IndexesError("index %s already has a docs entry labeled %r; pass --label "
+                                   "to name this one differently. Nothing was changed"
+                                   % (name, d["label"]))
+        want = copy.deepcopy(part)
+        want["indexes"][name]["docs"] = list(have) + docs
+        new = _docs_text(text, name, docs)
+        if new is None or yaml.safe_load(new) != want:
+            raise IndexesError("the entry for %s in %s is not in a layout this command can extend "
+                               "line by line, so nothing was changed; edit its docs list by hand"
+                               % (name, entry_file.name))
+        config.atomic_write(str(entry_file), new)
+    return entry_file
+
+
+def cmd_docs(reg, args):
+    """`index docs add NAME --docs PATH`: a docs entry for an index the caller owns. Applies the
+    refusals `index add` applies (direct caller, the trust guard, the never-index folders, a
+    protected group's scanner rules) and the ownership rule `forget` applies."""
+    if not args or args[0] != "add":
+        return _fail("usage: fleetwatch index docs add NAME --docs PATH [--include GLOB ...] "
+                     "[--label L]")
+    _require_direct_caller("docs add")
+    ap = argparse.ArgumentParser(prog="fleetwatch index docs add")
+    ap.add_argument("name")
+    ap.add_argument("--docs", action="append", required=True, help="a folder of documents")
+    ap.add_argument("--include", action="append",
+                    help="glob under the folder (repeatable; default **/*.md)")
+    ap.add_argument("--label", action="append", help="label of the folder (default: its name)")
+    a = ap.parse_args(args[1:])
+    r = indexes.refresh()
+    name = a.name
+    why = r.index_name_problem(name)
+    if why:
+        raise IndexesError(why)
+    if name not in reg["indexes"]:
+        raise IndexesError("no index %r in the registry (see `fleetwatch index list`)" % name)
+    _guard(reg, name)
+    why = r.owner_refusal(reg, name, "add docs to")
+    if why:
+        raise Refused(why)
+    entry = reg["indexes"][name]
+    if entry.get("kind") == "plain" or not (entry.get("privacy") or {}).get("allowlist"):
+        raise IndexesError("index %s has no docs entries to extend (it is a plain index or has no "
+                           "privacy block)" % name)
+    group = entry.get("group")
+    if group not in (reg.get("groups") or {}):
+        raise IndexesError("index %s is in group %r, which is not declared in the registry, so its "
+                           "protection cannot be checked; fix the group first" % (name, group))
+    if indexes.is_protected(group, r.SETTINGS.protected_groups):
+        from .memory.privacy_scan import RuleSet, Scanner
+        try:
+            deny = entry["privacy"].get("denylist")
+            scanner = Scanner(Path(r.CONFIG_ROOT) / entry["privacy"]["allowlist"],
+                              Path(r.CONFIG_ROOT) / deny if deny else None,
+                              RuleSet(r.SETTINGS.rule_packs))
+            problems = r.protection_problems(group, scanner, doc_options=entry.get("doc_options"))
+        except Exception as e:
+            problems = ["its scanner could not be loaded (%s)" % e]
+        if problems:
+            raise IndexesError("a %s index cannot take a docs entry: %s" % (group, "; ".join(problems)))
+    docs = _docs_entries(a.docs, a.include, a.label, single_label=None)
+    for d in docs:
+        if not os.path.isdir(os.path.expanduser(d["path"])):
+            raise IndexesError("the docs folder %s does not exist" % d["path"])
+    entry_file = _append_docs(name, docs)
+    for d in docs:
+        print("added docs entry %s (%s) to index %s" % (d["label"], d["path"], name))
+    print("registry entry: %s" % tilde(entry_file))
+    _print_docs_report(docs)
     print("next: fleetwatch index refresh %s" % name)
     return 0
 
@@ -394,7 +647,7 @@ def main(argv):
             indexes.refresh().main([verb] + rest)
             return 0
         table = {"list": cmd_list, "status": cmd_status, "refresh": cmd_refresh, "file": cmd_file,
-                 "build": cmd_build, "add": cmd_add, "migrate": cmd_migrate, "verify": cmd_verify}
+                 "build": cmd_build, "add": cmd_add, "docs": cmd_docs, "migrate": cmd_migrate, "verify": cmd_verify}
         if verb not in table:
             return _fail("unknown command %r\n%s" % (verb, USAGE))
         return table[verb](indexes.load_registry(), rest) or 0

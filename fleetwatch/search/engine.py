@@ -1191,6 +1191,22 @@ def as_fts_term(term):
     return '"%s"' % term if " " in term else term
 
 
+def quoted_or(terms):
+    """Any-word FTS5 query. Each term is quoted so a hyphen inside it is not read as syntax."""
+    return " OR ".join('"%s"' % t.replace('"', " ") for t in terms)
+
+
+def rescue_terms(query):
+    """A query's words for an any-word match, keeping hyphenated and numeric ones ("2026-2027",
+    "CS-3600") whole. An underscore separates words, as it does for the FTS5 tokenizer."""
+    out = []
+    for w in re.findall(r"[^\W_](?:[^\W_]|['-])*", query):
+        w = w.lower().rstrip("'-")
+        if len(w) >= 3 and w not in STOPWORDS and w not in FTS_OPERATORS and w not in out:
+            out.append(w)
+    return out
+
+
 def content_terms(query):
     """The words worth matching on: no stopwords, no one or two letter fragments."""
     return [t for t in tokenize(query)
@@ -1210,27 +1226,43 @@ def bm25_search(con, query, args, limit, loose=False, notes=None):
            "FROM chunks_fts JOIN chunks c ON c.id = chunks_fts.rowid "
            "WHERE %s ORDER BY score LIMIT ?" % where)
 
+    deliberate = has_fts_syntax(query)
+    rejected = []
+
     def run(match):
         try:
             return con.execute(sql, [match] + params + [limit]).fetchall()
         except sqlite3.OperationalError:
             # The query used characters FTS5 treats as syntax. Retry as a literal phrase.
+            rejected.append(match)
             safe = '"%s"' % match.replace('"', " ")
-            _note(notes, "literal-phrase", "Note: treated the query as a literal phrase, since "
-                  "FTS5 rejected its syntax.")
-            return con.execute(sql, [safe] + params + [limit]).fetchall()
+            rows = con.execute(sql, [safe] + params + [limit]).fetchall()
+            if rows:
+                _note(notes, "literal-phrase", "Note: treated the query as a literal phrase, since "
+                      "FTS5 rejected its syntax.")
+            return rows
 
-    verbatim = has_fts_syntax(query)
     terms = content_terms(query)
-    if loose and not verbatim and len(terms) > 1:
-        rows = run(" OR ".join(terms))
+    if loose and not deliberate and len(terms) > 1:
+        # The keyword half of a hybrid search keeps a range or a code ("2026-2027", "CS-3600")
+        # whole, so a chunk that holds only that word still gets a keyword match.
+        rows = run(quoted_or(rescue_terms(query) or terms))
     else:
         rows = run(query)
-        if not rows and not verbatim and len(terms) > 1:
-            rows = run(" OR ".join(terms))
+        if not rows and not deliberate and len(terms) > 1:
+            rows = run(quoted_or(terms))
             if rows:
                 _note(notes, "any-word",
                       "Note: no chunk contains every word, so these match any of them.\n")
+        # Only for a query FTS5 rejected, and only when its words found nothing: a hyphenated
+        # or numeric word ("2026-2027") that the word list above drops or cuts short. Run
+        # earlier, a bare number would outrank the query's real words.
+        words = rescue_terms(query) if rejected and not rows and not deliberate else []
+        if words and words != terms:
+            rows = run(quoted_or(words))
+            if rows:
+                _note(notes, "any-word", "Note: FTS5 rejected the query's punctuation and no chunk "
+                      "holds it as one phrase, so these match any of its words.\n")
     # bm25() returns negative numbers where more negative is better. Flip for display.
     return [(dict(r), -r["score"]) for r in rows]
 
